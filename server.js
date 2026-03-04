@@ -1,11 +1,11 @@
 const WebSocket = require('ws');
 const mongoose = require('mongoose');
 const bcrypt = require('bcryptjs');
+require('dotenv').config(); // <--- ADD THIS LINE TO READ THE .ENV FILE
 
 // --- DATABASE CONNECTION ---
-// Replace this string with the one from MongoDB Atlas. 
-// DON'T FORGET to swap <password> with your actual database password!
-const MONGO_URI = "mongodb+srv://emmasess2025_db_user:WCpVwc7Fp0ulTsVL@cluster0.y1pad3u.mongodb.net/?appName=Cluster0";
+// Now it pulls securely from your hidden environment file!
+const MONGO_URI = process.env.MONGO_URI;
 
 mongoose.connect(MONGO_URI)
     .then(() => console.log('🔥 Connected to MongoDB!'))
