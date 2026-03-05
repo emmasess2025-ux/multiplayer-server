@@ -21,17 +21,18 @@ const tileSchema = new mongoose.Schema({
 
 const Tile = mongoose.model('Tile', tileSchema);
 
-    // --- THE PLAYER BLUEPRINT (SCHEMA) ---
-const userSchema = new mongoose.Schema({
-    username: { type: String, required: true, unique: true },
-    password: { type: String, required: true }, 
-    token: { type: String, default: "" }, // <--- ADD THIS LINE
-    worldX: { type: Number, default: 0 },
-    worldY: { type: Number, default: 0 },
-    inventory: { type: Array, default: [] },
-    equippedWeapon: { type: String, default: "none" },
-    friends: { type: Array, default: [] }
-});
+// --- THE PLAYER BLUEPRINT (SCHEMA) ---
+    const userSchema = new mongoose.Schema({
+        email: { type: String, required: true, unique: true }, // NEW: Email is the unique login
+        username: { type: String, required: true },            // CHANGED: No longer unique!
+        password: { type: String, required: true }, 
+        token: { type: String, default: "" }, 
+        worldX: { type: Number, default: 0 },
+        worldY: { type: Number, default: 0 },
+        inventory: { type: Array, default: [] },
+        equippedWeapon: { type: String, default: "none" },
+        friends: { type: Array, default: [] } // Stores the emails or IDs of friends
+    });
 
 const User = mongoose.model('User', userSchema);
 
@@ -58,83 +59,97 @@ wss.on('connection', async (ws) => {
         isMoving: false, message: "", messageTimer: 0, isTyping: false
     };
 
-// 2. FETCH WORLD DATA
-    const allTiles = await Tile.find({});
-
-    // 3. TELL THE NEW GUEST WHO THEY ARE (INIT)
-    ws.send(JSON.stringify({ 
-        type: 'init', 
-        id: id, 
-        players: players, 
-        worldMap: allTiles 
-    }));
-        
-    // 4. NOW TELL THE LOBBY A GUEST HAS ARRIVED
-    wss.clients.forEach(client => {
-        if (client !== ws && client.readyState === WebSocket.OPEN) {
-            client.send(JSON.stringify({ type: 'joined', id: id, player: players[id] }));
-        }
-    });
-
-    ws.on('message', async (message) => {
+        ws.on('message', async (message) => {
         const data = JSON.parse(message);
 
-        // 1. HANDLE REGISTRATION
+// 1. HANDLE REGISTRATION
         if (data.type === 'register') {
             try {
-                // Check if the username is already taken
-                const existingUser = await User.findOne({ username: data.username });
-                if (existingUser) {
-                    return ws.send(JSON.stringify({ type: 'auth_error', message: 'Username already taken' }));
-                }
+                const existingUser = await User.findOne({ email: data.email });
+                if (existingUser) return ws.send(JSON.stringify({ type: 'auth_error', message: 'Email already registered' }));
 
-                // Scramble the password before saving it to Atlas!
                 const hashedPassword = await bcrypt.hash(data.password, 10);
-
-                // Build the new player
                 const newUser = new User({
-                    username: data.username,
+                    email: data.email,
+                    username: data.username, // Give them a default display name
                     password: hashedPassword
                 });
                 await newUser.save();
 
                 ws.send(JSON.stringify({ type: 'register_success', message: 'Account created! You can now log in.' }));
-            } catch (err) {
-                console.error(err);
-                ws.send(JSON.stringify({ type: 'auth_error', message: 'Server error during registration.' }));
-            }
+            } catch (err) { console.error(err); ws.send(JSON.stringify({ type: 'auth_error', message: 'Server error.' })); }
         }
 
-// 2. HANDLE LOGIN
+        // 2. HANDLE LOGIN
         if (data.type === 'login') {
             try {
-                const user = await User.findOne({ username: data.username });
-                if (!user) return ws.send(JSON.stringify({ type: 'auth_error', message: 'User not found' }));
+                // Search by EMAIL instead of username
+                const user = await User.findOne({ email: data.email });
+                if (!user) return ws.send(JSON.stringify({ type: 'auth_error', message: 'Email not found' }));
                 
                 const isMatch = await bcrypt.compare(data.password, user.password);
                 if (!isMatch) return ws.send(JSON.stringify({ type: 'auth_error', message: 'Incorrect password' }));
 
-                // GENERATE A SECURE SESSION TOKEN AND SAVE IT TO MONGODB
                 const newToken = Math.random().toString(36).substring(2) + Math.random().toString(36).substring(2);
                 user.token = newToken;
                 await user.save();
 
                 isAuthenticated = true;
-                currentUser = user.username;
+                currentUser = user.email; // Track session by email internally
 
+                // Pass their data to the lobby memory
+                players[id].email = user.email; // Hidden from other players
                 players[id].username = user.username;
                 players[id].worldX = user.worldX;
                 players[id].worldY = user.worldY;
+                players[id].friends = user.friends;
 
-                // Send the token back to the browser so it can save it!
-                ws.send(JSON.stringify({ type: 'login_success', player: players[id], token: newToken }));
+                // Send success and include their friends list!
+                ws.send(JSON.stringify({ 
+                    type: 'login_success', 
+                    player: players[id], 
+                    token: newToken,
+                    friends: user.friends 
+                }));
                 
-                wss.clients.forEach(client => {
-                    if (client !== ws && client.readyState === WebSocket.OPEN) {
-                        client.send(JSON.stringify({ type: 'update', id: id, player: players[id] }));
-                    }
-                });
+                // Move the closing bracket so 'ws' is the second argument!
+        broadcast({ type: 'update', id: id, player: players[id] }, ws);
             } catch (err) { console.error(err); }
+        }
+
+        // 3. HANDLE PROFILE EDITS
+        if (data.type === 'change_username' && isAuthenticated) {
+            try {
+                await User.findOneAndUpdate({ email: currentUser }, { username: data.newUsername });
+                players[id].username = data.newUsername;
+                
+                // Move the closing bracket here too!
+                 broadcast({ type: 'update', id: id, player: players[id] }, ws);
+                ws.send(JSON.stringify({ type: 'profile_updated', username: data.newUsername }));
+            } catch(err) { console.error(err); }
+        }
+
+        if (data.type === 'add_friend' && isAuthenticated) {
+            try {
+                // 1. Add them to YOUR database
+                await User.findOneAndUpdate(
+                    { email: currentUser }, 
+                    { $addToSet: { friends: data.friendName } } 
+                );
+                ws.send(JSON.stringify({ type: 'friend_added', friendName: data.friendName }));
+
+                // --- THE LOOP FIX ---
+                // 2. Only ping the lobby if this is a NEW request, not a reply!
+                if (!data.isReply) {
+                    broadcast({ 
+                        type: 'friend_request', 
+                        targetUsername: data.friendName,     
+                        senderUsername: players[id].username, 
+                        senderFrameX: players[id].frameX,     
+                        senderFrameY: players[id].frameY
+                    }, ws);
+                }
+            } catch(err) { console.error(err); }
         }
 
         // 5. HANDLE WORLD BUILDING
@@ -196,32 +211,36 @@ wss.on('connection', async (ws) => {
             } catch (err) { console.error('Meta Update Error:', err); }
         }
 
-        // --- NEW: HANDLE AUTO-LOGIN BEHIND THE SCENES ---
+        // 4. HANDLE AUTO-LOGIN
         if (data.type === 'auto_login') {
             try {
-                // Look for the VIP token in the database
+                // Find the user by their secret token
                 const user = await User.findOne({ token: data.token });
                 
-                // If the token is fake or empty, just ignore them (they stay a Guest)
-                if (!user || data.token === "") return; 
+                if (!user) {
+                    return ws.send(JSON.stringify({ type: 'auth_error', message: 'Session expired. Please log in again.' }));
+                }
 
-                // It's a match! Log them in silently.
                 isAuthenticated = true;
-                currentUser = user.username;
+                currentUser = user.email; // We track the session by email now!
 
+                // Pass their data to the lobby memory
+                players[id].email = user.email;
                 players[id].username = user.username;
                 players[id].worldX = user.worldX;
                 players[id].worldY = user.worldY;
+                players[id].friends = user.friends; // Don't forget the friends list!
 
-                // Tell their browser they successfully auto-logged in
-                ws.send(JSON.stringify({ type: 'login_success', player: players[id], token: user.token }));
+                // Send success back to the browser
+                ws.send(JSON.stringify({ 
+                    type: 'login_success', 
+                    player: players[id], 
+                    token: user.token,
+                    friends: user.friends 
+                }));
                 
-                // Announce their true name and location to the lobby
-                wss.clients.forEach(client => {
-                    if (client !== ws && client.readyState === WebSocket.OPEN) {
-                        client.send(JSON.stringify({ type: 'update', id: id, player: players[id] }));
-                    }
-                });
+                // Tell everyone else you arrived (excluding yourself so no ghost clone appears!)
+                broadcast({ type: 'update', id: id, player: players[id] }, ws);
             } catch (err) { console.error(err); }
         }
 
@@ -242,7 +261,7 @@ wss.on('connection', async (ws) => {
         if (isAuthenticated && players[id]) {
             try {
                 await User.findOneAndUpdate(
-                    { username: currentUser },
+                    { email: currentUser }, // <--- FIX: Search by Email!
                     { worldX: players[id].worldX, worldY: players[id].worldY }
                 );
             } catch (err) { console.error(err); }
@@ -254,6 +273,24 @@ wss.on('connection', async (ws) => {
                 client.send(JSON.stringify({ type: 'left', id: id }));
             }
         });
+    });
+
+// 2. FETCH WORLD DATA
+    const allTiles = await Tile.find({});
+
+    // 3. TELL THE NEW GUEST WHO THEY ARE (INIT)
+    ws.send(JSON.stringify({ 
+        type: 'init', 
+        id: id, 
+        players: players, 
+        worldMap: allTiles 
+    }));
+        
+    // 4. NOW TELL THE LOBBY A GUEST HAS ARRIVED
+    wss.clients.forEach(client => {
+        if (client !== ws && client.readyState === WebSocket.OPEN) {
+            client.send(JSON.stringify({ type: 'joined', id: id, player: players[id] }));
+        }
     });
     
 });
