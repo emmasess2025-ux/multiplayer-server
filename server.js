@@ -23,18 +23,70 @@ const Tile = mongoose.model('Tile', tileSchema);
 
 // --- THE PLAYER BLUEPRINT (SCHEMA) ---
     const userSchema = new mongoose.Schema({
-        email: { type: String, required: true, unique: true }, // NEW: Email is the unique login
-        username: { type: String, required: true },            // CHANGED: No longer unique!
+        email: { type: String, required: true, unique: true }, 
+        username: { type: String, required: true },            
         password: { type: String, required: true }, 
         token: { type: String, default: "" }, 
         worldX: { type: Number, default: 0 },
         worldY: { type: Number, default: 0 },
-        inventory: { type: Array, default: [] },
+        
+        // --- UPDATED: Give them the gun by default! ---
+        inventory: { type: Array, default: ["ghost_gun"] },
         equippedWeapon: { type: String, default: "none" },
-        friends: { type: Array, default: [] } // Stores the emails or IDs of friends
+
+        // --- ADD THIS LINE: Saves the state of all 3 slots ---
+        hotbar: { type: Array, default: ["none", "none", "none"] },
+        
+        friends: { type: Array, default: [] } 
     });
 
 const User = mongoose.model('User', userSchema);
+
+// --- EL ESQUEMA DE LAS ARMAS ---
+const weaponSchema = new mongoose.Schema({
+    id: { type: String, required: true, unique: true }, // ej: "ghost_gun"
+    name: String,
+    damage: Number,
+    speed: Number,
+    fireRate: Number,
+    magSize: Number,
+    reloadTime: Number,
+    range: Number,
+    color: String
+});
+const Weapon = mongoose.model('Weapon', weaponSchema);
+
+// --- CACHÉ EN RAM PARA VELOCIDAD EXTREMA ---
+let WEAPONS = {
+    "none": { damage: 0, speed: 0, fireRate: 0, magSize: 0, reloadTime: 0, color: "transparent" }
+};
+
+// Cargar armas de la Base de Datos a la RAM cuando el servidor inicia
+async function loadWeaponsFromDB() {
+    try {
+        // Crear el arma por defecto si no existe en la DB
+        const existing = await Weapon.findOne({ id: "ghost_gun" });
+        if (!existing) {
+            await Weapon.create({
+                id: "ghost_gun", name: "Ghost Gun", damage: 15, speed: 6,
+                fireRate: 250, magSize: 8, reloadTime: 1500, range: 120, color: "#2ecc71"
+            });
+            console.log('🔫 Ghost Gun añadida a MongoDB!');
+        }
+
+        // Cargar todas las armas a la memoria RAM
+        const dbWeapons = await Weapon.find({});
+        dbWeapons.forEach(w => {
+            WEAPONS[w.id] = w;
+        });
+        console.log(`✅ Base de datos de armas cargada en RAM (${dbWeapons.length} armas)`);
+    } catch (err) {
+        console.error("Error cargando armas:", err);
+    }
+}
+
+// Llama a la función inmediatamente
+loadWeaponsFromDB();
 
 // Use the port Render gives us, or default to 8080 for local testing
 const PORT = process.env.PORT || 8080;
@@ -56,7 +108,14 @@ wss.on('connection', async (ws) => {
         username: currentUser, 
         worldX: 0, worldY: 0,
         frameX: 0, frameY: 0,
-        isMoving: false, message: "", messageTimer: 0, isTyping: false
+        isMoving: false, message: "", messageTimer: 0, isTyping: false,
+        
+        // --- MEMORIA ANTI-CHEAT DEL SERVIDOR ---
+        hp: 100,
+        isDead: false,
+        ammo: 8, // Empezamos con el cargador lleno
+        lastShotTime: 0,
+        isReloading: false
     };
 
         ws.on('message', async (message) => {
@@ -90,6 +149,13 @@ wss.on('connection', async (ws) => {
                 const isMatch = await bcrypt.compare(data.password, user.password);
                 if (!isMatch) return ws.send(JSON.stringify({ type: 'auth_error', message: 'Incorrect password' }));
 
+                // --- NEW: RETROACTIVELY GIVE EXISTING PLAYERS THE GUN ---
+                if (!user.inventory || user.inventory.length === 0) {
+                    user.inventory = ["ghost_gun"];
+                    user.markModified('inventory'); // <--- THE FIX: Force MongoDB to see the change!
+                    await user.save();
+                }
+
                 const newToken = Math.random().toString(36).substring(2) + Math.random().toString(36).substring(2);
                 user.token = newToken;
                 await user.save();
@@ -103,6 +169,13 @@ wss.on('connection', async (ws) => {
                 players[id].worldX = user.worldX;
                 players[id].worldY = user.worldY;
                 players[id].friends = user.friends;
+                // --- THE FIX: Give the server memory their inventory! ---
+                players[id].inventory = user.inventory;
+
+                players[id].equippedWeapon = user.equippedWeapon || "none";
+
+                // --- THE HOTBAR PERSISTENCE FIX ---
+                players[id].hotbar = user.hotbar || ["none", "none", "none"];
 
                 // Send success and include their friends list!
                 ws.send(JSON.stringify({ 
@@ -221,6 +294,13 @@ wss.on('connection', async (ws) => {
                     return ws.send(JSON.stringify({ type: 'auth_error', message: 'Session expired. Please log in again.' }));
                 }
 
+                // --- NEW: RETROACTIVELY GIVE EXISTING PLAYERS THE GUN ---
+                if (!user.inventory || user.inventory.length === 0) {
+                    user.inventory = ["ghost_gun"];
+                    user.markModified('inventory'); // <--- THE FIX: Force MongoDB to see the change!
+                    await user.save();
+                }
+
                 isAuthenticated = true;
                 currentUser = user.email; // We track the session by email now!
 
@@ -230,7 +310,14 @@ wss.on('connection', async (ws) => {
                 players[id].worldX = user.worldX;
                 players[id].worldY = user.worldY;
                 players[id].friends = user.friends; // Don't forget the friends list!
+                // --- FIX: Give the server memory their inventory! ---
+                players[id].inventory = user.inventory;
 
+                // --- THE PERSISTENCE FIX: Load the saved weapon! ---
+                players[id].equippedWeapon = user.equippedWeapon || "none";
+                // --- THE HOTBAR PERSISTENCE FIX ---
+                players[id].hotbar = user.hotbar || ["none", "none", "none"];
+                
                 // Send success back to the browser
                 ws.send(JSON.stringify({ 
                     type: 'login_success', 
@@ -246,12 +333,118 @@ wss.on('connection', async (ws) => {
 
         // 3. ALLOW GUESTS TO MOVE (Removed the isAuthenticated check!)
         if (data.type === 'update') {
-            players[id] = data.player; 
+            // --- EL FIX DE LA INMORTALIDAD ---
+            // En lugar de sobrescribir (players[id] = data.player), fusionamos los datos!
+            // Así mantenemos el HP, Ammo y lastShotTime intactos en la memoria del servidor.
+            if (!players[id]) players[id] = {};
+            players[id] = { ...players[id], ...data.player }; 
+            
             wss.clients.forEach(client => {
                 if (client !== ws && client.readyState === WebSocket.OPEN) {
                     client.send(JSON.stringify({ type: 'update', id: id, player: players[id] }));
                 }
             });
+        }
+
+       // 7. HANDLE SHOOTING (CON ANTI-CHEAT)
+        if (data.type === 'shoot') {
+            const shooter = players[id];
+            const weaponId = shooter.equippedWeapon || "none";
+            const stats = WEAPONS[weaponId];
+
+            if (!stats || weaponId === "none") return;
+
+            const now = Date.now();
+
+            // ANTI-CHEAT 1: ¿Está disparando más rápido que el FireRate del arma?
+            // Le damos 50ms de margen por el lag del internet
+            if (now - shooter.lastShotTime < (stats.fireRate - 50)) {
+                return; // ¡Hacker ignorado!
+            }
+
+            // ANTI-CHEAT 2: ¿Tiene balas?
+            if (shooter.ammo <= 0) {
+                // Si no tiene balas y no está recargando, iniciar recarga en el servidor
+                if (!shooter.isReloading) {
+                    shooter.isReloading = true;
+                    setTimeout(() => {
+                        if (players[id]) { // Verificar que el jugador no se haya desconectado
+                            players[id].ammo = stats.magSize;
+                            players[id].isReloading = false;
+                        }
+                    }, stats.reloadTime);
+                }
+                return; // No puede disparar, está vacío/recargando
+            }
+
+            // SI PASA LAS PRUEBAS: Disparo oficial
+            shooter.ammo--;
+            shooter.lastShotTime = now;
+
+            // Replicar la bala a todos los demás
+            wss.clients.forEach(client => {
+                if (client !== ws && client.readyState === WebSocket.OPEN) {
+                    client.send(JSON.stringify({
+                        type: 'shoot',
+                        id: id,
+                        x: data.x,
+                        y: data.y,
+                        angle: data.angle,
+                        weaponId: weaponId
+                    }));
+                }
+            });
+        }
+
+        // 8. MANEJAR EL DAÑO Y LA VIDA (CON SEGURIDAD ANTI-CHEAT Y ESTADO DE MUERTE)
+        if (data.type === 'damage_player') {
+            const shooter = players[id]; 
+            const target = players[data.targetId]; 
+
+            // Si el objetivo existe y NO está muerto ya
+            if (shooter && target && !target.isDead) {
+                const weaponId = shooter.equippedWeapon || "none";
+                const actualDamage = WEAPONS[weaponId] ? WEAPONS[weaponId].damage : 0;
+
+                target.hp = (target.hp || 100) - actualDamage;
+
+                // --- SISTEMA DE MUERTE (DERRIBADO) ---
+                if (target.hp <= 0) {
+                    target.hp = 0;
+                    target.isDead = true; // Lo marcamos como muerto
+
+                    // Temporizador para revivirlo en 3 segundos (3000 ms)
+                    setTimeout(() => {
+                        if (players[data.targetId]) { // Verificar que no se haya desconectado
+                            players[data.targetId].hp = 100;
+                            players[data.targetId].isDead = false;
+                            
+                            // Avisar a todos que revivió
+                            wss.clients.forEach(client => {
+                                if (client.readyState === WebSocket.OPEN) {
+                                    client.send(JSON.stringify({
+                                        type: 'hp_update', targetId: data.targetId,
+                                        newHp: 100, damageDealt: 0, isDead: false
+                                    }));
+                                }
+                            });
+                        }
+                    }, 3000);
+                }
+
+                // Avisarle a TODOS el nuevo HP y si se murió
+                wss.clients.forEach(client => {
+                    if (client.readyState === WebSocket.OPEN) {
+                        client.send(JSON.stringify({
+                            type: 'hp_update',
+                            targetId: data.targetId,
+                            newHp: target.hp,
+                            damageDealt: actualDamage,
+                            isDead: target.isDead || false
+                        }));
+                    }
+                });
+            }
         }
     });
 
@@ -262,7 +455,13 @@ wss.on('connection', async (ws) => {
             try {
                 await User.findOneAndUpdate(
                     { email: currentUser }, // <--- FIX: Search by Email!
-                    { worldX: players[id].worldX, worldY: players[id].worldY }
+                    { worldX: players[id].worldX, 
+                        worldY: players[id].worldY,
+                    // --- SAVE THE WEAPON STATE ---
+                        equippedWeapon: players[id].equippedWeapon,
+                    // --- SAVE THE HOTBAR STATE ---
+                        hotbar: players[id].hotbar
+                    }
                 );
             } catch (err) { console.error(err); }
         }
@@ -283,7 +482,8 @@ wss.on('connection', async (ws) => {
         type: 'init', 
         id: id, 
         players: players, 
-        worldMap: allTiles 
+        worldMap: allTiles,
+        weaponsDB: WEAPONS // <--- ¡Le mandamos la tabla oficial al cliente!
     }));
         
     // 4. NOW TELL THE LOBBY A GUEST HAS ARRIVED
