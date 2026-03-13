@@ -407,19 +407,21 @@ wss.on('connection', async (ws) => {
                 const actualDamage = WEAPONS[weaponId] ? WEAPONS[weaponId].damage : 0;
 
                 target.hp = (target.hp || 100) - actualDamage;
+                
+                // --- ¡EL FIX DEL AUTO-HEAL! REINICIAR EL CRONÓMETRO ---
+                target.lastHitTime = Date.now(); 
 
                 // --- SISTEMA DE MUERTE (DERRIBADO) ---
                 if (target.hp <= 0) {
                     target.hp = 0;
-                    target.isDead = true; // Lo marcamos como muerto
+                    target.isDead = true; 
 
-                    // Temporizador para revivirlo en 3 segundos (3000 ms)
                     setTimeout(() => {
-                        if (players[data.targetId]) { // Verificar que no se haya desconectado
+                        if (players[data.targetId]) { 
                             players[data.targetId].hp = 100;
                             players[data.targetId].isDead = false;
+                            players[data.targetId].lastHitTime = Date.now(); // Reiniciar al revivir
                             
-                            // Avisar a todos que revivió
                             wss.clients.forEach(client => {
                                 if (client.readyState === WebSocket.OPEN) {
                                     client.send(JSON.stringify({
@@ -432,7 +434,6 @@ wss.on('connection', async (ws) => {
                     }, 3000);
                 }
 
-                // Avisarle a TODOS el nuevo HP y si se murió
                 wss.clients.forEach(client => {
                     if (client.readyState === WebSocket.OPEN) {
                         client.send(JSON.stringify({
@@ -505,5 +506,38 @@ function broadcast(data, excludeWs = null) {
         }
     });
 }
+
+// --- NUEVO: SISTEMA DE REGENERACIÓN DE VIDA (AUTO-HEAL) ---
+setInterval(() => {
+    const now = Date.now();
+    for (let id in players) {
+        let p = players[id];
+        
+        // Si el jugador existe, NO está muerto y le falta vida...
+        if (p && !p.isDead && p.hp < 100) {
+            
+            // Si pasaron 60 segundos (60,000 ms) desde su último golpe...
+            // (Nota: Cámbialo a 5000 para probarlo rápido)
+            if (now - (p.lastHitTime || 0) >= 60000) {
+                
+                // Le sumamos 5 de vida, sin pasarnos del 100
+                p.hp = Math.min(100, p.hp + 5); 
+                
+                const hpMsg = JSON.stringify({
+                    type: 'hp_update',
+                    targetId: id,
+                    newHp: p.hp,
+                    isDead: false,
+                    damageDealt: -5 // Un número negativo le dice al cliente que es curación
+                });
+
+                // Enviar a todos los clientes para que vean que este jugador se curó
+                wss.clients.forEach(client => {
+                    if (client.readyState === 1) client.send(hpMsg);
+                });
+            }
+        }
+    }
+}, 1000); // Revisa a todos los jugadores 1 vez por segundo
 
 console.log(`WebSocket server running on port ${PORT}`);
