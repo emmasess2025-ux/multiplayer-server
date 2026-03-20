@@ -22,7 +22,7 @@ const tileSchema = new mongoose.Schema({
 const Tile = mongoose.model('Tile', tileSchema);
 
 // --- THE PLAYER BLUEPRINT (SCHEMA) ---
-    const userSchema = new mongoose.Schema({
+const userSchema = new mongoose.Schema({
         email: { type: String, required: true, unique: true }, 
         username: { type: String, required: true },            
         password: { type: String, required: true }, 
@@ -30,14 +30,13 @@ const Tile = mongoose.model('Tile', tileSchema);
         worldX: { type: Number, default: 0 },
         worldY: { type: Number, default: 0 },
         
-        // --- UPDATED: Give them the gun by default! ---
         inventory: { type: Array, default: ["ghost_gun"] },
         equippedWeapon: { type: String, default: "none" },
-
-        // --- ADD THIS LINE: Saves the state of all 3 slots ---
         hotbar: { type: Array, default: ["none", "none", "none"] },
+        friends: { type: Array, default: [] },
         
-        friends: { type: Array, default: [] } 
+        // --- NUEVO: SISTEMA DE ECONOMÍA ---
+        coins: { type: Number, default: 0 } 
     });
 
 const User = mongoose.model('User', userSchema);
@@ -60,6 +59,17 @@ const Weapon = mongoose.model('Weapon', weaponSchema);
 let WEAPONS = {
     "none": { damage: 0, speed: 0, fireRate: 0, magSize: 0, reloadTime: 0, color: "transparent" }
 };
+
+// --- ESQUEMA DE MENSAJES PRIVADOS (AHORA POR ID) ---
+const pmSchema = new mongoose.Schema({
+    participants: [String], // Array con los 2 accountIds (IDs de MongoDB)
+    messages: [{
+        senderId: String,   // accountId del que envía
+        text: String,
+        timestamp: { type: Date, default: Date.now }
+    }]
+});
+const PM = mongoose.model('PM', pmSchema);
 
 // Cargar armas de la Base de Datos a la RAM cuando el servidor inicia
 async function loadWeaponsFromDB() {
@@ -98,6 +108,7 @@ const players = {};
 // --- WEBSOCKET LOGIC ---
 wss.on('connection', async (ws) => {
     const id = Math.random().toString(36).substring(2, 9);
+    ws.playerId = id; // <--- ¡AÑADE ESTA LÍNEA! Es crucial para encontrar a quién enviarle el PM.
     
     let isAuthenticated = false;
     // Generate a random guest name like "Guest_482"
@@ -177,6 +188,12 @@ wss.on('connection', async (ws) => {
                 // --- THE HOTBAR PERSISTENCE FIX ---
                 players[id].hotbar = user.hotbar || ["none", "none", "none"];
 
+                // --- NUEVO: CARGAR MONEDAS A LA RAM ---
+                players[id].coins = user.coins || 0;
+
+                // Agrega esta línea para guardar el ID único de MongoDB en RAM:
+                players[id].accountId = user._id.toString();
+
                 // Send success and include their friends list!
                 ws.send(JSON.stringify({ 
                     type: 'login_success', 
@@ -190,16 +207,15 @@ wss.on('connection', async (ws) => {
             } catch (err) { console.error(err); }
         }
 
-        // 3. HANDLE PROFILE EDITS
+        // 3. HANDLE PROFILE EDITS (Ahora es limpio gracias a los IDs)
         if (data.type === 'change_username' && isAuthenticated) {
             try {
-                await User.findOneAndUpdate({ email: currentUser }, { username: data.newUsername });
-                players[id].username = data.newUsername;
-                
-                // Move the closing bracket here too!
-                 broadcast({ type: 'update', id: id, player: players[id] }, ws);
-                ws.send(JSON.stringify({ type: 'profile_updated', username: data.newUsername }));
-            } catch(err) { console.error(err); }
+                const newUsername = data.newUsername;
+                await User.findOneAndUpdate({ email: currentUser }, { username: newUsername });
+                players[id].username = newUsername;
+                broadcast({ type: 'update', id: id, player: players[id] }, ws);
+                ws.send(JSON.stringify({ type: 'profile_updated', username: newUsername }));
+            } catch(err) { console.error("Error cambiando nombre:", err); }
         }
 
         if (data.type === 'add_friend' && isAuthenticated) {
@@ -317,6 +333,12 @@ wss.on('connection', async (ws) => {
                 players[id].equippedWeapon = user.equippedWeapon || "none";
                 // --- THE HOTBAR PERSISTENCE FIX ---
                 players[id].hotbar = user.hotbar || ["none", "none", "none"];
+
+                // --- NUEVO: CARGAR MONEDAS A LA RAM ---
+                players[id].coins = user.coins || 0;
+
+                // Agrega esta línea para guardar el ID único de MongoDB en RAM:
+                players[id].accountId = user._id.toString();
                 
                 // Send success back to the browser
                 ws.send(JSON.stringify({ 
@@ -447,6 +469,93 @@ wss.on('connection', async (ws) => {
                 });
             }
         }
+
+        // 9. ENVIAR MENSAJE PRIVADO
+        if (data.type === 'send_pm' && isAuthenticated) {
+            try {
+                const myAccountId = players[id].accountId;
+                const targetAccountId = data.targetAccountId;
+
+                let conv = await PM.findOne({ participants: { $all: [myAccountId, targetAccountId] } });
+                if (!conv) {
+                    conv = new PM({ participants: [myAccountId, targetAccountId], messages: [] });
+                }
+
+                conv.messages.push({ senderId: myAccountId, text: data.text });
+                if (conv.messages.length > 15) conv.messages = conv.messages.slice(-15);
+                await conv.save();
+
+                let targetWsId = null;
+                for (let pid in players) {
+                    if (players[pid].accountId === targetAccountId) targetWsId = pid;
+                }
+
+                if (targetWsId) {
+                    wss.clients.forEach(client => {
+                        if (client.playerId === targetWsId && client.readyState === WebSocket.OPEN) {
+                            client.send(JSON.stringify({
+                                type: 'receive_pm',
+                                senderAccountId: myAccountId,
+                                senderUsername: players[id].username, // Solo para la notificación flotante
+                                history: conv.messages
+                            }));
+                        }
+                    });
+                }
+
+                ws.send(JSON.stringify({ type: 'pm_history', targetAccountId: targetAccountId, targetUsername: data.targetUsername, history: conv.messages }));
+            } catch (err) { console.error("Error en PM:", err); }
+        }
+
+        // 10. PEDIR HISTORIAL DE CHAT
+        if (data.type === 'get_pm_history' && isAuthenticated) {
+            try {
+                const myAccountId = players[id].accountId;
+                const targetAccountId = data.targetAccountId;
+                
+                // Buscar el nombre ACTUAL del usuario en la base de datos (Magia del ID)
+                const targetUser = await User.findById(targetAccountId);
+                const currentTargetName = targetUser ? targetUser.username : "Usuario Desconocido";
+
+                const conv = await PM.findOne({ participants: { $all: [myAccountId, targetAccountId] } });
+                
+                ws.send(JSON.stringify({
+                    type: 'pm_history',
+                    targetAccountId: targetAccountId,
+                    targetUsername: currentTargetName, // Devolvemos el nombre real!
+                    history: conv ? conv.messages : []
+                }));
+            } catch (err) { console.error("Error pidiendo historial:", err); }
+        }
+
+        // 11. PEDIR LISTA DE INBOX
+        if (data.type === 'get_inbox' && isAuthenticated) {
+            try {
+                const myAccountId = players[id].accountId;
+                const convos = await PM.find({ participants: myAccountId });
+                
+                const inboxData = [];
+                for (let c of convos) {
+                    const otherPersonId = c.participants.find(p => p !== myAccountId);
+                    
+                    // Buscar su nombre ACTUAL
+                    const otherUser = await User.findById(otherPersonId);
+                    const currentName = otherUser ? otherUser.username : "Usuario Desconocido";
+                    
+                    const lastMsg = c.messages.length > 0 ? c.messages[c.messages.length - 1] : null;
+                    
+                    inboxData.push({
+                        targetAccountId: otherPersonId,
+                        targetUser: currentName,
+                        lastMessage: lastMsg ? lastMsg.text : "Comienza a chatear...",
+                        time: lastMsg ? lastMsg.timestamp : 0
+                    });
+                }
+
+                inboxData.sort((a, b) => new Date(b.time) - new Date(a.time));
+                ws.send(JSON.stringify({ type: 'inbox_data', inbox: inboxData }));
+            } catch (err) { console.error("Error pidiendo inbox:", err); }
+        }
     });
 
     /// 4. DISCONNECT
@@ -456,12 +565,13 @@ wss.on('connection', async (ws) => {
             try {
                 await User.findOneAndUpdate(
                     { email: currentUser }, // <--- FIX: Search by Email!
-                    { worldX: players[id].worldX, 
+                    { 
+                        worldX: players[id].worldX, 
                         worldY: players[id].worldY,
-                    // --- SAVE THE WEAPON STATE ---
                         equippedWeapon: players[id].equippedWeapon,
-                    // --- SAVE THE HOTBAR STATE ---
-                        hotbar: players[id].hotbar
+                        hotbar: players[id].hotbar,
+                        // --- NUEVO: GUARDAR MONEDAS AL DESCONECTARSE ---
+                        coins: players[id].coins 
                     }
                 );
             } catch (err) { console.error(err); }
