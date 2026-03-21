@@ -218,25 +218,35 @@ wss.on('connection', async (ws) => {
             } catch(err) { console.error("Error cambiando nombre:", err); }
         }
 
+        // 4. AÑADIR AMIGOS (POR ID)
         if (data.type === 'add_friend' && isAuthenticated) {
             try {
-                // 1. Add them to YOUR database
+                // 1. Lo añadimos a tu base de datos usando su AccountID
                 await User.findOneAndUpdate(
                     { email: currentUser }, 
-                    { $addToSet: { friends: data.friendName } } 
+                    { $addToSet: { friends: data.friendAccountId } } 
                 );
-                ws.send(JSON.stringify({ type: 'friend_added', friendName: data.friendName }));
 
-                // --- THE LOOP FIX ---
-                // 2. Only ping the lobby if this is a NEW request, not a reply!
+                // 2. Si es una solicitud nueva (no una respuesta), le avisamos en vivo
                 if (!data.isReply) {
-                    broadcast({ 
-                        type: 'friend_request', 
-                        targetUsername: data.friendName,     
-                        senderUsername: players[id].username, 
-                        senderFrameX: players[id].frameX,     
-                        senderFrameY: players[id].frameY
-                    }, ws);
+                    let targetWsId = null;
+                    for (let pid in players) {
+                        if (players[pid].accountId === data.friendAccountId) targetWsId = pid;
+                    }
+
+                    if (targetWsId) {
+                        wss.clients.forEach(client => {
+                            if (client.playerId === targetWsId && client.readyState === WebSocket.OPEN) {
+                                client.send(JSON.stringify({ 
+                                    type: 'friend_request', 
+                                    senderAccountId: players[id].accountId, // Enviamos el ID del que lo pide
+                                    senderUsername: players[id].username, 
+                                    senderFrameX: players[id].frameX,     
+                                    senderFrameY: players[id].frameY
+                                }));
+                            }
+                        });
+                    }
                 }
             } catch(err) { console.error(err); }
         }
@@ -555,6 +565,22 @@ wss.on('connection', async (ws) => {
                 inboxData.sort((a, b) => new Date(b.time) - new Date(a.time));
                 ws.send(JSON.stringify({ type: 'inbox_data', inbox: inboxData }));
             } catch (err) { console.error("Error pidiendo inbox:", err); }
+        }
+        // 12. PEDIR LISTA DE AMIGOS ACTUALIZADA
+        if (data.type === 'get_friends_list' && isAuthenticated) {
+            try {
+                const myUser = await User.findOne({ email: currentUser });
+                const friendsData = [];
+                
+                // Buscar el nombre ACTUAL de cada amigo usando su ID
+                for (let fId of (myUser.friends || [])) {
+                    const fUser = await User.findById(fId);
+                    if (fUser) {
+                        friendsData.push({ accountId: fId, username: fUser.username });
+                    }
+                }
+                ws.send(JSON.stringify({ type: 'friends_list_data', friends: friendsData }));
+            } catch (err) { console.error("Error pidiendo amigos:", err); }
         }
     });
 
