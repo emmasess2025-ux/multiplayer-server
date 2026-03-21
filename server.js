@@ -271,8 +271,10 @@ wss.on('connection', async (ws) => {
                     await Tile.create({ x: data.x, y: data.y, l: data.l, tileId: data.tileId });
                 }
                 
+        // EN LA SECCIÓN 5 (place_tile):
                 wss.clients.forEach(client => {
-                    if (client.readyState === WebSocket.OPEN) {
+                    // --- EL FIX: Agregamos client !== ws para no mandarnos ecos ---
+                    if (client !== ws && client.readyState === WebSocket.OPEN) {
                         client.send(JSON.stringify({
                             type: 'tile_update', x: data.x, y: data.y, l: data.l, tileId: data.tileId
                         }));
@@ -281,6 +283,43 @@ wss.on('connection', async (ws) => {
             } catch (err) { console.error('Tile Save Error:', err); }
         }
 
+        // 5.5 HANDLE BULK BUILDING (SÚPER GUARDADO MULTI-CAPA ANTI-LAG)
+        if (data.type === 'place_tiles_bulk') {
+            try {
+                const bulkOps = [];
+                for (let t of data.tiles) {
+                    if (t.tileId === -1) {
+                        // BORRADOR: Solo borramos el bloque específico en su capa
+                        bulkOps.push({ deleteMany: { filter: { x: t.x, y: t.y, l: t.l } } });
+                    } else {
+                        // UPSERT: Si existe, lo sobrescribe. Si no existe, lo crea. ¡1 sola operación!
+                        bulkOps.push({
+                            updateOne: {
+                                filter: { x: t.x, y: t.y, l: t.l },
+                                update: { $set: { tileId: t.tileId } },
+                                upsert: true
+                            }
+                        });
+                    }
+                }
+
+                if (bulkOps.length > 0) {
+                    // LA MAGIA: ordered: false permite a MongoDB procesar todo en paralelo a máxima velocidad
+                    await Tile.bulkWrite(bulkOps, { ordered: false }); 
+                }
+
+        // EN LA SECCIÓN 5.5 (place_tiles_bulk):
+                wss.clients.forEach(client => {
+                    // --- EL FIX: Agregamos client !== ws ---
+                    if (client !== ws && client.readyState === WebSocket.OPEN) {
+                        client.send(JSON.stringify({
+                            type: 'tile_update_bulk', tiles: data.tiles
+                        }));
+                    }
+                });
+            } catch (err) { console.error('Bulk Save Error:', err); }
+        }
+        
         // 6. HANDLE TILE INSPECTOR UPDATES
         if (data.type === 'update_tile_metadata') {
             try {
