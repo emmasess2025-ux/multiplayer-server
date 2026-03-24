@@ -14,9 +14,13 @@ mongoose.connect(MONGO_URI)
 const tileSchema = new mongoose.Schema({
     x: Number,
     y: Number,
-    l: { type: Number, default: 0 }, // The Z-Index Layer (0 to 4)
+    l: { type: Number, default: 0 }, 
     tileId: Number,
-    hasCollision: { type: Boolean, default: false }
+    hasCollision: { type: Boolean, default: false },
+    // --- NUEVO: DATOS LÓGICOS (Capa 15) ---
+    triggerType: { type: String, default: null },
+    destX: { type: Number, default: null },
+    destY: { type: Number, default: null }
 });
 
 const Tile = mongoose.model('Tile', tileSchema);
@@ -36,7 +40,9 @@ const userSchema = new mongoose.Schema({
         friends: { type: Array, default: [] },
         
         // --- NUEVO: SISTEMA DE ECONOMÍA ---
-        coins: { type: Number, default: 0 } 
+        coins: { type: Number, default: 0 },
+        // --- NUEVO: SISTEMA DE ROLES ---
+        role: { type: String, default: 'player' } // Todos nacen como 'player' por defecto, pero podrías tener 'admin', 'moderator', etc. y manejar permisos en el futuro.
     });
 
 const User = mongoose.model('User', userSchema);
@@ -194,6 +200,9 @@ wss.on('connection', async (ws) => {
                 // Agrega esta línea para guardar el ID único de MongoDB en RAM:
                 players[id].accountId = user._id.toString();
 
+                // --- NUEVO: PASAR EL ROL A LA MEMORIA ---
+                players[id].role = user.role || 'player';
+
                 // Send success and include their friends list!
                 ws.send(JSON.stringify({ 
                     type: 'login_success', 
@@ -253,6 +262,10 @@ wss.on('connection', async (ws) => {
 
         // 5. HANDLE WORLD BUILDING
         if (data.type === 'place_tile') {
+            // --- EL CANDADO DE SEGURIDAD ABSOLUTA ---
+            if (!players[id] || players[id].role !== 'admin') return;
+
+
             try {
                 // SMART QUERY: Catch tiles on the active layer, OR legacy ghost tiles with no layer (if L0)
                 const query = { x: data.x, y: data.y };
@@ -285,6 +298,9 @@ wss.on('connection', async (ws) => {
 
         // 5.5 HANDLE BULK BUILDING (SÚPER GUARDADO MULTI-CAPA ANTI-LAG)
         if (data.type === 'place_tiles_bulk') {
+            // --- EL CANDADO DE SEGURIDAD ABSOLUTA ---
+            if (!players[id] || players[id].role !== 'admin') return;
+
             try {
                 const bulkOps = [];
                 for (let t of data.tiles) {
@@ -322,8 +338,10 @@ wss.on('connection', async (ws) => {
         
         // 6. HANDLE TILE INSPECTOR UPDATES
         if (data.type === 'update_tile_metadata') {
+            // --- EL CANDADO DE SEGURIDAD ABSOLUTA ---
+            if (!players[id] || players[id].role !== 'admin') return;
+
             try {
-                // Use the same Smart Query to find ghost tiles
                 const query = { x: data.x, y: data.y };
                 if (data.layer === 0) {
                     query.$or = [{ l: 0 }, { l: { $exists: false } }, { l: null }];
@@ -331,18 +349,23 @@ wss.on('connection', async (ws) => {
                     query.l = data.layer;
                 }
 
-                // updateMany ensures we catch duplicates, and we force 'l' to be saved!
-                await Tile.updateMany(
-                    query,
-                    { hasCollision: data.hasCollision, l: data.layer }
-                );
+                const updateData = { hasCollision: data.hasCollision, l: data.layer };
+                
+                // --- NUEVO: GUARDAR COORDENADAS DE TELETRANSPORTE ---
+                if (data.triggerType) {
+                    updateData.triggerType = data.triggerType;
+                    updateData.destX = data.destX;
+                    updateData.destY = data.destY;
+                }
+
+                await Tile.updateMany(query, updateData);
                 
                 wss.clients.forEach(client => {
                     if (client !== ws && client.readyState === WebSocket.OPEN) {
                         client.send(JSON.stringify({
                             type: 'tile_meta_update', 
-                            x: data.x, y: data.y, 
-                            layer: data.layer, hasCollision: data.hasCollision
+                            x: data.x, y: data.y, layer: data.layer, hasCollision: data.hasCollision,
+                            triggerType: data.triggerType, destX: data.destX, destY: data.destY
                         }));
                     }
                 });
@@ -388,6 +411,9 @@ wss.on('connection', async (ws) => {
 
                 // Agrega esta línea para guardar el ID único de MongoDB en RAM:
                 players[id].accountId = user._id.toString();
+
+                // --- NUEVO: PASAR EL ROL A LA MEMORIA ---
+                players[id].role = user.role || 'player';
                 
                 // Send success back to the browser
                 ws.send(JSON.stringify({ 
@@ -402,19 +428,56 @@ wss.on('connection', async (ws) => {
             } catch (err) { console.error(err); }
         }
 
-        // 3. ALLOW GUESTS TO MOVE (Removed the isAuthenticated check!)
+        // 3. ALLOW GUESTS TO MOVE (SEGURO - ANTI INYECCIÓN)
         if (data.type === 'update') {
-            // --- EL FIX DE LA INMORTALIDAD ---
-            // En lugar de sobrescribir (players[id] = data.player), fusionamos los datos!
-            // Así mantenemos el HP, Ammo y lastShotTime intactos en la memoria del servidor.
             if (!players[id]) players[id] = {};
-            players[id] = { ...players[id], ...data.player }; 
+            
+            players[id].worldX = data.player.worldX;
+            players[id].worldY = data.player.worldY;
+            players[id].frameX = data.player.frameX;
+            players[id].frameY = data.player.frameY;
+            players[id].isMoving = data.player.isMoving;
+            players[id].isTyping = data.player.isTyping;
+            
+            // --- NUEVO ANTI-CRASH: Limitar caracteres del chat ---
+            let safeMsg = data.player.message || "";
+            if (safeMsg.length > 100) safeMsg = safeMsg.substring(0, 100);
+            players[id].message = safeMsg;
+            
+            // Evitar que envíen un temporizador infinito
+            let safeTimer = data.player.messageTimer || 0;
+            if (safeTimer > 600) safeTimer = 600; 
+            players[id].messageTimer = safeTimer;
             
             wss.clients.forEach(client => {
                 if (client !== ws && client.readyState === WebSocket.OPEN) {
                     client.send(JSON.stringify({ type: 'update', id: id, player: players[id] }));
                 }
             });
+        }
+
+        // --- NUEVO: RUTA SEGURA PARA EQUIPAR ARMAS ---
+        if (data.type === 'equip_weapon') {
+            const p = players[id];
+            if (!p) return;
+            
+            // Verificar que el arma que pide exista en el hotbar de la RAM del servidor
+            if (data.weaponId === "none" || (p.hotbar && p.hotbar.includes(data.weaponId))) {
+                p.equippedWeapon = data.weaponId;
+                broadcast({ type: 'update', id: id, player: p }, ws); // Avisar a los demás
+            }
+        }
+
+        // --- NUEVO: RUTA SEGURA PARA ACTUALIZAR EL HOTBAR ---
+        if (data.type === 'update_hotbar') {
+            const p = players[id];
+            if (!p) return;
+
+            // Verificar que el arma que quiere poner en el hotbar realmente exista en su inventario
+            if (data.weaponId === "none" || (p.inventory && p.inventory.includes(data.weaponId))) {
+                if (!p.hotbar) p.hotbar = ["none", "none", "none"];
+                p.hotbar[data.slotIndex] = data.weaponId;
+            }
         }
 
        // 7. HANDLE SHOOTING (CON ANTI-CHEAT)
@@ -519,8 +582,20 @@ wss.on('connection', async (ws) => {
             }
         }
 
-        // 9. ENVIAR MENSAJE PRIVADO
+// 9. ENVIAR MENSAJE PRIVADO
         if (data.type === 'send_pm' && isAuthenticated) {
+            
+            // --- NUEVO ANTI-SPAM (Rate Limit: 1 mensaje por segundo) ---
+            const now = Date.now();
+            if (players[id].lastPMTime && now - players[id].lastPMTime < 1000) {
+                return; // Lo ignoramos silenciosamente
+            }
+            players[id].lastPMTime = now;
+
+            // --- SANEAMIENTO: Máximo 250 caracteres ---
+            let safeText = data.text || "";
+            if (safeText.length > 250) safeText = safeText.substring(0, 250);
+
             try {
                 const myAccountId = players[id].accountId;
                 const targetAccountId = data.targetAccountId;
@@ -530,7 +605,8 @@ wss.on('connection', async (ws) => {
                     conv = new PM({ participants: [myAccountId, targetAccountId], messages: [] });
                 }
 
-                conv.messages.push({ senderId: myAccountId, text: data.text });
+                // Usamos "safeText" en lugar de "data.text"
+                conv.messages.push({ senderId: myAccountId, text: safeText }); 
                 if (conv.messages.length > 15) conv.messages = conv.messages.slice(-15);
                 await conv.save();
 
@@ -545,7 +621,7 @@ wss.on('connection', async (ws) => {
                             client.send(JSON.stringify({
                                 type: 'receive_pm',
                                 senderAccountId: myAccountId,
-                                senderUsername: players[id].username, // Solo para la notificación flotante
+                                senderUsername: players[id].username, 
                                 history: conv.messages
                             }));
                         }
