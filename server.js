@@ -43,10 +43,45 @@ const userSchema = new mongoose.Schema({
     // --- NUEVO: SISTEMA DE ECONOMÍA ---
     coins: { type: Number, default: 0 },
     // --- NUEVO: SISTEMA DE ROLES ---
-    role: { type: String, default: 'player' } // Todos nacen como 'player' por defecto, pero podrías tener 'admin', 'moderator', etc. y manejar permisos en el futuro.
+    role: { type: String, default: 'player' }, // Todos nacen como 'player' por defecto, pero podrías tener 'admin', 'moderator', etc. y manejar permisos en el futuro.
+    // ... tus otros campos (coins, friends, etc)
+    squad: { type: mongoose.Schema.Types.ObjectId, ref: 'Squad', default: null } // <--- NUEVO
 });
 
 const User = mongoose.model('User', userSchema);
+
+// --- ESQUEMA DE LOS SQUADS (CLANES) ---
+
+// Sub-esquema para definir qué puede hacer cada miembro
+const squadMemberSchema = new mongoose.Schema({
+    accountId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+    customTitle: { type: String, default: 'Miembro' }, // Aquí va "Comandante", "Reclutador", etc.
+
+    // Los permisos granulares que pediste
+    canInvite: { type: Boolean, default: false },      // Puede contratar personal
+    canKick: { type: Boolean, default: false },        // Puede sacar personal
+    canAssignRoles: { type: Boolean, default: false }  // Puede dar atributos a otros (Full Admin)
+}, { _id: false }); // _id: false evita que MongoDB le cree un ID extra a cada fila del arreglo
+
+// El esquema principal del Squad
+const squadSchema = new mongoose.Schema({
+    name: {
+        type: String,
+        required: true,
+        unique: true, // ¡Garantiza que no haya dos nombres iguales!
+        maxLength: 20 // Para que el nombre no ocupe toda la pantalla
+    },
+    leader: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+
+    // 👇 NUEVO CAMPO PARA EL LOGO 👇
+    logo: { type: String, default: "" },
+    // Arreglo de miembros (Excluyendo al líder). Controlaremos el límite de 24 en el código.
+    members: [squadMemberSchema],
+
+    createdAt: { type: Date, default: Date.now }
+});
+
+const Squad = mongoose.model('Squad', squadSchema);
 
 // --- EL ESQUEMA DE LAS ARMAS ---
 const weaponSchema = new mongoose.Schema({
@@ -242,6 +277,15 @@ wss.on('connection', async (ws) => {
                 // --- NUEVO: PASAR EL ROL A LA MEMORIA ---
                 players[id].role = user.role || 'player';
 
+                // --- NUEVO: CARGAR EL TAG DEL SQUAD EN RAM ---
+                if (user.squad) {
+                    const mySquad = await Squad.findById(user.squad);
+                    if (mySquad) {
+                        players[id].squad = mySquad._id.toString();
+                        players[id].squadName = mySquad.name;
+                        players[id].squadLogo = mySquad.logo;
+                    }
+                }
                 // Send success and include their friends list!
                 ws.send(JSON.stringify({
                     type: 'login_success',
@@ -456,6 +500,16 @@ wss.on('connection', async (ws) => {
                 // --- NUEVO: PASAR EL ROL A LA MEMORIA ---
                 players[id].role = user.role || 'player';
 
+                // --- NUEVO: CARGAR EL TAG DEL SQUAD EN RAM ---
+                if (user.squad) {
+                    const mySquad = await Squad.findById(user.squad);
+                    if (mySquad) {
+                        players[id].squad = mySquad._id.toString();
+                        players[id].squadName = mySquad.name;
+                        players[id].squadLogo = mySquad.logo;
+                    }
+                }
+
                 // Send success back to the browser
                 ws.send(JSON.stringify({
                     type: 'login_success',
@@ -571,15 +625,37 @@ wss.on('connection', async (ws) => {
             });
         }
 
-        // 8. MANEJAR EL DAÑO Y LA VIDA (CON SEGURIDAD ANTI-CHEAT Y ESTADO DE MUERTE)
+        // 8. MANEJAR EL DAÑO Y LA VIDA (CON ESCUDO ANTI-CHEAT)
         if (data.type === 'damage_player') {
             const shooter = players[id];
             const target = players[data.targetId];
 
             // Si el objetivo existe y NO está muerto ya
             if (shooter && target && !target.isDead) {
+
+                // --- 🛡️ EL NUEVO ESCUDO ANTI-HACKER (SERVER VALIDATION) ---
                 const weaponId = shooter.equippedWeapon || "none";
-                const actualDamage = WEAPONS[weaponId] ? WEAPONS[weaponId].damage : 0;
+                const stats = WEAPONS[weaponId];
+                if (!stats || weaponId === "none") return; // Hacker: Intentó hacer daño sin arma
+
+                // 1. ¿Disparó una bala en los últimos 2 segundos? (Evita el spam del código de daño)
+                if (Date.now() - (shooter.lastShotTime || 0) > 2000) {
+                    console.log(`🛡️ Anti-Cheat: ${shooter.username} intentó hacer daño sin disparar.`);
+                    return;
+                }
+
+                // 2. ¿Están dentro del rango lógico del arma?
+                const dist = Math.hypot(shooter.worldX - target.worldX, shooter.worldY - target.worldY);
+                // Distancia máxima teórica = Rango * Velocidad (más un 30% de margen por si hay lag)
+                const maxDist = (stats.range * stats.speed) * 1.3;
+
+                if (dist > maxDist) {
+                    console.log(`🛡️ Anti-Cheat: ${shooter.username} disparó desde demasiado lejos (${Math.round(dist)}px).`);
+                    return; // Hacker: Está intentando matar a todos desde el otro lado del mapa
+                }
+                // --- FIN DEL ESCUDO ---
+
+                const actualDamage = stats.damage;
 
                 target.hp = (target.hp || 100) - actualDamage;
 
@@ -722,19 +798,23 @@ wss.on('connection', async (ws) => {
                 ws.send(JSON.stringify({ type: 'inbox_data', inbox: inboxData }));
             } catch (err) { console.error("Error pidiendo inbox:", err); }
         }
-        // 12. PEDIR LISTA DE AMIGOS ACTUALIZADA
+        // 12. PEDIR LISTA DE AMIGOS ACTUALIZADA (Versión Optimizada)
         if (data.type === 'get_friends_list' && isAuthenticated) {
             try {
                 const myUser = await User.findOne({ email: currentUser });
-                const friendsData = [];
 
-                // Buscar el nombre ACTUAL de cada amigo usando su ID
-                for (let fId of (myUser.friends || [])) {
-                    const fUser = await User.findById(fId);
-                    if (fUser) {
-                        friendsData.push({ accountId: fId, username: fUser.username });
-                    }
-                }
+                // 1. Filtramos en milisegundos (en RAM) solo los IDs que sí son válidos
+                const validFriendIds = (myUser.friends || []).filter(id => mongoose.Types.ObjectId.isValid(id));
+
+                // 2. LA MAGIA: Le pedimos a MongoDB que nos traiga TODOS esos usuarios en 1 SOLA CONSULTA
+                const friendsUsers = await User.find({ _id: { $in: validFriendIds } });
+
+                // 3. Armamos el paquete para enviarlo al juego
+                const friendsData = friendsUsers.map(fUser => ({
+                    accountId: fUser._id.toString(),
+                    username: fUser.username
+                }));
+
                 ws.send(JSON.stringify({ type: 'friends_list_data', friends: friendsData }));
             } catch (err) { console.error("Error pidiendo amigos:", err); }
         }
@@ -761,6 +841,227 @@ wss.on('connection', async (ws) => {
                 ws.send(JSON.stringify({ type: 'update', id: id, player: p })); // Actualiza al jugador
             } catch (err) { console.error("Error al comprar:", err); }
         }
+
+        // 14. CREAR SQUAD (CLAN) CON COBRO Y LOGO
+        if (data.type === 'create_squad' && isAuthenticated) {
+            try {
+                const p = players[id];
+                const squadName = data.squadName.trim();
+                const squadLogo = data.logo ? data.logo.trim() : ""; // <--- NUEVO
+                const SQUAD_PRICE = 2000;
+
+                if (squadName.length < 3 || squadName.length > 20) {
+                    return ws.send(JSON.stringify({ type: 'squad_error', message: 'El nombre debe tener entre 3 y 20 letras.' }));
+                }
+
+                // SEGURIDAD: Solo URLs de Pinterest
+                if (squadLogo !== "" && !squadLogo.startsWith("https://i.pinimg.com/")) {
+                    return ws.send(JSON.stringify({ type: 'squad_error', message: 'El logo debe ser de Pinterest (Empieza con https://i.pinimg.com/)' }));
+                }
+
+                if (p.coins < SQUAD_PRICE) return ws.send(JSON.stringify({ type: 'squad_error', message: `Necesitas ${SQUAD_PRICE} 🪙 para fundar un clan.` }));
+
+                const myUser = await User.findOne({ email: currentUser });
+                if (myUser.squad) return ws.send(JSON.stringify({ type: 'squad_error', message: 'Ya eres miembro de un Squad principal.' }));
+
+                const existingSquad = await Squad.findOne({ name: new RegExp('^' + squadName + '$', 'i') });
+                if (existingSquad) return ws.send(JSON.stringify({ type: 'squad_error', message: 'Ese nombre ya está en uso.' }));
+
+                p.coins -= SQUAD_PRICE;
+                myUser.coins = p.coins;
+
+                const newSquad = new Squad({
+                    name: squadName,
+                    leader: myUser._id,
+                    logo: squadLogo, // <--- GUARDAMOS EL LOGO
+                    members: []
+                });
+                await newSquad.save();
+
+                myUser.squad = newSquad._id;
+                await myUser.save();
+                p.squad = newSquad._id.toString();
+                p.squadName = newSquad.name;
+                p.squadLogo = newSquad.logo;
+
+                ws.send(JSON.stringify({ type: 'squad_success', message: `¡Has fundado el Squad [${squadName}]!`, newCoins: p.coins, squadName: newSquad.name, squadLogo: squadLogo }));
+                broadcast({ type: 'update', id: id, player: p }, ws);
+            } catch (err) { ws.send(JSON.stringify({ type: 'squad_error', message: 'Error interno del servidor.' })); }
+        }
+        // 15. ELIMINAR AMIGO
+        if (data.type === 'remove_friend' && isAuthenticated) {
+            try {
+                const myUser = await User.findOne({ email: currentUser });
+                const friendUser = await User.findById(data.targetId);
+
+                if (myUser && friendUser) {
+                    // 1. Filtrar las listas para borrar el ID del otro
+                    myUser.friends = myUser.friends.filter(fId => fId.toString() !== data.targetId);
+                    friendUser.friends = friendUser.friends.filter(fId => fId.toString() !== myUser._id.toString());
+
+                    // 2. Guardar en MongoDB
+                    await myUser.save();
+                    await friendUser.save();
+
+                    // 3. Actualizar la memoria RAM si tú estás conectado
+                    if (players[id]) {
+                        players[id].friends = myUser.friends.map(fid => fid.toString());
+                    }
+
+                    // 4. (Opcional) Actualizar la memoria RAM del amigo si él también está conectado jugando
+                    const friendSocket = Object.keys(players).find(key => players[key].accountId === data.targetId);
+                    if (friendSocket && players[friendSocket]) {
+                        players[friendSocket].friends = friendUser.friends.map(fid => fid.toString());
+                    }
+
+                    // 5. Avisarte que fue un éxito
+                    ws.send(JSON.stringify({ type: 'friend_removed', targetId: data.targetId }));
+                }
+            } catch (err) {
+                console.error("Error eliminando amigo:", err);
+            }
+        }
+
+        // 16. OBTENER LISTA DE TODOS MIS SQUADS (Con Logo)
+        if (data.type === 'get_my_squads_list' && isAuthenticated) {
+            try {
+                const myUser = await User.findOne({ email: currentUser });
+                const mySquads = await Squad.find({ $or: [{ leader: myUser._id }, { 'members.accountId': myUser._id }] });
+
+                if (mySquads.length === 0) return ws.send(JSON.stringify({ type: 'no_squads_found' }));
+
+                mySquads.sort((a, b) => {
+                    const aIsLeader = a.leader.toString() === myUser._id.toString();
+                    const bIsLeader = b.leader.toString() === myUser._id.toString();
+                    if (aIsLeader && !bIsLeader) return -1;
+                    if (!aIsLeader && bIsLeader) return 1;
+                    return 0;
+                });
+
+                const listData = mySquads.map(sq => ({
+                    id: sq._id,
+                    name: sq.name,
+                    logo: sq.logo, // <--- ENVIAMOS EL LOGO
+                    isLeader: sq.leader.toString() === myUser._id.toString(),
+                    memberCount: sq.members.length + 1
+                }));
+
+                ws.send(JSON.stringify({ type: 'my_squads_list_data', squads: listData }));
+            } catch (err) { console.error(err); }
+        }
+
+        // 17. OBTENER DETALLES DE UN SQUAD ESPECÍFICO (Con Logo)
+        if (data.type === 'get_squad_details' && isAuthenticated) {
+            try {
+                const squad = await Squad.findById(data.squadId).populate('leader', 'username').populate('members.accountId', 'username');
+                if (!squad) return;
+
+                const squadData = {
+                    id: squad._id,
+                    name: squad.name,
+                    logo: squad.logo, // <--- ENVIAMOS EL LOGO AL PERFIL
+                    leader: { id: squad.leader._id, name: squad.leader.username },
+                    members: squad.members.map(m => {
+                        if (!m.accountId) return null;
+                        return { id: m.accountId._id, name: m.accountId.username, title: m.customTitle };
+                    }).filter(m => m !== null)
+                };
+
+                ws.send(JSON.stringify({ type: 'my_squad_data', squad: squadData }));
+            } catch (err) { console.error(err); }
+        }
+
+        // 18. NUEVO: EDITAR SQUAD (COBRO DE 350 SOLO SI CAMBIA EL NOMBRE)
+        if (data.type === 'edit_squad' && isAuthenticated) {
+            try {
+                const p = players[id];
+                const squad = await Squad.findById(data.squadId);
+                const myUser = await User.findOne({ email: currentUser });
+
+                // Seguridad: Verificar si existe y si soy el líder
+                if (!squad || squad.leader.toString() !== myUser._id.toString()) {
+                    return ws.send(JSON.stringify({ type: 'edit_squad_error', message: 'No tienes permisos de Líder.' }));
+                }
+
+                const newName = data.newName.trim();
+                const newLogo = data.newLogo ? data.newLogo.trim() : "";
+
+                if (newName.length < 3 || newName.length > 20) return ws.send(JSON.stringify({ type: 'edit_squad_error', message: 'El nombre debe tener entre 3 y 20 letras.' }));
+                if (newLogo !== "" && !newLogo.startsWith("https://i.pinimg.com/")) return ws.send(JSON.stringify({ type: 'edit_squad_error', message: 'El logo debe ser una imagen de Pinterest.' }));
+
+                // ¿Cambió el nombre? Si es así, validamos y cobramos 350
+                let nameChanged = (newName !== squad.name);
+                if (nameChanged) {
+                    if (p.coins < 350) return ws.send(JSON.stringify({ type: 'edit_squad_error', message: 'Necesitas 350 🪙 para cambiar el nombre.' }));
+
+                    const existingSquad = await Squad.findOne({ name: new RegExp('^' + newName + '$', 'i') });
+                    if (existingSquad) return ws.send(JSON.stringify({ type: 'edit_squad_error', message: 'Ese nombre ya está en uso por otra banda.' }));
+
+                    // Cobrar
+                    p.coins -= 350;
+                    myUser.coins = p.coins;
+                    await myUser.save();
+
+                    squad.name = newName;
+                }
+
+                squad.logo = newLogo;
+                await squad.save();
+
+                ws.send(JSON.stringify({ type: 'edit_squad_success', message: '¡Actualizado!', newCoins: p.coins, squadId: squad._id, squadName: p.squadName, squadLogo: p.squadLogo }));;
+            } catch (err) { ws.send(JSON.stringify({ type: 'edit_squad_error', message: 'Error del servidor.' })); }
+        }
+
+        // 19. EQUIPAR O QUITAR TAG DE SQUAD
+        if (data.type === 'toggle_squad_tag' && isAuthenticated) {
+            try {
+                const myUser = await User.findOne({ email: currentUser });
+                const p = players[id];
+                const squadId = data.squadId;
+
+                // 1. Verificar que el jugador realmente pertenezca a este clan
+                const squad = await Squad.findById(squadId);
+                if (!squad) return;
+
+                const isLeader = squad.leader.toString() === myUser._id.toString();
+                const isMember = squad.members.some(m => m.accountId.toString() === myUser._id.toString());
+
+                if (!isLeader && !isMember) {
+                    return ws.send(JSON.stringify({ type: 'squad_error', message: 'No perteneces a este squad.' }));
+                }
+
+                // 2. Lógica del "Interruptor" (Toggle)
+                let isActive = false;
+
+                // Si el squad que me envió es el mismo que ya tengo equipado, significa que lo quiero QUITAR
+                if (myUser.squad && myUser.squad.toString() === squadId) {
+                    myUser.squad = null;
+                    p.squad = null;
+                    p.squadName = null; // <--- NUEVO
+                    p.squadLogo = null; // <--- NUEVO
+                    isActive = false;
+                } else {
+                    // Si es distinto o estaba en null, lo quiero EQUIPAR (reemplaza a cualquier otro)
+                    myUser.squad = squad._id;
+                    p.squad = squad._id.toString();
+                    p.squadName = squad.name; // <--- NUEVO
+                    p.squadLogo = squad.logo; // <--- NUEVO
+                    isActive = true;
+                }
+
+                // 3. Guardar en Base de Datos y avisar a todos
+                await myUser.save();
+
+                ws.send(JSON.stringify({ type: 'toggle_squad_success', isActive: isActive, squadId: squadId, squadName: p.squadName, squadLogo: p.squadLogo }));
+
+                // Avisarle a los demás jugadores conectados que cambiaste tu Tag
+                broadcast({ type: 'update', id: id, player: p }, ws);
+
+            } catch (err) {
+                console.error("Error al hacer toggle del tag:", err);
+            }
+        }
+
     });
 
     /// 4. DISCONNECT
