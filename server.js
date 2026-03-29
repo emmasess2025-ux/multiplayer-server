@@ -4,11 +4,18 @@ const bcrypt = require('bcryptjs');
 require('dotenv').config(); // <--- ADD THIS LINE TO READ THE .ENV FILE
 
 // --- DATABASE CONNECTION ---
-// Now it pulls securely from your hidden environment file!
 const MONGO_URI = process.env.MONGO_URI;
 
 mongoose.connect(MONGO_URI)
-    .then(() => console.log('🔥 Connected to MongoDB!'))
+    .then(() => {
+        console.log('🔥 Connected to MongoDB!');
+
+        // 🛑 EL FIX: Solo cargamos el mundo cuando la base de datos está 100% conectada
+        loadTilesetsFromDB();
+        loadWorldMapFromDB();
+        loadWeaponsFromDB();
+        loadSafeZonesFromDB(); // <--- ¡AÑADE ESTA LÍNEA AQUÍ!
+    })
     .catch(err => console.error('MongoDB Connection Error:', err));
 
 const tileSchema = new mongoose.Schema({
@@ -26,6 +33,24 @@ const tileSchema = new mongoose.Schema({
 
 const Tile = mongoose.model('Tile', tileSchema);
 
+// --- NUEVO: ESQUEMA DE ZONAS SEGURAS (VECTORES) ---
+const safeZoneSchema = new mongoose.Schema({
+    name: { type: String, required: true },
+    xMin: { type: Number, required: true },
+    xMax: { type: Number, required: true },
+    yMin: { type: Number, required: true },
+    yMax: { type: Number, required: true }
+});
+const SafeZone = mongoose.model('SafeZone', safeZoneSchema);
+
+let safeZonesRAM = []; // Caché ultrarrápida
+
+async function loadSafeZonesFromDB() {
+    try {
+        safeZonesRAM = await SafeZone.find({});
+        console.log(`🛡️ Zonas Seguras cargadas en RAM (${safeZonesRAM.length} zonas).`);
+    } catch (err) { console.error("Error cargando Zonas Seguras:", err); }
+}
 // --- THE PLAYER BLUEPRINT (SCHEMA) ---
 const userSchema = new mongoose.Schema({
     email: { type: String, required: true, unique: true },
@@ -42,6 +67,12 @@ const userSchema = new mongoose.Schema({
 
     // --- NUEVO: SISTEMA DE ECONOMÍA ---
     coins: { type: Number, default: 0 },
+    // 👇 NUEVO: ESTADÍSTICAS DE COMBATE 👇
+    kills: { type: Number, default: 0 },
+    losses: { type: Number, default: 0 },
+    // 👇 NUEVO: GUARDADO DE SALUD (ANTI-COMBAT LOGGING) 👇
+    hp: { type: Number, default: 100 },
+    isDead: { type: Boolean, default: false },
     // --- NUEVO: SISTEMA DE ROLES ---
     role: { type: String, default: 'player' }, // Todos nacen como 'player' por defecto, pero podrías tener 'admin', 'moderator', etc. y manejar permisos en el futuro.
     // ... tus otros campos (coins, friends, etc)
@@ -135,8 +166,50 @@ async function loadTilesetsFromDB() {
     } catch (err) { console.error("Error cargando tilesets:", err); }
 }
 
-// Llama a la función al iniciar el servidor
-loadTilesetsFromDB();
+// --- LA NUEVA MEMORIA FÍSICA DEL SERVIDOR ---
+let serverWorldMap = {}; // Aquí el servidor recordará dónde están las paredes y puertas
+
+async function loadWorldMapFromDB() {
+    try {
+        const allTiles = await Tile.find({});
+        allTiles.forEach(t => {
+            const l = t.l || 0;
+            serverWorldMap[`${t.x},${t.y},${l}`] = {
+                hasCollision: t.hasCollision || false,
+                triggerType: t.triggerType, // <--- NUEVO: Memoriza si es teleport
+                destX: t.destX,             // <--- NUEVO: Coordenada X destino
+                destY: t.destY              // <--- NUEVO: Coordenada Y destino
+            };
+        });
+        console.log(`🌍 Mapa Físico cargado en RAM del servidor (${allTiles.length} bloques).`);
+    } catch (err) {
+        console.error("Error cargando el mapa:", err);
+    }
+}
+
+// Función que usaremos para detectar hackers traspasando paredes
+const TILE_SIZE = 16;
+function serverCheckCollision(x, y) {
+    const hitX = 5;
+    const hitY = 5;
+    const offsetY = 3;
+
+    const checkWall = (cx, cy) => {
+        const gx = Math.floor(cx / TILE_SIZE);
+        const gy = Math.floor(cy / TILE_SIZE);
+        // Escaneamos las 16 capas buscando colisiones
+        for (let l = 0; l <= 15; l++) {
+            if (serverWorldMap[`${gx},${gy},${l}`] && serverWorldMap[`${gx},${gy},${l}`].hasCollision) return true;
+        }
+        return false;
+    };
+
+    return checkWall(x - hitX, y - hitY + offsetY) ||
+        checkWall(x + hitX, y - hitY + offsetY) ||
+        checkWall(x - hitX, y + hitY + offsetY) ||
+        checkWall(x + hitX, y + hitY + offsetY);
+}
+// 👆 HASTA AQUÍ 👆
 
 // --- ESQUEMA DE MENSAJES PRIVADOS (AHORA POR ID) ---
 const pmSchema = new mongoose.Schema({
@@ -175,9 +248,6 @@ async function loadWeaponsFromDB() {
     }
 }
 
-// Llama a la función inmediatamente
-loadWeaponsFromDB();
-
 // Use the port Render gives us, or default to 8080 for local testing
 const PORT = process.env.PORT || 8080;
 const wss = new WebSocket.Server({ port: PORT });
@@ -210,6 +280,31 @@ wss.on('connection', async (ws) => {
     };
 
     ws.on('message', async (message) => {
+
+        // --- 🛡️ ESCUDO ANTI-DDOS (RATE LIMITING) 🛡️ ---
+        const now = Date.now();
+        if (!ws.rateLimit) ws.rateLimit = { count: 0, lastReset: now };
+
+        // Reiniciamos el contador cada segundo (1000 milisegundos)
+        if (now - ws.rateLimit.lastReset > 1000) {
+            ws.rateLimit.count = 0;
+            ws.rateLimit.lastReset = now;
+        }
+
+        ws.rateLimit.count++;
+
+        // Un jugador legal envía ~20 paquetes por segundo.
+        // Si manda más de 40, está usando macros o lag switch. Lo ignoramos.
+        if (ws.rateLimit.count > 40) {
+
+            // Si el ataque es masivo (ej. un script malicioso enviando 100+), le cortamos el cable.
+            if (ws.rateLimit.count > 100) {
+                console.warn(`[ANTI-DDOS] Desconectando atacante por spam masivo.`);
+                ws.close(); // Lo pateamos del servidor instantáneamente
+            }
+            return; // Detenemos la ejecución aquí. Salvamos la CPU del servidor.
+        }
+
         const data = JSON.parse(message);
 
         // 1. HANDLE REGISTRATION
@@ -270,6 +365,17 @@ wss.on('connection', async (ws) => {
 
                 // --- NUEVO: CARGAR MONEDAS A LA RAM ---
                 players[id].coins = user.coins || 0;
+
+                // 👇 NUEVO: CARGAR KILLS Y LOSSES 👇
+                players[id].kills = user.kills || 0;
+                players[id].losses = user.losses || 0;
+                // 👇 NUEVO: CARGAR SALUD A LA RAM 👇
+                players[id].hp = user.hp !== undefined ? user.hp : 100;
+                players[id].isDead = user.isDead || false;
+
+                // 🛑 EL FIX: REINICIAR EL TEMPORIZADOR DE COMBATE AL ENTRAR 🛑
+                // Esto evita que los que recargan la página se curen mágicamente
+                players[id].lastHitTime = Date.now();
 
                 // Agrega esta línea para guardar el ID único de MongoDB en RAM:
                 players[id].accountId = user._id.toString();
@@ -434,12 +540,21 @@ wss.on('connection', async (ws) => {
 
                 const updateData = { hasCollision: data.hasCollision, l: data.layer };
 
-                // --- NUEVO: GUARDAR COORDENADAS DE TELETRANSPORTE Y TIENDAS ---
+                // --- NUEVO: ACTUALIZAR LA RAM DEL SERVIDOR EN TIEMPO REAL ---
+                const key = `${data.x},${data.y},${data.layer}`;
+                if (!serverWorldMap[key]) serverWorldMap[key] = {};
+                serverWorldMap[key].hasCollision = data.hasCollision;
+
                 if (data.triggerType) {
                     updateData.triggerType = data.triggerType;
                     updateData.destX = data.destX;
                     updateData.destY = data.destY;
-                    updateData.itemId = data.itemId; // <--- AÑADE ESTO
+                    updateData.itemId = data.itemId;
+
+                    // Guardar también en RAM
+                    serverWorldMap[key].triggerType = data.triggerType;
+                    serverWorldMap[key].destX = data.destX;
+                    serverWorldMap[key].destY = data.destY;
                 }
 
                 await Tile.updateMany(query, updateData);
@@ -455,6 +570,30 @@ wss.on('connection', async (ws) => {
                     }
                 });
             } catch (err) { console.error('Meta Update Error:', err); }
+        }
+
+        // --- NUEVO: CREAR ZONA SEGURA (ADMIN) ---
+        if (data.type === 'create_safezone') {
+            if (!players[id] || players[id].role !== 'admin') return;
+
+            try {
+                const newZone = new SafeZone({
+                    name: data.name,
+                    xMin: data.xMin, xMax: data.xMax,
+                    yMin: data.yMin, yMax: data.yMax
+                });
+                await newZone.save();
+
+                // Actualizar la RAM del servidor
+                safeZonesRAM.push(newZone);
+
+                // Avisarle a todos los jugadores conectados que hay una nueva zona
+                wss.clients.forEach(client => {
+                    if (client.readyState === WebSocket.OPEN) {
+                        client.send(JSON.stringify({ type: 'new_safezone', zone: newZone }));
+                    }
+                });
+            } catch (err) { console.error("Error guardando SafeZone:", err); }
         }
 
         // 4. HANDLE AUTO-LOGIN
@@ -494,6 +633,18 @@ wss.on('connection', async (ws) => {
                 // --- NUEVO: CARGAR MONEDAS A LA RAM ---
                 players[id].coins = user.coins || 0;
 
+                // 👇 NUEVO: CARGAR KILLS Y LOSSES 👇
+                players[id].kills = user.kills || 0;
+                players[id].losses = user.losses || 0;
+
+                // 👇 NUEVO: CARGAR SALUD A LA RAM 👇
+                players[id].hp = user.hp !== undefined ? user.hp : 100;
+                players[id].isDead = user.isDead || false;
+
+                // 🛑 EL FIX: REINICIAR EL TEMPORIZADOR DE COMBATE AL ENTRAR 🛑
+                // Esto evita que los que recargan la página se curen mágicamente
+                players[id].lastHitTime = Date.now();
+
                 // Agrega esta línea para guardar el ID único de MongoDB en RAM:
                 players[id].accountId = user._id.toString();
 
@@ -523,30 +674,90 @@ wss.on('connection', async (ws) => {
             } catch (err) { console.error(err); }
         }
 
-        // 3. ALLOW GUESTS TO MOVE (SEGURO - ANTI INYECCIÓN)
+        // 3. MOVIMIENTO AUTORITATIVO (ANTI-SPEEDHACK Y ANTI-NOCLIP)
         if (data.type === 'update') {
-            if (!players[id]) players[id] = {};
+            if (!players[id]) players[id] = { worldX: 0, worldY: 0, lastUpdate: Date.now() };
+            let p = players[id];
 
-            players[id].worldX = data.player.worldX;
-            players[id].worldY = data.player.worldY;
-            players[id].frameX = data.player.frameX;
-            players[id].frameY = data.player.frameY;
-            players[id].isMoving = data.player.isMoving;
-            players[id].isTyping = data.player.isTyping;
+            const requestedX = data.player.worldX;
+            const requestedY = data.player.worldY;
 
-            // --- NUEVO ANTI-CRASH: Limitar caracteres del chat ---
+            const now = Date.now();
+            const timeSinceLastUpdate = Math.max(1, now - (p.lastUpdate || now));
+            p.lastUpdate = now;
+
+            const dist = Math.hypot(requestedX - p.worldX, requestedY - p.worldY);
+
+            // EL FIX (ANTI-JITTER): 
+            // 1. Subimos la velocidad teórica a 400px por segundo para dar más holgura al lag.
+            let MAX_ALLOWED_DIST = (400 * timeSinceLastUpdate) / 1000;
+
+            // 2. Subimos el "Piso Mínimo" de 15 a 45 píxeles. 
+            // Esto evita que el servidor te castigue cuando recibe 2 paquetes amontonados al mismo tiempo.
+            MAX_ALLOWED_DIST = Math.max(45, MAX_ALLOWED_DIST);
+
+            // --- NUEVO: ¿ESTÁ CERCA DE UN TELETRANSPORTADOR LEGAL? ---
+            const oldGridX = Math.floor(p.worldX / TILE_SIZE);
+            const oldGridY = Math.floor(p.worldY / TILE_SIZE);
+
+            let isLegalTeleport = false;
+
+            // Escaneamos un radio de 5x5 alrededor de la puerta
+            for (let ox = -2; ox <= 2; ox++) {
+                for (let oy = -2; oy <= 2; oy++) {
+                    const checkX = oldGridX + ox;
+                    const checkY = oldGridY + oy;
+                    const logicTile = serverWorldMap[`${checkX},${checkY},15`]; // Revisa capa 15
+
+                    if (logicTile && logicTile.triggerType === 'teleport') {
+                        // Calculamos a dónde lleva esta puerta teóricamente
+                        const expectedX = (logicTile.destX * TILE_SIZE) + (TILE_SIZE / 2);
+                        const expectedY = (logicTile.destY * TILE_SIZE) + (TILE_SIZE / 2);
+
+                        // EL FIX DEFINITIVO: 150 píxeles de tolerancia.
+                        // Al salir de edificios, el cliente suele "escupir" al jugador lejos de la puerta.
+                        // Mientras caiga en un radio de 150px del destino, el salto es 100% legal.
+                        if (Math.abs(requestedX - expectedX) < 150 && Math.abs(requestedY - expectedY) < 150) {
+                            isLegalTeleport = true;
+                            break;
+                        }
+                    }
+                }
+                if (isLegalTeleport) break;
+            }
+
+            const isColliding = serverCheckCollision(requestedX, requestedY);
+            const isAdmin = (p.role === 'admin');
+
+            // EL FIX: Agregamos !isLegalTeleport para que no lo castigue si usó una puerta
+            if (!isAdmin && !isLegalTeleport && (dist > MAX_ALLOWED_DIST || isColliding)) {
+
+                // 🚔 ¡HACKER DETECTADO! 
+                ws.send(JSON.stringify({
+                    type: 'force_position',
+                    x: p.worldX,
+                    y: p.worldY
+                }));
+
+            } else {
+                // Movimiento legal (o Teleport Autorizado)
+                p.worldX = requestedX;
+                p.worldY = requestedY;
+            }
+
+            p.frameX = data.player.frameX;
+            p.frameY = data.player.frameY;
+            p.isMoving = data.player.isMoving;
+            p.isTyping = data.player.isTyping;
+
             let safeMsg = data.player.message || "";
-            if (safeMsg.length > 100) safeMsg = safeMsg.substring(0, 100);
-            players[id].message = safeMsg;
+            p.message = safeMsg.substring(0, 100);
+            p.messageTimer = Math.min(data.player.messageTimer || 0, 600);
 
-            // Evitar que envíen un temporizador infinito
-            let safeTimer = data.player.messageTimer || 0;
-            if (safeTimer > 600) safeTimer = 600;
-            players[id].messageTimer = safeTimer;
-
+            // Enviar posición oficial a los demás
             wss.clients.forEach(client => {
                 if (client !== ws && client.readyState === WebSocket.OPEN) {
-                    client.send(JSON.stringify({ type: 'update', id: id, player: players[id] }));
+                    client.send(JSON.stringify({ type: 'update', id: id, player: p }));
                 }
             });
         }
@@ -556,10 +767,33 @@ wss.on('connection', async (ws) => {
             const p = players[id];
             if (!p) return;
 
-            // Verificar que el arma que pide exista en el hotbar de la RAM del servidor
             if (data.weaponId === "none" || (p.hotbar && p.hotbar.includes(data.weaponId))) {
                 p.equippedWeapon = data.weaponId;
-                broadcast({ type: 'update', id: id, player: p }, ws); // Avisar a los demás
+
+                // --- EL FIX ANTI-CRASH: Guardar el Timer en 'ws' en lugar de 'p' ---
+                if (ws.reloadTimeout) clearTimeout(ws.reloadTimeout);
+
+                // Limpiar la variable contaminada por si acaso quedó viva
+                delete p.reloadTimeout;
+
+                const stats = WEAPONS[data.weaponId];
+                if (stats) {
+                    p.ammo = 0;
+                    p.isReloading = true;
+
+                    ws.reloadTimeout = setTimeout(() => {
+                        if (players[id] && players[id].equippedWeapon === data.weaponId) {
+                            players[id].ammo = stats.magSize;
+                            players[id].isReloading = false;
+                        }
+                    }, stats.reloadTime);
+                } else {
+                    p.ammo = 0;
+                    p.isReloading = false;
+                }
+
+                // Ahora 'p' está 100% limpio de Timers de Node.js
+                broadcast({ type: 'update', id: id, player: p }, ws);
             }
         }
 
@@ -575,6 +809,20 @@ wss.on('connection', async (ws) => {
             }
         }
 
+        // --- HERRAMIENTA: ESCÁNER DE ZONAS SEGURAS ---
+        const SERVER_TILE_SIZE = 16;
+
+        // --- HERRAMIENTA: ESCÁNER MATEMÁTICO DE ZONAS SEGURAS ---
+        function isInSafeZone(px, py) {
+            for (let i = 0; i < safeZonesRAM.length; i++) {
+                let z = safeZonesRAM[i];
+                if (px >= z.xMin && px <= z.xMax && py >= z.yMin && py <= z.yMax) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
         // 7. HANDLE SHOOTING (CON ANTI-CHEAT)
         if (data.type === 'shoot') {
             const shooter = players[id];
@@ -583,27 +831,31 @@ wss.on('connection', async (ws) => {
 
             if (!stats || weaponId === "none") return;
 
+            // 👇 NUEVO: BLOQUEO DE DISPARO EN ZONA SEGURA 👇
+            if (isInSafeZone(shooter.worldX, shooter.worldY)) {
+                return; // Ignoramos el disparo silenciosamente
+            }
+
             const now = Date.now();
 
-            // ANTI-CHEAT 1: ¿Está disparando más rápido que el FireRate del arma?
-            // Le damos 50ms de margen por el lag del internet
-            if (now - shooter.lastShotTime < (stats.fireRate - 50)) {
-                return; // ¡Hacker ignorado!
+            // EL FIX (ANTI-GHOST BULLETS): Las balas visuales no matan a nadie, 
+            // así que les damos un 50% de margen de tolerancia para absorber los "tropiezos" del internet (Jitter).
+            if (now - shooter.lastShotTime < (stats.fireRate * 0.5)) {
+                return; // Hacker ignorado solo si es descaradamente rápido
             }
 
             // ANTI-CHEAT 2: ¿Tiene balas?
             if (shooter.ammo <= 0) {
-                // Si no tiene balas y no está recargando, iniciar recarga en el servidor
                 if (!shooter.isReloading) {
                     shooter.isReloading = true;
-                    setTimeout(() => {
-                        if (players[id]) { // Verificar que el jugador no se haya desconectado
+                    ws.reloadTimeout = setTimeout(() => {
+                        if (players[id]) {
                             players[id].ammo = stats.magSize;
                             players[id].isReloading = false;
                         }
                     }, stats.reloadTime);
                 }
-                return; // No puede disparar, está vacío/recargando
+                return;
             }
 
             // SI PASA LAS PRUEBAS: Disparo oficial
@@ -614,52 +866,57 @@ wss.on('connection', async (ws) => {
             wss.clients.forEach(client => {
                 if (client !== ws && client.readyState === WebSocket.OPEN) {
                     client.send(JSON.stringify({
-                        type: 'shoot',
-                        id: id,
-                        x: data.x,
-                        y: data.y,
-                        angle: data.angle,
-                        weaponId: weaponId
+                        type: 'shoot', id: id, x: data.x, y: data.y, angle: data.angle, weaponId: weaponId
                     }));
                 }
             });
         }
 
-        // 8. MANEJAR EL DAÑO Y LA VIDA (CON ESCUDO ANTI-CHEAT)
+        // 8. MANEJAR EL DAÑO Y LA VIDA (CON ESCUDO ANTI-CHEAT DEFINITIVO)
         if (data.type === 'damage_player') {
             const shooter = players[id];
             const target = players[data.targetId];
 
-            // Si el objetivo existe y NO está muerto ya
             if (shooter && target && !target.isDead) {
 
-                // --- 🛡️ EL NUEVO ESCUDO ANTI-HACKER (SERVER VALIDATION) ---
                 const weaponId = shooter.equippedWeapon || "none";
                 const stats = WEAPONS[weaponId];
-                if (!stats || weaponId === "none") return; // Hacker: Intentó hacer daño sin arma
+                if (!stats || weaponId === "none") return;
 
-                // 1. ¿Disparó una bala en los últimos 2 segundos? (Evita el spam del código de daño)
-                if (Date.now() - (shooter.lastShotTime || 0) > 2000) {
-                    console.log(`🛡️ Anti-Cheat: ${shooter.username} intentó hacer daño sin disparar.`);
+                const now = Date.now();
+
+                // 1. ¿Disparó recientemente?
+                if (now - (shooter.lastShotTime || 0) > 2000) return;
+
+                // 2. ANTI-METRALLETA DE DAÑO (Más estricto que las balas visuales)
+                const lastDamage = shooter.lastDamageTime || 0;
+                if (now - lastDamage < (stats.fireRate - 50)) {
+                    return;
+                }
+                shooter.lastDamageTime = now;
+
+                // 3. RANGO
+                const dist = Math.hypot(shooter.worldX - target.worldX, shooter.worldY - target.worldY);
+                const maxDist = (stats.range * stats.speed) * 1.3;
+                if (dist > maxDist) return;
+
+                // 4. FUEGO AMIGO
+                if (shooter.squad && target.squad && shooter.squad === target.squad) {
                     return;
                 }
 
-                // 2. ¿Están dentro del rango lógico del arma?
-                const dist = Math.hypot(shooter.worldX - target.worldX, shooter.worldY - target.worldY);
-                // Distancia máxima teórica = Rango * Velocidad (más un 30% de margen por si hay lag)
-                const maxDist = (stats.range * stats.speed) * 1.3;
-
-                if (dist > maxDist) {
-                    console.log(`🛡️ Anti-Cheat: ${shooter.username} disparó desde demasiado lejos (${Math.round(dist)}px).`);
-                    return; // Hacker: Está intentando matar a todos desde el otro lado del mapa
+                // 👇 NUEVO: 4.5 ¿ALGUNO ESTÁ EN ZONA SEGURA? 👇
+                if (isInSafeZone(shooter.worldX, shooter.worldY) || isInSafeZone(target.worldX, target.worldY)) {
+                    return; // Nadie recibe daño si uno de los dos está en zona segura
                 }
-                // --- FIN DEL ESCUDO ---
+
+                // 👇 5. EL FIX: ESCUDO DE PROTECCIÓN AL REVIVIR 👇
+                if (target.invulnerableUntil && now < target.invulnerableUntil) {
+                    return; // Ignoramos el daño porque el jugador tiene el escudo activo
+                }
 
                 const actualDamage = stats.damage;
-
                 target.hp = (target.hp || 100) - actualDamage;
-
-                // --- ¡EL FIX DEL AUTO-HEAL! REINICIAR EL CRONÓMETRO ---
                 target.lastHitTime = Date.now();
 
                 // --- SISTEMA DE MUERTE (DERRIBADO) ---
@@ -667,11 +924,18 @@ wss.on('connection', async (ws) => {
                     target.hp = 0;
                     target.isDead = true;
 
+                    shooter.kills = (shooter.kills || 0) + 1;
+                    target.losses = (target.losses || 0) + 1;
+
+                    // Revivir al jugador después de 3 segundos
                     setTimeout(() => {
                         if (players[data.targetId]) {
                             players[data.targetId].hp = 100;
                             players[data.targetId].isDead = false;
-                            players[data.targetId].lastHitTime = Date.now(); // Reiniciar al revivir
+                            players[data.targetId].lastHitTime = Date.now();
+
+                            // 👇 LA MAGIA: 2 Segundos de Invulnerabilidad al revivir 👇
+                            players[data.targetId].invulnerableUntil = Date.now() + 2000;
 
                             wss.clients.forEach(client => {
                                 if (client.readyState === WebSocket.OPEN) {
@@ -685,6 +949,7 @@ wss.on('connection', async (ws) => {
                     }, 3000);
                 }
 
+                // Enviar la actualización de vida a todos
                 wss.clients.forEach(client => {
                     if (client.readyState === WebSocket.OPEN) {
                         client.send(JSON.stringify({
@@ -692,7 +957,10 @@ wss.on('connection', async (ws) => {
                             targetId: data.targetId,
                             newHp: target.hp,
                             damageDealt: actualDamage,
-                            isDead: target.isDead || false
+                            isDead: target.isDead || false,
+                            shooterId: id,
+                            shooterKills: shooter.kills,
+                            targetLosses: target.losses
                         }));
                     }
                 });
@@ -1060,6 +1328,81 @@ wss.on('connection', async (ws) => {
             } catch (err) {
                 console.error("Error al hacer toggle del tag:", err);
             }
+        }// 20. ENVIAR INVITACIÓN AL CLAN
+        if (data.type === 'send_squad_invite' && isAuthenticated) {
+            try {
+                const p = players[id];
+                if (!p.squad) return ws.send(JSON.stringify({ type: 'squad_error', message: 'Primero equipa tu Tag para invitar.' }));
+
+                const squad = await Squad.findById(p.squad);
+                if (!squad) return;
+
+                const myUser = await User.findOne({ email: currentUser });
+                const isLeader = squad.leader.toString() === myUser._id.toString();
+                const memberData = squad.members.find(m => m.accountId.toString() === myUser._id.toString());
+                const canInvite = isLeader || (memberData && memberData.canInvite);
+
+                if (!canInvite) return ws.send(JSON.stringify({ type: 'squad_error', message: 'No tienes permisos para reclutar.' }));
+
+                // --- NUEVA VALIDACIÓN: ¿El objetivo ya está en ESTE clan? ---
+                const targetIsLeader = squad.leader.toString() === data.targetAccountId;
+                const targetIsMember = squad.members.some(m => m.accountId.toString() === data.targetAccountId);
+
+                if (targetIsLeader || targetIsMember) {
+                    return ws.send(JSON.stringify({ type: 'squad_error', message: 'Este jugador ya pertenece a tu clan.' }));
+                }
+
+                // Buscar al objetivo y ver si está conectado
+                let targetWsId = null;
+                for (let pid in players) {
+                    if (players[pid].accountId === data.targetAccountId) targetWsId = pid;
+                }
+
+                if (targetWsId) {
+                    wss.clients.forEach(client => {
+                        if (client.playerId === targetWsId && client.readyState === WebSocket.OPEN) {
+                            client.send(JSON.stringify({
+                                type: 'squad_invite',
+                                squadId: squad._id,
+                                squadName: squad.name,
+                                senderUsername: p.username,
+                                senderFrameX: p.frameX,
+                                senderFrameY: p.frameY
+                            }));
+                        }
+                    });
+                    ws.send(JSON.stringify({ type: 'squad_success', message: 'Invitación enviada.' }));
+                } else {
+                    ws.send(JSON.stringify({ type: 'squad_error', message: 'El jugador no está en línea.' }));
+                }
+            } catch (err) { console.error("Error invitando al clan:", err); }
+        }
+
+        // 21. ACEPTAR INVITACIÓN AL CLAN
+        if (data.type === 'accept_squad_invite' && isAuthenticated) {
+            try {
+                const squad = await Squad.findById(data.squadId);
+                if (!squad) return ws.send(JSON.stringify({ type: 'squad_error', message: 'El clan ya no existe.' }));
+
+                const myUser = await User.findOne({ email: currentUser });
+
+                // Regla 1: Límite de miembros (Excluye al líder)
+                if (squad.members.length >= 24) return ws.send(JSON.stringify({ type: 'squad_error', message: 'El clan está lleno.' }));
+
+                // Regla 2: ¿Ya estoy en este clan?
+                const isMember = squad.members.some(m => m.accountId.toString() === myUser._id.toString());
+                const isLeader = squad.leader.toString() === myUser._id.toString();
+
+                if (!isMember && !isLeader) {
+                    // Lo agregamos como miembro básico
+                    squad.members.push({ accountId: myUser._id });
+                    await squad.save();
+
+                    ws.send(JSON.stringify({ type: 'squad_success', message: `¡Te has unido al clan [${squad.name}]!` }));
+                } else {
+                    ws.send(JSON.stringify({ type: 'squad_error', message: 'Ya eres miembro de este clan.' }));
+                }
+            } catch (err) { console.error("Error aceptando clan:", err); }
         }
 
     });
@@ -1070,14 +1413,18 @@ wss.on('connection', async (ws) => {
         if (isAuthenticated && players[id]) {
             try {
                 await User.findOneAndUpdate(
-                    { email: currentUser }, // <--- FIX: Search by Email!
+                    { email: currentUser },
                     {
                         worldX: players[id].worldX,
                         worldY: players[id].worldY,
                         equippedWeapon: players[id].equippedWeapon,
                         hotbar: players[id].hotbar,
-                        // --- NUEVO: GUARDAR MONEDAS AL DESCONECTARSE ---
-                        coins: players[id].coins
+                        coins: players[id].coins,
+                        hp: players[id].hp,
+                        isDead: players[id].isDead,
+                        // 👇 NUEVO: GUARDAR KILLS Y LOSSES 👇
+                        kills: players[id].kills,
+                        losses: players[id].losses
                     }
                 );
             } catch (err) { console.error(err); }
@@ -1100,8 +1447,9 @@ wss.on('connection', async (ws) => {
         id: id,
         players: players,
         worldMap: allTiles,
-        weaponsDB: WEAPONS, // <--- ¡Le mandamos la tabla oficial al cliente!
-        tilesetsDB: TILESETS // <--- ¡NUEVO! Le mandamos el menú del Editor
+        weaponsDB: WEAPONS,
+        tilesetsDB: TILESETS,
+        safeZones: safeZonesRAM // <--- ¡NUEVO: Enviamos los rectángulos de paz al jugador!
     }));
 
     // 4. NOW TELL THE LOBBY A GUEST HAS ARRIVED
