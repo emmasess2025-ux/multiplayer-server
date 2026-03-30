@@ -24,11 +24,12 @@ const tileSchema = new mongoose.Schema({
     l: { type: Number, default: 0 },
     tileId: Number,
     hasCollision: { type: Boolean, default: false },
-    // --- NUEVO: DATOS LÓGICOS (Capa 15) ---
-    triggerType: { type: String, default: null },
-    destX: { type: Number, default: null },
-    destY: { type: Number, default: null },
-    itemId: { type: String, default: null }
+    // Logical Data: Omit defaults so these are only stored if they have values
+    triggerType: String,
+    destX: Number,
+    destY: Number,
+    itemId: String,
+    rotation: { type: Number, default: 0 }
 });
 
 const Tile = mongoose.model('Tile', tileSchema);
@@ -501,7 +502,7 @@ wss.on('connection', async (ws) => {
                         bulkOps.push({
                             updateOne: {
                                 filter: { x: t.x, y: t.y, l: t.l },
-                                update: { $set: { tileId: t.tileId } },
+                                update: { $set: { tileId: t.tileId, rotation: t.rotation || 0 } }, // <--- EL FIX
                                 upsert: true
                             }
                         });
