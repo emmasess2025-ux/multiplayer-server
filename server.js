@@ -144,50 +144,66 @@ const squadSchema = new mongoose.Schema({
 
 const Squad = mongoose.model('Squad', squadSchema);
 
-// --- EL ESQUEMA DE LAS ARMAS EVOLUCIONADO (GANI READY) ---
+// --- 1. EL ESQUEMA ESTRICTO PARA LAS DIRECCIONES ---
+const dirStatsSchema = new mongoose.Schema({
+    wX: Number, wY: Number, wRot: Number, wZ: Number, wSwg: Number,
+    hX: Number, hY: Number, hRot: Number, hZ: Number,
+    aX: Number, aY: Number, aRot: Number, aZ: Number,
+    hitX: Number, hitY: Number, hitRot: Number, hitLen: Number, hitWid: Number,
+    tX: Number, tY: Number, wTileX: Number, wTileY: Number,
+    kb: Number, freeze: Number
+}, { _id: false });
+
+// --- 2. EL ESQUEMA DE LAS ARMAS ---
 const weaponSchema = new mongoose.Schema({
     id: { type: String, required: true, unique: true },
     name: String,
-    type: { type: String, default: "ranged" }, // "ranged" (armas de fuego) o "melee" (espadas/bates)
-
-    // --- ATRIBUTOS DE COMBATE ---
-    damage: Number,
-    speed: Number,
-    fireRate: Number,
-    magSize: Number,
-    reloadTime: Number,
-    range: Number,
-    color: String,
-    price: Number,
-    src: String,
-
-    // --- EL PIVOTE (EL MANGO O AGARRE DEL ARMA) ---
-    // Define en qué píxel de la imagen del arma se pone la mano
+    type: { type: String, default: "ranged" },
+    damage: Number, speed: Number, fireRate: Number, magSize: Number, reloadTime: Number, range: Number, color: String, price: Number, src: String,
     pivotX: { type: Number, default: 0 },
     pivotY: { type: Number, default: 0 },
-
-    // 0: Down, 1: Left, 2: Right, 3: Up
+    // Asignamos el esquema a los 4 lados fijos
     dirStats: {
-        type: Object,
-        default: {
-            0: { rot: 0, arc: 90, len: 40, wid: 60, hX: 0, hY: 0, tX: 13, tY: 0 },
-            1: { rot: 0, arc: 90, len: 40, wid: 60, hX: 0, hY: 0, tX: 13, tY: 0 },
-            2: { rot: 0, arc: 90, len: 40, wid: 60, hX: 0, hY: 0, tX: 13, tY: 0 },
-            3: { rot: 0, arc: 90, len: 40, wid: 60, hX: 0, hY: 0, tX: 13, tY: 0 }
-        }
+        '0': { type: dirStatsSchema, default: () => ({}) },
+        '1': { type: dirStatsSchema, default: () => ({}) },
+        '2': { type: dirStatsSchema, default: () => ({}) },
+        '3': { type: dirStatsSchema, default: () => ({}) }
     }
 });
 
 const Weapon = mongoose.model('Weapon', weaponSchema);
 
-// --- CACHÉ EN RAM ACTUALIZADA ---
+// --- CACHÉ EN RAM ---
 let WEAPONS = {
     "none": {
         damage: 0, speed: 0, fireRate: 0, magSize: 0, reloadTime: 0,
-        color: "transparent", type: "none",
-        pivotX: 0, pivotY: 0, defaultRotation: 0
+        color: "transparent", type: "none", pivotX: 0, pivotY: 0, defaultRotation: 0
     }
 };
+
+async function loadWeaponsFromDB() {
+    try {
+        const existing = await Weapon.findOne({ id: "ghost_gun" });
+        if (!existing) {
+            await Weapon.create({
+                id: "ghost_gun", name: "Ghost Gun", type: "ranged",
+                damage: 15, speed: 6, fireRate: 250, magSize: 8, reloadTime: 1500, range: 120, color: "#2ecc71", price: 0,
+                src: "weapons/gun/Ghost_gun.png", pivotX: 0, pivotY: 0, defaultRotation: 0
+            });
+        }
+
+        // 🛑 EL FIX MÁGICO (.lean()): Convierte los documentos de Mongoose a objetos puros de JavaScript
+        // Esto evita que JSON.stringify destruya los datos al enviarlos a tu juego.
+        const dbWeapons = await Weapon.find({}).lean();
+
+        dbWeapons.forEach(w => {
+            WEAPONS[w.id] = w;
+        });
+        console.log(`✅ Base de datos de armas cargada con éxito (${dbWeapons.length} armas).`);
+    } catch (err) {
+        console.error("Error cargando armas:", err);
+    }
+}
 
 // --- EL ESQUEMA DE LOS TILESETS ---
 const tilesetSchema = new mongoose.Schema({
@@ -275,40 +291,6 @@ const pmSchema = new mongoose.Schema({
     }]
 });
 const PM = mongoose.model('PM', pmSchema);
-
-async function loadWeaponsFromDB() {
-    try {
-        const existing = await Weapon.findOne({ id: "ghost_gun" });
-        if (!existing) {
-            await Weapon.create({
-                id: "ghost_gun",
-                name: "Ghost Gun",
-                type: "ranged", // <--- Nuevo
-                damage: 15,
-                speed: 6,
-                fireRate: 250,
-                magSize: 8,
-                reloadTime: 1500,
-                range: 120,
-                color: "#2ecc71",
-                price: 0,
-                src: "weapons/gun/Ghost_gun.png",
-                pivotX: 0,  // <--- Nuevo: Ajustarás esto en el editor
-                pivotY: 0,  // <--- Nuevo: Ajustarás esto en el editor
-                defaultRotation: 0 // <--- Nuevo
-            });
-            console.log('🔫 Ghost Gun actualizada con sistema Gani en MongoDB!');
-        }
-
-        const dbWeapons = await Weapon.find({});
-        dbWeapons.forEach(w => {
-            WEAPONS[w.id] = w;
-        });
-        console.log(`✅ Base de datos de armas cargada con éxito (${dbWeapons.length} armas).`);
-    } catch (err) {
-        console.error("Error cargando armas:", err);
-    }
-}
 
 // Use the port Render gives us, or default to 8080 for local testing
 const PORT = process.env.PORT || 8080;
@@ -885,7 +867,7 @@ wss.on('connection', async (ws) => {
             return false;
         }
 
-        // 7. HANDLE SHOOTING (CON ANTI-CHEAT)
+        // 7. HANDLE SHOOTING (SINCRO VISUAL ABSOLUTA ANTI-FANTASMAS)
         if (data.type === 'shoot') {
             const shooter = players[id];
             const weaponId = shooter.equippedWeapon || "none";
@@ -893,38 +875,25 @@ wss.on('connection', async (ws) => {
 
             if (!stats || weaponId === "none") return;
 
-            // 👇 NUEVO: BLOQUEO DE DISPARO EN ZONA SEGURA 👇
+            // BLOQUEO DE DISPARO EN ZONA SEGURA
             if (isInSafeZone(shooter.worldX, shooter.worldY)) {
-                return; // Ignoramos el disparo silenciosamente
+                return;
             }
 
             const now = Date.now();
 
-            // EL FIX (ANTI-GHOST BULLETS): Las balas visuales no matan a nadie, 
-            // así que les damos un 50% de margen de tolerancia para absorber los "tropiezos" del internet (Jitter).
-            if (now - shooter.lastShotTime < (stats.fireRate * 0.5)) {
-                return; // Hacker ignorado solo si es descaradamente rápido
-            }
+            // 🛑 EL FIX: Quitamos la lógica estricta de munición de este bloque.
+            // Las balas visuales NO hacen daño. El verdadero escudo anti-hack está en 'damage_player'.
+            // Al hacer esto, evitamos la desincronización y el lag de internet.
 
-            // ANTI-CHEAT 2: ¿Tiene balas?
-            if (shooter.ammo <= 0) {
-                if (!shooter.isReloading) {
-                    shooter.isReloading = true;
-                    ws.reloadTimeout = setTimeout(() => {
-                        if (players[id]) {
-                            players[id].ammo = stats.magSize;
-                            players[id].isReloading = false;
-                        }
-                    }, stats.reloadTime);
-                }
+            // Solo dejamos un Anti-Spam básico (Ej. máximo 20 balas visuales por segundo)
+            // para evitar que un hacker malicioso sature la pantalla de luces.
+            if (now - (shooter.lastShotTime || 0) < 50) {
                 return;
             }
-
-            // SI PASA LAS PRUEBAS: Disparo oficial
-            shooter.ammo--;
             shooter.lastShotTime = now;
 
-            // Replicar la bala a todos los demás
+            // Replicar la bala a todos los demás instantáneamente sin hacer preguntas
             wss.clients.forEach(client => {
                 if (client !== ws && client.readyState === WebSocket.OPEN) {
                     client.send(JSON.stringify({
@@ -974,6 +943,48 @@ wss.on('connection', async (ws) => {
                 target.hp = (Number(target.hp) || 100) - actualDamage;
                 target.lastHitTime = Date.now();
 
+                // 💥 SISTEMA DE EMPUJE (KNOCKBACK AL ENEMIGO CON COLISIONES) 💥
+                let knockbackForce = 0;
+                if (stats.dirStats) {
+                    const kbDir = stats.dirStats['0'] || stats.dirStats['1'] || stats.dirStats['2'] || stats.dirStats['3'] || {};
+                    knockbackForce = Number(kbDir.kb) || 0;
+                }
+
+                if (knockbackForce > 0 && !target.isDead) {
+                    const angle = Math.atan2(target.worldY - shooter.worldY, target.worldX - shooter.worldX);
+
+                    // 🛑 EL FIX: En lugar de teletransportar, caminamos pasito a pasito. 
+                    // Si encontramos una pared, el empuje se cancela.
+                    let stepForce = knockbackForce / 5;
+                    for (let i = 0; i < 5; i++) {
+                        let nextX = target.worldX + (Math.cos(angle) * stepForce);
+                        let nextY = target.worldY + (Math.sin(angle) * stepForce);
+
+                        if (!serverCheckCollision(nextX, nextY)) {
+                            target.worldX = nextX;
+                            target.worldY = nextY;
+                        } else {
+                            break; // 🧱 Chocó contra pared, salvado.
+                        }
+                    }
+
+                    // Avisar a la cámara de la víctima
+                    wss.clients.forEach(c => {
+                        if (c.playerId === data.targetId && c.readyState === WebSocket.OPEN) {
+                            c.send(JSON.stringify({
+                                type: 'force_position',
+                                x: target.worldX,
+                                y: target.worldY,
+                                reason: 'knockback'
+                            }));
+                        }
+                    });
+
+                    // 2. Avisar a todos los DEMÁS que la víctima salió volando
+                    // 🛑 EL FIX: Quitamos el JSON.stringify
+                    broadcast({ type: 'update', id: data.targetId, player: target });
+                }
+
                 // --- SISTEMA DE MUERTE (DERRIBADO) ---
                 if (target.hp <= 0) {
                     target.hp = 0;
@@ -1021,12 +1032,13 @@ wss.on('connection', async (ws) => {
         }
         // --- 1. SINCRONIZAR ANIMACIÓN MELEE ---
         if (data.type === 'melee_swing') {
-            // Reenvía a todos LOS DEMÁS que este jugador dio un espadazo
-            broadcast(JSON.stringify({
+            // 🛑 EL FIX: Quitamos el JSON.stringify porque la función 'broadcast' ya lo hace internamente.
+            // También usamos 'id' directo en lugar de 'ws.playerId'.
+            broadcast({
                 type: 'player_swing',
-                id: ws.playerId,
+                id: id,
                 weaponId: data.weaponId
-            }), ws);
+            }, ws);
         }
 
         // 9. ENVIAR MENSAJE PRIVADO
@@ -1499,42 +1511,25 @@ wss.on('connection', async (ws) => {
             try {
                 if (players[id].role !== 'admin') return;
 
-                console.log(`[MELEE] 📝 Procesando guardado de arma: ${data.weaponId} (Dir: ${data.direction})`);
-
-                // 1. Buscar el arma o prepararla para crearla desde cero
                 let weaponDoc = await Weapon.findOne({ id: data.weaponId });
-
                 if (!weaponDoc) {
-                    weaponDoc = new Weapon({
-                        id: data.weaponId,
-                        type: "melee",
-                        dirStats: {} // Inicializamos el objeto vacío
-                    });
+                    weaponDoc = new Weapon({ id: data.weaponId, type: "melee" });
                 }
 
-                // 2. Asegurarnos de que el objeto dirStats exista
-                if (!weaponDoc.dirStats) {
-                    weaponDoc.dirStats = {};
-                }
+                if (!weaponDoc.dirStats) weaponDoc.dirStats = {};
 
-                // 3. Sobreescribir SOLO la dirección que estamos modificando
-                weaponDoc.dirStats[data.direction] = data.stats;
+                // Sobreescribir los datos
+                weaponDoc.dirStats[String(data.direction)] = data.stats;
 
-                // 4. 🔥 EL COMANDO MÁGICO 🔥
-                // Obligamos a Mongoose a reconocer que este "Objeto Mixto" fue alterado
-                weaponDoc.markModified('dirStats');
-
-                // 5. Guardar físicamente en MongoDB
+                // 🛑 EL FIX: Forzamos a Mongoose a notar el cambio en este lado específico
+                weaponDoc.markModified(`dirStats.${data.direction}`);
                 await weaponDoc.save();
 
-                console.log(`[MELEE] ✅ Guardado 100% real en MongoDB. Arma: ${weaponDoc.id}, Lado: ${data.direction}`);
-
-                // Actualizamos la memoria RAM del servidor
-                if (!WEAPONS[data.weaponId]) WEAPONS[data.weaponId] = { type: "melee" };
-                if (!WEAPONS[data.weaponId].dirStats) WEAPONS[data.weaponId].dirStats = {};
+                // Actualizamos la RAM del servidor
+                if (!WEAPONS[data.weaponId]) WEAPONS[data.weaponId] = { type: "melee", dirStats: {} };
                 WEAPONS[data.weaponId].dirStats[data.direction] = data.stats;
 
-                // Avisamos a todos los clientes en el mapa
+                // Avisamos a las pantallas
                 wss.clients.forEach(client => {
                     if (client.readyState === WebSocket.OPEN) {
                         client.send(JSON.stringify({
@@ -1545,9 +1540,7 @@ wss.on('connection', async (ws) => {
                         }));
                     }
                 });
-            } catch (err) {
-                console.error("[MELEE] 💥 ERROR al guardar en MongoDB:", err);
-            }
+            } catch (err) { console.error("💥 ERROR al guardar en MongoDB:", err); }
         } else if (data.type === 'sync_weapon_pivot') {
             if (weaponsDB[data.weaponId]) {
                 weaponsDB[data.weaponId].pivotX = data.pivotX;
