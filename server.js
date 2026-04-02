@@ -15,6 +15,7 @@ mongoose.connect(MONGO_URI)
         loadWorldMapFromDB();
         loadWeaponsFromDB();
         loadSafeZonesFromDB(); // <--- ¡AÑADE ESTA LÍNEA AQUÍ!
+        loadSkeletonFromDB();
     })
     .catch(err => console.error('MongoDB Connection Error:', err));
 
@@ -51,6 +52,34 @@ async function loadSafeZonesFromDB() {
         safeZonesRAM = await SafeZone.find({});
         console.log(`🛡️ Zonas Seguras cargadas en RAM (${safeZonesRAM.length} zonas).`);
     } catch (err) { console.error("Error cargando Zonas Seguras:", err); }
+}
+
+// --- MODELO DEL ESQUELETO (GANI) ---
+const skeletonSchema = new mongoose.Schema({
+    anchors: { type: Object, default: {} },
+    handTile: { type: Object, default: { x: 13, y: 0 } } // <--- NUEVO
+});
+const Skeleton = mongoose.model('Skeleton', skeletonSchema);
+
+// Variable global en RAM
+let skeletonRAM = {};
+
+
+// --- CARGAR ANIMACIONES GANI AL INICIAR (CORREGIDO) ---
+async function loadSkeletonFromDB() {
+    try {
+        // Buscamos el registro sin filtros innecesarios
+        const skel = await Skeleton.findOne({});
+        if (skel && skel.anchors) {
+            skeletonRAM = skel.anchors;
+            console.log("✅ Animaciones Gani cargadas correctamente desde MongoDB!");
+        } else {
+            console.log("🦴 No hay animaciones previas, iniciando Gani en blanco.");
+            skeletonRAM = {};
+        }
+    } catch (err) {
+        console.error("❌ Error al cargar las animaciones Gani:", err);
+    }
 }
 // --- THE PLAYER BLUEPRINT (SCHEMA) ---
 const userSchema = new mongoose.Schema({
@@ -115,10 +144,13 @@ const squadSchema = new mongoose.Schema({
 
 const Squad = mongoose.model('Squad', squadSchema);
 
-// --- EL ESQUEMA DE LAS ARMAS ---
+// --- EL ESQUEMA DE LAS ARMAS EVOLUCIONADO (GANI READY) ---
 const weaponSchema = new mongoose.Schema({
     id: { type: String, required: true, unique: true },
     name: String,
+    type: { type: String, default: "ranged" }, // "ranged" (armas de fuego) o "melee" (espadas/bates)
+
+    // --- ATRIBUTOS DE COMBATE ---
     damage: Number,
     speed: Number,
     fireRate: Number,
@@ -127,13 +159,34 @@ const weaponSchema = new mongoose.Schema({
     range: Number,
     color: String,
     price: Number,
-    src: String // <--- NUEVO: LA RUTA DEL SPRITE DE LA IMAGEN
+    src: String,
+
+    // --- EL PIVOTE (EL MANGO O AGARRE DEL ARMA) ---
+    // Define en qué píxel de la imagen del arma se pone la mano
+    pivotX: { type: Number, default: 0 },
+    pivotY: { type: Number, default: 0 },
+
+    // 0: Down, 1: Left, 2: Right, 3: Up
+    dirStats: {
+        type: Object,
+        default: {
+            0: { rot: 0, arc: 90, len: 40, wid: 60, hX: 0, hY: 0, tX: 13, tY: 0 },
+            1: { rot: 0, arc: 90, len: 40, wid: 60, hX: 0, hY: 0, tX: 13, tY: 0 },
+            2: { rot: 0, arc: 90, len: 40, wid: 60, hX: 0, hY: 0, tX: 13, tY: 0 },
+            3: { rot: 0, arc: 90, len: 40, wid: 60, hX: 0, hY: 0, tX: 13, tY: 0 }
+        }
+    }
 });
+
 const Weapon = mongoose.model('Weapon', weaponSchema);
 
-// --- CACHÉ EN RAM PARA VELOCIDAD EXTREMA ---
+// --- CACHÉ EN RAM ACTUALIZADA ---
 let WEAPONS = {
-    "none": { damage: 0, speed: 0, fireRate: 0, magSize: 0, reloadTime: 0, color: "transparent" }
+    "none": {
+        damage: 0, speed: 0, fireRate: 0, magSize: 0, reloadTime: 0,
+        color: "transparent", type: "none",
+        pivotX: 0, pivotY: 0, defaultRotation: 0
+    }
 };
 
 // --- EL ESQUEMA DE LOS TILESETS ---
@@ -223,27 +276,35 @@ const pmSchema = new mongoose.Schema({
 });
 const PM = mongoose.model('PM', pmSchema);
 
-// Cargar armas de la Base de Datos a la RAM cuando el servidor inicia
 async function loadWeaponsFromDB() {
     try {
-        // Crear el arma por defecto si no existe en la DB
         const existing = await Weapon.findOne({ id: "ghost_gun" });
         if (!existing) {
             await Weapon.create({
-                id: "ghost_gun", name: "Ghost Gun", damage: 15, speed: 6,
-                fireRate: 250, magSize: 8, reloadTime: 1500, range: 120, color: "#2ecc71",
+                id: "ghost_gun",
+                name: "Ghost Gun",
+                type: "ranged", // <--- Nuevo
+                damage: 15,
+                speed: 6,
+                fireRate: 250,
+                magSize: 8,
+                reloadTime: 1500,
+                range: 120,
+                color: "#2ecc71",
                 price: 0,
-                src: "weapons/gun/Ghost_gun.png" // <--- AÑADE ESTO
+                src: "weapons/gun/Ghost_gun.png",
+                pivotX: 0,  // <--- Nuevo: Ajustarás esto en el editor
+                pivotY: 0,  // <--- Nuevo: Ajustarás esto en el editor
+                defaultRotation: 0 // <--- Nuevo
             });
-            console.log('🔫 Ghost Gun añadida a MongoDB!');
+            console.log('🔫 Ghost Gun actualizada con sistema Gani en MongoDB!');
         }
 
-        // Cargar todas las armas a la memoria RAM
         const dbWeapons = await Weapon.find({});
         dbWeapons.forEach(w => {
             WEAPONS[w.id] = w;
         });
-        console.log(`✅ Base de datos de armas cargada en RAM (${dbWeapons.length} armas)`);
+        console.log(`✅ Base de datos de armas cargada con éxito (${dbWeapons.length} armas).`);
     } catch (err) {
         console.error("Error cargando armas:", err);
     }
@@ -880,44 +941,37 @@ wss.on('connection', async (ws) => {
 
             if (shooter && target && !target.isDead) {
 
-                const weaponId = shooter.equippedWeapon || "none";
+                const weaponId = data.weaponId || shooter.equippedWeapon || "none";
                 const stats = WEAPONS[weaponId];
                 if (!stats || weaponId === "none") return;
 
                 const now = Date.now();
 
-                // 1. ¿Disparó recientemente?
-                if (now - (shooter.lastShotTime || 0) > 2000) return;
-
-                // 2. ANTI-METRALLETA DE DAÑO (Más estricto que las balas visuales)
+                // 2. ANTI-METRALLETA DE DAÑO
                 const lastDamage = shooter.lastDamageTime || 0;
-                if (now - lastDamage < (stats.fireRate - 50)) {
+                if (now - lastDamage < ((stats.fireRate || 300) - 50)) {
                     return;
                 }
                 shooter.lastDamageTime = now;
 
                 // 3. RANGO
                 const dist = Math.hypot(shooter.worldX - target.worldX, shooter.worldY - target.worldY);
-                const maxDist = (stats.range * stats.speed) * 1.3;
-                if (dist > maxDist) return;
+                // Si es melee, el rango máximo es de la Hitbox. Si es pistola usa speed * range
+                const maxDist = stats.type === 'melee' ? (stats.dirStats?.[0]?.hitLen || 60) * 2 : (stats.range * stats.speed) * 1.3;
+                if (dist > maxDist && stats.type !== 'melee') return;
 
                 // 4. FUEGO AMIGO
-                if (shooter.squad && target.squad && shooter.squad === target.squad) {
-                    return;
-                }
+                if (shooter.squad && target.squad && shooter.squad === target.squad) return;
 
-                // 👇 NUEVO: 4.5 ¿ALGUNO ESTÁ EN ZONA SEGURA? 👇
-                if (isInSafeZone(shooter.worldX, shooter.worldY) || isInSafeZone(target.worldX, target.worldY)) {
-                    return; // Nadie recibe daño si uno de los dos está en zona segura
-                }
+                // 4.5 ZONA SEGURA
+                if (isInSafeZone(shooter.worldX, shooter.worldY) || isInSafeZone(target.worldX, target.worldY)) return;
 
-                // 👇 5. EL FIX: ESCUDO DE PROTECCIÓN AL REVIVIR 👇
-                if (target.invulnerableUntil && now < target.invulnerableUntil) {
-                    return; // Ignoramos el daño porque el jugador tiene el escudo activo
-                }
+                // 5. ESCUDO DE PROTECCIÓN AL REVIVIR
+                if (target.invulnerableUntil && now < target.invulnerableUntil) return;
 
-                const actualDamage = stats.damage;
-                target.hp = (target.hp || 100) - actualDamage;
+                // 🛑 EL FIX FINAL ANTI-FANTASMA
+                const actualDamage = Number(stats.damage) || 10;
+                target.hp = (Number(target.hp) || 100) - actualDamage;
                 target.lastHitTime = Date.now();
 
                 // --- SISTEMA DE MUERTE (DERRIBADO) ---
@@ -934,9 +988,7 @@ wss.on('connection', async (ws) => {
                             players[data.targetId].hp = 100;
                             players[data.targetId].isDead = false;
                             players[data.targetId].lastHitTime = Date.now();
-
-                            // 👇 LA MAGIA: 2 Segundos de Invulnerabilidad al revivir 👇
-                            players[data.targetId].invulnerableUntil = Date.now() + 2000;
+                            players[data.targetId].invulnerableUntil = Date.now() + 100;
 
                             wss.clients.forEach(client => {
                                 if (client.readyState === WebSocket.OPEN) {
@@ -966,6 +1018,15 @@ wss.on('connection', async (ws) => {
                     }
                 });
             }
+        }
+        // --- 1. SINCRONIZAR ANIMACIÓN MELEE ---
+        if (data.type === 'melee_swing') {
+            // Reenvía a todos LOS DEMÁS que este jugador dio un espadazo
+            broadcast(JSON.stringify({
+                type: 'player_swing',
+                id: ws.playerId,
+                weaponId: data.weaponId
+            }), ws);
         }
 
         // 9. ENVIAR MENSAJE PRIVADO
@@ -1404,6 +1465,119 @@ wss.on('connection', async (ws) => {
                     ws.send(JSON.stringify({ type: 'squad_error', message: 'Ya eres miembro de este clan.' }));
                 }
             } catch (err) { console.error("Error aceptando clan:", err); }
+        }// 22. GUARDAR PIVOTE DE ARMA (GANI WEAPON MODE)
+        if (data.type === 'update_weapon_pivot' && isAuthenticated) {
+            try {
+                if (players[id].role !== 'admin') return; // Solo Admins pueden editar armas
+
+                // 1. Guardar permanente en MongoDB
+                await Weapon.findOneAndUpdate(
+                    { id: data.weaponId },
+                    { pivotX: data.pivotX, pivotY: data.pivotY }
+                );
+
+                // 2. Actualizar la memoria RAM del servidor
+                if (WEAPONS[data.weaponId]) {
+                    WEAPONS[data.weaponId].pivotX = data.pivotX;
+                    WEAPONS[data.weaponId].pivotY = data.pivotY;
+                }
+
+                // 3. Avisar a todos los jugadores para que el arma se acomode en vivo
+                wss.clients.forEach(client => {
+                    if (client.readyState === WebSocket.OPEN) {
+                        client.send(JSON.stringify({
+                            type: 'sync_weapon_pivot',
+                            weaponId: data.weaponId,
+                            pivotX: data.pivotX,
+                            pivotY: data.pivotY
+                        }));
+                    }
+                });
+            } catch (err) { console.error("Error guardando pivote de arma:", err); }
+        }// 23. GUARDAR ESTADÍSTICAS MELEE (SISTEMA DIRECCIONAL WASD)
+        if (data.type === 'update_melee_stats' && isAuthenticated) {
+            try {
+                if (players[id].role !== 'admin') return;
+
+                console.log(`[MELEE] 📝 Procesando guardado de arma: ${data.weaponId} (Dir: ${data.direction})`);
+
+                // 1. Buscar el arma o prepararla para crearla desde cero
+                let weaponDoc = await Weapon.findOne({ id: data.weaponId });
+
+                if (!weaponDoc) {
+                    weaponDoc = new Weapon({
+                        id: data.weaponId,
+                        type: "melee",
+                        dirStats: {} // Inicializamos el objeto vacío
+                    });
+                }
+
+                // 2. Asegurarnos de que el objeto dirStats exista
+                if (!weaponDoc.dirStats) {
+                    weaponDoc.dirStats = {};
+                }
+
+                // 3. Sobreescribir SOLO la dirección que estamos modificando
+                weaponDoc.dirStats[data.direction] = data.stats;
+
+                // 4. 🔥 EL COMANDO MÁGICO 🔥
+                // Obligamos a Mongoose a reconocer que este "Objeto Mixto" fue alterado
+                weaponDoc.markModified('dirStats');
+
+                // 5. Guardar físicamente en MongoDB
+                await weaponDoc.save();
+
+                console.log(`[MELEE] ✅ Guardado 100% real en MongoDB. Arma: ${weaponDoc.id}, Lado: ${data.direction}`);
+
+                // Actualizamos la memoria RAM del servidor
+                if (!WEAPONS[data.weaponId]) WEAPONS[data.weaponId] = { type: "melee" };
+                if (!WEAPONS[data.weaponId].dirStats) WEAPONS[data.weaponId].dirStats = {};
+                WEAPONS[data.weaponId].dirStats[data.direction] = data.stats;
+
+                // Avisamos a todos los clientes en el mapa
+                wss.clients.forEach(client => {
+                    if (client.readyState === WebSocket.OPEN) {
+                        client.send(JSON.stringify({
+                            type: 'sync_melee_stats',
+                            weaponId: data.weaponId,
+                            direction: data.direction,
+                            stats: data.stats
+                        }));
+                    }
+                });
+            } catch (err) {
+                console.error("[MELEE] 💥 ERROR al guardar en MongoDB:", err);
+            }
+        } else if (data.type === 'sync_weapon_pivot') {
+            if (weaponsDB[data.weaponId]) {
+                weaponsDB[data.weaponId].pivotX = data.pivotX;
+                weaponsDB[data.weaponId].pivotY = data.pivotY;
+            }
+        }
+        else if (data.type === 'save_skeleton_data') {
+            skeletonRAM = data.anchors;
+            const globalHandTile = data.handTile; // Guardarlo en memoria
+
+            // Guardar permanentemente en MongoDB
+            Skeleton.findOneAndUpdate({}, {
+                anchors: skeletonRAM,
+                handTile: globalHandTile
+            }, { upsert: true })
+
+            // 2. ¡MAGIA! Rebotamos la animación a TODOS los jugadores en vivo
+            wss.clients.forEach(client => {
+                if (client.readyState === WebSocket.OPEN) {
+                    client.send(JSON.stringify({
+                        type: 'sync_skeleton',
+                        anchors: skeletonRAM
+                    }));
+                }
+            });
+
+            // 3. Guardar en MongoDB para que NUNCA se borre al reiniciar el server
+            Skeleton.findOneAndUpdate({}, { anchors: skeletonRAM }, { upsert: true })
+                .then(() => console.log("🦴 Animación Gani guardada en la Base de Datos!"))
+                .catch(err => console.error("Error guardando Gani:", err));
         }
 
     });
@@ -1450,7 +1624,8 @@ wss.on('connection', async (ws) => {
         worldMap: allTiles,
         weaponsDB: WEAPONS,
         tilesetsDB: TILESETS,
-        safeZones: safeZonesRAM // <--- ¡NUEVO: Enviamos los rectángulos de paz al jugador!
+        safeZones: safeZonesRAM, // <--- ¡NUEVO: Enviamos los rectángulos de paz al jugador!
+        skeleton: skeletonRAM // <--- ¡ESTA ES LA LÍNEA QUE FALTABA!
     }));
 
     // 4. NOW TELL THE LOBBY A GUEST HAS ARRIVED
