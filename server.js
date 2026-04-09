@@ -10,12 +10,14 @@ mongoose.connect(MONGO_URI)
     .then(() => {
         console.log('🔥 Connected to MongoDB!');
 
-        // 🛑 EL FIX: Solo cargamos el mundo cuando la base de datos está 100% conectada
         loadTilesetsFromDB();
         loadWorldMapFromDB();
-        loadWeaponsFromDB();
-        loadSafeZonesFromDB(); // <--- ¡AÑADE ESTA LÍNEA AQUÍ!
+        loadSafeZonesFromDB();
         loadSkeletonFromDB();
+
+        // 🛑 EL FIX: Solo llamamos al Catálogo Maestro. 
+        // Ya no cargamos Weapons ni Trash por separado.
+        loadMasterCatalog();
     })
     .catch(err => console.error('MongoDB Connection Error:', err));
 
@@ -35,6 +37,16 @@ const tileSchema = new mongoose.Schema({
 
 const Tile = mongoose.model('Tile', tileSchema);
 
+// --- NUEVO: ESQUEMA DE BASES CAPTURABLES (TURFS) ---
+const turfSchema = new mongoose.Schema({
+    turfId: { type: String, required: true, unique: true }, // Ej: "base_120_45" (basado en sus coordenadas)
+    name: { type: String, default: "Base Central" }, // ¡Para que le pongas el nombre que quieras!
+    hp: { type: Number, default: 5000 },
+    maxHp: { type: Number, default: 5000 },
+    ownerSquadName: { type: String, default: null } // El clan que la controla
+});
+const Turf = mongoose.model('Turf', turfSchema);
+
 // --- NUEVO: ESQUEMA DE ZONAS SEGURAS (VECTORES) ---
 const safeZoneSchema = new mongoose.Schema({
     name: { type: String, required: true },
@@ -52,6 +64,20 @@ async function loadSafeZonesFromDB() {
         safeZonesRAM = await SafeZone.find({});
         console.log(`🛡️ Zonas Seguras cargadas en RAM (${safeZonesRAM.length} zonas).`);
     } catch (err) { console.error("Error cargando Zonas Seguras:", err); }
+}
+
+// --- HERRAMIENTA: ESCÁNER DE ZONAS SEGURAS ---
+const SERVER_TILE_SIZE = 16;
+
+// --- HERRAMIENTA: ESCÁNER MATEMÁTICO DE ZONAS SEGURAS ---
+function isInSafeZone(px, py) {
+    for (let i = 0; i < safeZonesRAM.length; i++) {
+        let z = safeZonesRAM[i];
+        if (px >= z.xMin && px <= z.xMax && py >= z.yMin && py <= z.yMax) {
+            return true;
+        }
+    }
+    return false;
 }
 
 // --- MODELO DEL ESQUELETO (GANI) ---
@@ -90,9 +116,15 @@ const userSchema = new mongoose.Schema({
     worldX: { type: Number, default: 0 },
     worldY: { type: Number, default: 0 },
 
-    inventory: { type: Array, default: ["ghost_gun"] },
+    inventory: { type: [mongoose.Schema.Types.Mixed], default: [] },
     equippedWeapon: { type: String, default: "none" },
     hotbar: { type: Array, default: ["none", "none", "none"] },
+    equipped: { // 👕 EL WARDROBE
+        hands: { type: String, default: 'none' },
+        head: { type: String, default: 'head_default' },
+        body: { type: String, default: 'body_default' },
+        hat: { type: String, default: 'none' } // 🎩 NUEVO: Espacio para sombreros
+    },
     friends: { type: Array, default: [] },
 
     // --- NUEVO: SISTEMA DE ECONOMÍA ---
@@ -139,69 +171,67 @@ const squadSchema = new mongoose.Schema({
     // Arreglo de miembros (Excluyendo al líder). Controlaremos el límite de 24 en el código.
     members: [squadMemberSchema],
 
-    createdAt: { type: Date, default: Date.now }
+    createdAt: { type: Date, default: Date.now },
+    // 👇 NUEVO: CAMPO PARA EL RANKING GLOBAL DE INFAMIA 👇
+    territoryTimeMinutes: { type: Number, default: 0 }
 });
 
 const Squad = mongoose.model('Squad', squadSchema);
 
-// --- 1. EL ESQUEMA ESTRICTO PARA LAS DIRECCIONES ---
-const dirStatsSchema = new mongoose.Schema({
-    wX: Number, wY: Number, wRot: Number, wZ: Number, wSwg: Number,
-    hX: Number, hY: Number, hRot: Number, hZ: Number,
-    aX: Number, aY: Number, aRot: Number, aZ: Number,
-    hitX: Number, hitY: Number, hitRot: Number, hitLen: Number, hitWid: Number,
-    tX: Number, tY: Number, wTileX: Number, wTileY: Number,
-    kb: Number, freeze: Number
-}, { _id: false });
-
-// --- 2. EL ESQUEMA DE LAS ARMAS ---
-const weaponSchema = new mongoose.Schema({
+// ==========================================
+// 📦 TABLA MAESTRA DE ÍTEMS (MASTER CATALOG)
+// ==========================================
+const itemSchema = new mongoose.Schema({
     id: { type: String, required: true, unique: true },
-    name: String,
-    type: { type: String, default: "ranged" },
-    damage: Number, speed: Number, fireRate: Number, magSize: Number, reloadTime: Number, range: Number, color: String, price: Number, src: String,
-    pivotX: { type: Number, default: 0 },
-    pivotY: { type: Number, default: 0 },
-    // Asignamos el esquema a los 4 lados fijos
-    dirStats: {
-        '0': { type: dirStatsSchema, default: () => ({}) },
-        '1': { type: dirStatsSchema, default: () => ({}) },
-        '2': { type: dirStatsSchema, default: () => ({}) },
-        '3': { type: dirStatsSchema, default: () => ({}) }
-    }
+    category: { type: String, required: true },
+    name: { type: String, required: true },
+    src: { type: String, required: true },
+    price: { type: Number, default: 0 },
+    stats: { type: Object, default: {} },
+    drawConfig: { type: Object, default: {} }
 });
 
-const Weapon = mongoose.model('Weapon', weaponSchema);
+const Item = mongoose.model('Item', itemSchema);
 
-// --- CACHÉ EN RAM ---
-let WEAPONS = {
-    "none": {
-        damage: 0, speed: 0, fireRate: 0, magSize: 0, reloadTime: 0,
-        color: "transparent", type: "none", pivotX: 0, pivotY: 0, defaultRotation: 0
-    }
-};
+let MASTER_CATALOG = {};
+let WEAPONS = {};
+let TRASH_CATALOG = [];
 
-async function loadWeaponsFromDB() {
+async function loadMasterCatalog() {
     try {
-        const existing = await Weapon.findOne({ id: "ghost_gun" });
-        if (!existing) {
-            await Weapon.create({
-                id: "ghost_gun", name: "Ghost Gun", type: "ranged",
-                damage: 15, speed: 6, fireRate: 250, magSize: 8, reloadTime: 1500, range: 120, color: "#2ecc71", price: 0,
-                src: "weapons/gun/Ghost_gun.png", pivotX: 0, pivotY: 0, defaultRotation: 0
-            });
-        }
+        console.log("📦 Cargando Catálogo Maestro...");
 
-        // 🛑 EL FIX MÁGICO (.lean()): Convierte los documentos de Mongoose a objetos puros de JavaScript
-        // Esto evita que JSON.stringify destruya los datos al enviarlos a tu juego.
-        const dbWeapons = await Weapon.find({}).lean();
+        // 1. Solo deja activos los que sean "Esenciales" o nuevos.
+        // Si ya ajustaste la Katana en Compass, puedes comentar su 'findOneAndUpdate' 
+        // para que el servidor solo la LEA de la DB y no intente re-escribirla.
 
-        dbWeapons.forEach(w => {
-            WEAPONS[w.id] = w;
+        /* await Item.findOneAndUpdate({ id: "katana_azulado" }, { ... }, { upsert: true }); 
+        */
+
+        // 2. Cargar TODO a la memoria RAM (Esto es lo que reemplaza a las funciones viejas)
+        const items = await Item.find({});
+
+        MASTER_CATALOG = {};
+        WEAPONS = {};
+        TRASH_CATALOG = [];
+
+        items.forEach(i => {
+            MASTER_CATALOG[i.id] = i;
+
+            if (i.category === 'weapon') {
+                // Esto es lo que mantiene vivo tu hotbar y sistema de disparo
+                WEAPONS[i.id] = { ...i.toObject(), ...i.stats };
+            } else if (i.category === 'junk') {
+                TRASH_CATALOG.push({ ...i.toObject(), ...i.drawConfig, value: i.price });
+            }
         });
-        console.log(`✅ Base de datos de armas cargada con éxito (${dbWeapons.length} armas).`);
+
+        // Failsafe para evitar crashes
+        if (!WEAPONS["none"]) WEAPONS["none"] = { damage: 0, type: "none", pivotX: 0, pivotY: 0 };
+
+        console.log(`✅ Catálogo cargado: ${Object.keys(MASTER_CATALOG).length} ítems listos.`);
     } catch (err) {
-        console.error("Error cargando armas:", err);
+        console.error("💥 Error cargando el Catálogo:", err);
     }
 }
 
@@ -239,18 +269,67 @@ async function loadTilesetsFromDB() {
 // --- LA NUEVA MEMORIA FÍSICA DEL SERVIDOR ---
 let serverWorldMap = {}; // Aquí el servidor recordará dónde están las paredes y puertas
 
+// 💥 NUEVO: EL CEREBRO DE LA BASE CENTRAL 💥
+let centralBase = null;
+
 async function loadWorldMapFromDB() {
     try {
         const allTiles = await Tile.find({});
+
+        // Reiniciamos la base por si acaso recargamos el mapa
+        centralBase = null;
+
         allTiles.forEach(t => {
             const l = t.l || 0;
             serverWorldMap[`${t.x},${t.y},${l}`] = {
                 hasCollision: t.hasCollision || false,
-                triggerType: t.triggerType, // <--- NUEVO: Memoriza si es teleport
-                destX: t.destX,             // <--- NUEVO: Coordenada X destino
-                destY: t.destY              // <--- NUEVO: Coordenada Y destino
+                triggerType: t.triggerType,
+                destX: t.destX,
+                destY: t.destY,
+                itemId: t.itemId
             };
+
+            // 🛑 EL FIX: Detectar la Base y conectarla con su persistencia
+            if (t.triggerType === 'base') {
+                // Creamos un ID único basado en dónde pusiste el bloque
+                const uniqueTurfId = `base_${t.x}_${t.y}`;
+
+                // Buscamos si ya existe en la base de datos (await se usa dentro de una función asíncrona, 
+                // así que cambiaremos el forEach por un for...of o manejaremos la promesa).
+
+                // Como allTiles.forEach no maneja bien await, lo guardamos temporalmente
+                // y lo inicializamos justo después del forEach.
+                centralBase = {
+                    turfId: uniqueTurfId,
+                    gridX: t.x, gridY: t.y,
+                    worldX: (t.x * 16) + 8, worldY: (t.y * 16) + 8,
+                    hp: 5000, maxHp: 5000,
+                    currentOwnerSquadId: null,
+                    damageTracker: {}
+                };
+            }
         });
+        // --- RECUPERAR DATOS DE LA BASE DESDE MONGODB ---
+        if (centralBase) {
+            let dbTurf = await Turf.findOne({ turfId: centralBase.turfId });
+
+            // Si es la primera vez que ponemos la base, la creamos en MongoDB
+            if (!dbTurf) {
+                dbTurf = await Turf.create({
+                    turfId: centralBase.turfId,
+                    name: "Base Central",
+                    hp: 5000, maxHp: 5000
+                });
+            }
+
+            // Inyectamos los datos persistentes a la memoria RAM
+            centralBase.name = dbTurf.name;
+            centralBase.hp = dbTurf.hp;
+            centralBase.maxHp = dbTurf.maxHp;
+            centralBase.currentOwnerSquadId = dbTurf.ownerSquadName;
+
+            console.log(`🏰 [${centralBase.name}] cargada en RAM. Dueño actual: ${centralBase.currentOwnerSquadId || 'Nadie'}`);
+        }
         console.log(`🌍 Mapa Físico cargado en RAM del servidor (${allTiles.length} bloques).`);
     } catch (err) {
         console.error("Error cargando el mapa:", err);
@@ -318,9 +397,10 @@ wss.on('connection', async (ws) => {
         // --- MEMORIA ANTI-CHEAT DEL SERVIDOR ---
         hp: 100,
         isDead: false,
-        ammo: 8, // Empezamos con el cargador lleno
+        ammo: 8,
         lastShotTime: 0,
-        isReloading: false
+        isReloading: false,
+        equipped: { head: 'head_default', body: 'body_default', hands: 'none' }
     };
 
     ws.on('message', async (message) => {
@@ -403,6 +483,7 @@ wss.on('connection', async (ws) => {
                 players[id].inventory = user.inventory;
 
                 players[id].equippedWeapon = user.equippedWeapon || "none";
+                players[id].equipped = user.equipped || { head: 'head_default', body: 'body_default', hands: 'none' };
 
                 // --- THE HOTBAR PERSISTENCE FIX ---
                 players[id].hotbar = user.hotbar || ["none", "none", "none"];
@@ -511,6 +592,16 @@ wss.on('connection', async (ws) => {
                 if (data.tileId === -1) {
                     // 🗑 ERASER: Wipe ALL ghost tiles and duplicates at this coordinate
                     await Tile.deleteMany(query);
+
+                    // 👇 EL FIX: Si pasamos el borrador por encima de la base, la destruimos
+                    if (centralBase && centralBase.gridX === data.x && centralBase.gridY === data.y) {
+                        await Turf.deleteOne({ turfId: centralBase.turfId });
+                        centralBase = null;
+                        wss.clients.forEach(c => {
+                            if (c.readyState === WebSocket.OPEN) c.send(JSON.stringify({ type: 'base_update', base: null }));
+                        });
+                        console.log("🗑️ Base destruida con el Borrador.");
+                    }
                 } else {
                     // 🎨 PAINT: Destroy old corrupted tiles first, then insert the clean new one
                     await Tile.deleteMany(query);
@@ -540,6 +631,15 @@ wss.on('connection', async (ws) => {
                     if (t.tileId === -1) {
                         // BORRADOR: Solo borramos el bloque específico en su capa
                         bulkOps.push({ deleteMany: { filter: { x: t.x, y: t.y, l: t.l } } });
+
+                        // 👇 EL FIX: Si borramos la base con el borrador de arrastre masivo
+                        if (centralBase && centralBase.gridX === t.x && centralBase.gridY === t.y) {
+                            await Turf.deleteOne({ turfId: centralBase.turfId });
+                            centralBase = null;
+                            wss.clients.forEach(c => {
+                                if (c.readyState === WebSocket.OPEN) c.send(JSON.stringify({ type: 'base_update', base: null }));
+                            });
+                        }
                     } else {
                         // UPSERT: Si existe, lo sobrescribe. Si no existe, lo crea. ¡1 sola operación!
                         bulkOps.push({
@@ -603,6 +703,49 @@ wss.on('connection', async (ws) => {
 
                 await Tile.updateMany(query, updateData);
 
+                // 🛑 EL FIX: CREAR O ACTUALIZAR LA BASE EN VIVO CON SUS DATOS REALES 🛑
+                if (data.triggerType === 'base') {
+                    const uniqueTurfId = `base_${data.x}_${data.y}`;
+
+                    // upsert: true crea la base si no existe, o la actualiza si ya existe
+                    const dbTurf = await Turf.findOneAndUpdate(
+                        { turfId: uniqueTurfId },
+                        {
+                            name: data.turfName || "Base Central",
+                            maxHp: data.turfHp || 5000,
+                            $setOnInsert: { hp: data.turfHp || 5000, ownerSquadName: null }
+                        },
+                        { upsert: true, new: true }
+                    );
+
+                    // La cargamos a la memoria RAM instantáneamente
+                    centralBase = {
+                        turfId: uniqueTurfId,
+                        gridX: data.x, gridY: data.y,
+                        worldX: (data.x * 16) + 8, worldY: (data.y * 16) + 8,
+                        hp: dbTurf.hp, maxHp: dbTurf.maxHp,
+                        currentOwnerSquadId: dbTurf.ownerSquadName,
+                        name: dbTurf.name,
+                        damageTracker: {}
+                    };
+
+                    console.log(`🏰 Base Guardada/Actualizada en vivo: ${centralBase.name} (${centralBase.maxHp} HP)`);
+
+                    wss.clients.forEach(c => {
+                        if (c.readyState === WebSocket.OPEN) c.send(JSON.stringify({ type: 'base_update', base: centralBase }));
+                    });
+                } else {
+                    // 👇 NUEVO: Si cambias el bloque a "Normal", DESTRUIMOS LA BASE por completo
+                    if (centralBase && centralBase.gridX === data.x && centralBase.gridY === data.y) {
+                        await Turf.deleteOne({ turfId: centralBase.turfId });
+                        centralBase = null;
+                        wss.clients.forEach(c => {
+                            if (c.readyState === WebSocket.OPEN) c.send(JSON.stringify({ type: 'base_update', base: null }));
+                        });
+                        console.log(`🗑️ Base eliminada mediante el Inspector.`);
+                    }
+                }
+
                 wss.clients.forEach(client => {
                     if (client !== ws && client.readyState === WebSocket.OPEN) {
                         client.send(JSON.stringify({
@@ -614,6 +757,30 @@ wss.on('connection', async (ws) => {
                     }
                 });
             } catch (err) { console.error('Meta Update Error:', err); }
+        }// 🛑 NUEVO: GUARDAR ATUENDO DEL GUARDARROPA (WARDROBE)
+        if (data.type === 'update_wardrobe' && isAuthenticated) {
+            try {
+                const p = players[id];
+                if (!p) return;
+
+                const ownsHead = data.head === 'head_default' || (p.inventory && p.inventory.some(i => (typeof i === 'object' ? i.id : i) === data.head));
+                const ownsBody = data.body === 'body_default' || (p.inventory && p.inventory.some(i => (typeof i === 'object' ? i.id : i) === data.body));
+                const ownsHat = data.hat === 'none' || (p.inventory && p.inventory.some(i => (typeof i === 'object' ? i.id : i) === data.hat));
+
+                if (ownsHead && ownsBody && ownsHat) {
+                    if (!p.equipped) p.equipped = { head: 'head_default', body: 'body_default', hands: 'none', hat: 'none' };
+                    p.equipped.head = data.head;
+                    p.equipped.body = data.body;
+                    p.equipped.hat = data.hat;
+
+                    await User.findOneAndUpdate(
+                        { email: currentUser },
+                        { "equipped.head": data.head, "equipped.body": data.body, "equipped.hat": data.hat }
+                    );
+
+                    broadcast({ type: 'update', id: id, player: p }, ws);
+                }
+            } catch (err) { console.error("Error actualizando guardarropa:", err); }
         }
 
         // --- NUEVO: CREAR ZONA SEGURA (ADMIN) ---
@@ -671,8 +838,7 @@ wss.on('connection', async (ws) => {
 
                 // --- THE PERSISTENCE FIX: Load the saved weapon! ---
                 players[id].equippedWeapon = user.equippedWeapon || "none";
-                // --- THE HOTBAR PERSISTENCE FIX ---
-                players[id].hotbar = user.hotbar || ["none", "none", "none"];
+                players[id].equipped = user.equipped || { head: 'head_default', body: 'body_default', hands: 'none' }; players[id].hotbar = user.hotbar || ["none", "none", "none"];
 
                 // --- NUEVO: CARGAR MONEDAS A LA RAM ---
                 players[id].coins = user.coins || 0;
@@ -851,20 +1017,6 @@ wss.on('connection', async (ws) => {
                 if (!p.hotbar) p.hotbar = ["none", "none", "none"];
                 p.hotbar[data.slotIndex] = data.weaponId;
             }
-        }
-
-        // --- HERRAMIENTA: ESCÁNER DE ZONAS SEGURAS ---
-        const SERVER_TILE_SIZE = 16;
-
-        // --- HERRAMIENTA: ESCÁNER MATEMÁTICO DE ZONAS SEGURAS ---
-        function isInSafeZone(px, py) {
-            for (let i = 0; i < safeZonesRAM.length; i++) {
-                let z = safeZonesRAM[i];
-                if (px >= z.xMin && px <= z.xMax && py >= z.yMin && py <= z.yMax) {
-                    return true;
-                }
-            }
-            return false;
         }
 
         // 7. HANDLE SHOOTING (SINCRO VISUAL ABSOLUTA ANTI-FANTASMAS)
@@ -1477,70 +1629,209 @@ wss.on('connection', async (ws) => {
                     ws.send(JSON.stringify({ type: 'squad_error', message: 'Ya eres miembro de este clan.' }));
                 }
             } catch (err) { console.error("Error aceptando clan:", err); }
-        }// 22. GUARDAR PIVOTE DE ARMA (GANI WEAPON MODE)
+        }
+        // 22. GUARDAR PIVOTE DE ARMA (GANI WEAPON MODE)
         if (data.type === 'update_weapon_pivot' && isAuthenticated) {
             try {
-                if (players[id].role !== 'admin') return; // Solo Admins pueden editar armas
+                if (players[id].role !== 'admin') return;
 
-                // 1. Guardar permanente en MongoDB
-                await Weapon.findOneAndUpdate(
+                await Item.findOneAndUpdate(
                     { id: data.weaponId },
-                    { pivotX: data.pivotX, pivotY: data.pivotY }
+                    { $set: { "stats.pivotX": data.pivotX, "stats.pivotY": data.pivotY } }
                 );
 
-                // 2. Actualizar la memoria RAM del servidor
                 if (WEAPONS[data.weaponId]) {
                     WEAPONS[data.weaponId].pivotX = data.pivotX;
                     WEAPONS[data.weaponId].pivotY = data.pivotY;
                 }
 
-                // 3. Avisar a todos los jugadores para que el arma se acomode en vivo
                 wss.clients.forEach(client => {
                     if (client.readyState === WebSocket.OPEN) {
-                        client.send(JSON.stringify({
-                            type: 'sync_weapon_pivot',
-                            weaponId: data.weaponId,
-                            pivotX: data.pivotX,
-                            pivotY: data.pivotY
-                        }));
+                        client.send(JSON.stringify({ type: 'sync_weapon_pivot', weaponId: data.weaponId, pivotX: data.pivotX, pivotY: data.pivotY }));
                     }
                 });
-            } catch (err) { console.error("Error guardando pivote de arma:", err); }
-        }// 23. GUARDAR ESTADÍSTICAS MELEE (SISTEMA DIRECCIONAL WASD)
+            } catch (err) { console.error("Error guardando pivote:", err); }
+        }
+
+        // 23. GUARDAR ESTADÍSTICAS MELEE (SISTEMA DIRECCIONAL WASD)
         if (data.type === 'update_melee_stats' && isAuthenticated) {
             try {
                 if (players[id].role !== 'admin') return;
 
-                let weaponDoc = await Weapon.findOne({ id: data.weaponId });
-                if (!weaponDoc) {
-                    weaponDoc = new Weapon({ id: data.weaponId, type: "melee" });
-                }
+                let itemDoc = await Item.findOne({ id: data.weaponId });
+                if (!itemDoc) return;
 
-                if (!weaponDoc.dirStats) weaponDoc.dirStats = {};
+                if (!itemDoc.stats) itemDoc.stats = {};
+                if (!itemDoc.stats.dirStats) itemDoc.stats.dirStats = {};
 
-                // Sobreescribir los datos
-                weaponDoc.dirStats[String(data.direction)] = data.stats;
+                itemDoc.stats.dirStats[String(data.direction)] = data.stats;
+                itemDoc.markModified(`stats.dirStats.${data.direction}`);
+                await itemDoc.save();
 
-                // 🛑 EL FIX: Forzamos a Mongoose a notar el cambio en este lado específico
-                weaponDoc.markModified(`dirStats.${data.direction}`);
-                await weaponDoc.save();
-
-                // Actualizamos la RAM del servidor
                 if (!WEAPONS[data.weaponId]) WEAPONS[data.weaponId] = { type: "melee", dirStats: {} };
+                if (!WEAPONS[data.weaponId].dirStats) WEAPONS[data.weaponId].dirStats = {};
                 WEAPONS[data.weaponId].dirStats[data.direction] = data.stats;
 
-                // Avisamos a las pantallas
                 wss.clients.forEach(client => {
                     if (client.readyState === WebSocket.OPEN) {
-                        client.send(JSON.stringify({
-                            type: 'sync_melee_stats',
-                            weaponId: data.weaponId,
-                            direction: data.direction,
-                            stats: data.stats
-                        }));
+                        client.send(JSON.stringify({ type: 'sync_melee_stats', weaponId: data.weaponId, direction: data.direction, stats: data.stats }));
                     }
                 });
             } catch (err) { console.error("💥 ERROR al guardar en MongoDB:", err); }
+        }// 24. RECOGER BASURA CON EL TRASH PICKER
+        if (data.type === 'pickup_trash' && isAuthenticated) {
+            const itemId = data.itemId;
+            const item = groundItems[itemId];
+            const p = players[id];
+
+            if (item && p.equippedWeapon === 'trash_picker') {
+                delete groundItems[itemId];
+
+                if (!p.inventory) p.inventory = [];
+
+                // 🛑 EL FIX: SISTEMA APILABLE (STACKABLE)
+                // Buscamos si ya tiene un "montón" de este tipo de basura
+                let existingStack = p.inventory.find(i => typeof i === 'object' && i.id === item.templateId);
+
+                if (existingStack) {
+                    existingStack.quantity += 1; // Le sumamos 1 a su montón
+                } else {
+                    // Si no lo tiene, creamos el primer montón
+                    p.inventory.push({ id: item.templateId, quantity: 1 });
+                }
+
+                // Marcar el array como modificado para que Mongoose lo guarde bien
+                User.findByIdAndUpdate(p.accountId, { inventory: p.inventory }).catch(console.error);
+
+                broadcast({ type: 'remove_item', id: itemId });
+
+                // Avisamos visualmente que entró a la mochila
+                ws.send(JSON.stringify({
+                    type: 'system_message',
+                    text: `🎒 Recogiste: ${item.name}`,
+                    color: '#3498db'
+                }));
+
+                // 🛑 EL FIX: El servidor le envía a tu pantalla tu nueva mochila
+                ws.send(JSON.stringify({
+                    type: 'inventory_update',
+                    inventory: p.inventory
+                }));
+
+                broadcast({ type: 'update', id: id, player: p }, ws);
+            }
+        }// 25. VENDER TODA LA BASURA EN EL YONKE
+        if (data.type === 'sell_all_trash' && isAuthenticated) {
+            const p = players[id];
+            if (!p.inventory) return;
+
+            let totalEarned = 0;
+            let newInventory = [];
+
+            // Separar la basura de las armas a prueba de errores
+            for (let item of p.inventory) {
+                let isTrash = false;
+
+                // A. Formato Nuevo (Objeto: {id: "trash_lata", quantity: 5})
+                if (typeof item === 'object' && item.id && item.id.startsWith('trash_')) {
+                    let catalogItem = TRASH_CATALOG.find(t => t.id === item.id);
+                    if (catalogItem) {
+                        // Si por algún error no tiene quantity, asumimos que es 1
+                        const qty = item.quantity || 1;
+                        totalEarned += (catalogItem.value * qty);
+                        isTrash = true;
+                    }
+                }
+                // B. Formato Viejo de Pruebas Anteriores (String: "trash_lata")
+                else if (typeof item === 'string' && item.startsWith('trash_')) {
+                    let catalogItem = TRASH_CATALOG.find(t => t.id === item);
+                    if (catalogItem) {
+                        totalEarned += catalogItem.value;
+                        isTrash = true;
+                    }
+                }
+
+                // C. Conservar si NO es basura (Ej. Armas o items no registrados)
+                if (!isTrash) {
+                    newInventory.push(item);
+                }
+            }
+
+            // Si encontró dinero, hacemos la transacción
+            if (totalEarned > 0) {
+                p.coins += totalEarned;
+                p.inventory = newInventory;
+
+                User.findByIdAndUpdate(p.accountId, { coins: p.coins, inventory: p.inventory }).catch(console.error);
+
+                ws.send(JSON.stringify({
+                    type: 'sell_success',
+                    earned: totalEarned,
+                    newCoins: p.coins,
+                    newInventory: p.inventory
+                }));
+                broadcast({ type: 'update', id: id, player: p }, ws);
+            } else {
+                // 🛑 EL FIX: Si por algo falla, que el servidor te avise en pantalla en lugar de ignorarte
+                ws.send(JSON.stringify({ type: 'system_message', text: "Error: No se encontró basura válida para vender.", color: '#e74c3c' }));
+            }
+        } // =========================================================
+        // 🛑 NUEVO: VENDER CANTIDAD ESPECÍFICA DE UN ÍTEM INDIVIDUAL (YONKE) 🛑
+        // =========================================================
+        if (data.type === 'sell_individual_trash' && isAuthenticated) {
+            const p = players[id];
+            const requestedItemId = data.itemId;
+            const requestedQty = parseInt(data.quantity);
+
+            // 1. Validaciones de seguridad básicas
+            if (!p.inventory || !requestedItemId || !requestedQty || requestedQty <= 0) return;
+
+            // 2. Buscar el ítem en el Catálogo de MongoDB (TRASH_CATALOG) para saber su valor
+            const catalogItem = TRASH_CATALOG.find(t => t.id === requestedItemId);
+            if (!catalogItem) return; // Trampa o ítem no existe
+
+            // 3. Buscar el montón (Stack) de ese ítem en tu inventario apilable
+            let stackIndex = -1;
+            let existingStack = p.inventory.find((item, index) => {
+                if (typeof item === 'object' && item.id === requestedItemId) {
+                    stackIndex = index;
+                    return true;
+                }
+                return false;
+            });
+
+            // 4. Validar que tengas suficientes para vender
+            if (!existingStack || existingStack.quantity < requestedQty) {
+                ws.send(JSON.stringify({ type: 'system_message', text: "🛑 No tienes suficiente cantidad de este ítem.", color: '#e74c3c' }));
+                return;
+            }
+
+            // 5. HACER LA TRANSACCIÓN
+            const totalEarned = catalogItem.value * requestedQty;
+            p.coins += totalEarned;
+
+            // Descontar cantidad del inventario
+            existingStack.quantity -= requestedQty;
+
+            // Si el montón llegó a 0, borrar el objeto del array por completo
+            if (existingStack.quantity <= 0) {
+                p.inventory.splice(stackIndex, 1);
+            }
+
+            // 6. Guardar Cambios en MongoDB Atlas
+            User.findByIdAndUpdate(p.accountId, { coins: p.coins, inventory: p.inventory }).catch(console.error);
+
+            console.log(`🏗️ Venta Individual: ${p.name} vendió x${requestedQty} ${catalogItem.name} por ${totalEarned} 🪙`);
+
+            // 7. Avisar al cliente del éxito (Reusamos el paquete sell_success existente en demo.html)
+            ws.send(JSON.stringify({
+                type: 'sell_success',
+                earned: totalEarned, // Monto de esta venta específica
+                newCoins: p.coins,
+                newInventory: p.inventory
+            }));
+
+            broadcast({ type: 'update', id: id, player: p }, ws);
         } else if (data.type === 'sync_weapon_pivot') {
             if (weaponsDB[data.weaponId]) {
                 weaponsDB[data.weaponId].pivotX = data.pivotX;
@@ -1571,6 +1862,78 @@ wss.on('connection', async (ws) => {
             Skeleton.findOneAndUpdate({}, { anchors: skeletonRAM }, { upsert: true })
                 .then(() => console.log("🦴 Animación Gani guardada en la Base de Datos!"))
                 .catch(err => console.error("Error guardando Gani:", err));
+        }// --- NUEVO: SISTEMA DE DAÑO A LA BASE DE CLANES (TURF WARS) ---
+        if (data.type === 'damage_base' && isAuthenticated) {
+            const shooter = players[id];
+
+            // 1. Reglas: Tienes que tener un arma, un clan, y la base debe existir
+            if (!shooter || !shooter.squad || !centralBase) return;
+
+            const stats = WEAPONS[data.weaponId];
+            if (!stats) return;
+
+            // 2. Anti-spam de daño/curación
+            const now = Date.now();
+            if (now - (shooter.lastBaseDamageTime || 0) < ((stats.fireRate || 300) - 50)) return;
+            shooter.lastBaseDamageTime = now;
+
+            const actualDamage = Number(stats.damage) || 10;
+
+            // 🛑 EL FIX: BIFURCACIÓN DE LÓGICA (CURAR VS DESTRUIR)
+            // Comparamos si el dueño actual es exactamente el nombre de tu clan
+            if (centralBase.currentOwnerSquadId === shooter.squadName) {
+
+                // 3A. RUTINA DE REPARACIÓN (Fuego Amigo)
+                // Si la base ya está al 100%, no hacemos nada
+                if (centralBase.hp >= centralBase.maxHp) return;
+
+                centralBase.hp += actualDamage;
+
+                // Evitamos sobrecurar la base
+                if (centralBase.hp > centralBase.maxHp) {
+                    centralBase.hp = centralBase.maxHp;
+                }
+
+            } else {
+
+                // 3B. RUTINA DE ATAQUE (Enemigos)
+                centralBase.hp -= actualDamage;
+
+                // Registrar en la "Libreta de Daño" quién le está pegando
+                if (!centralBase.damageTracker[shooter.squadName]) centralBase.damageTracker[shooter.squadName] = 0;
+                centralBase.damageTracker[shooter.squadName] += actualDamage;
+
+                // ¿SE DESTRUYÓ LA BASE? (Llegó a 0)
+                if (centralBase.hp <= 0) {
+                    let topSquad = null;
+                    let maxDamage = 0;
+                    for (let sqName in centralBase.damageTracker) {
+                        if (centralBase.damageTracker[sqName] > maxDamage) {
+                            maxDamage = centralBase.damageTracker[sqName];
+                            topSquad = sqName;
+                        }
+                    }
+
+                    centralBase.currentOwnerSquadId = topSquad;
+                    centralBase.hp = centralBase.maxHp;
+                    centralBase.damageTracker = {};
+
+                    console.log(`🏆 El Squad [${topSquad}] ha capturado ${centralBase.name}!`);
+
+                    // 🛑 EL FIX: GUARDAR EL NUEVO DUEÑO EN MONGODB
+                    Turf.findOneAndUpdate(
+                        { turfId: centralBase.turfId },
+                        { ownerSquadName: topSquad, hp: centralBase.maxHp }
+                    ).catch(err => console.error("Error guardando Turf:", err));
+                }
+            }
+
+            // 4. Avisar a todas las pantallas cómo va la vida de la base (sea daño o curación)
+            wss.clients.forEach(client => {
+                if (client.readyState === WebSocket.OPEN) {
+                    client.send(JSON.stringify({ type: 'base_update', base: centralBase }));
+                }
+            });
         }
 
     });
@@ -1618,7 +1981,11 @@ wss.on('connection', async (ws) => {
         weaponsDB: WEAPONS,
         tilesetsDB: TILESETS,
         safeZones: safeZonesRAM, // <--- ¡NUEVO: Enviamos los rectángulos de paz al jugador!
-        skeleton: skeletonRAM // <--- ¡ESTA ES LA LÍNEA QUE FALTABA!
+        skeleton: skeletonRAM, // <--- ¡ESTA ES LA LÍNEA QUE FALTABA!
+        centralBase: centralBase, // 🛑 EL FIX: Añadimos la base a la memoria del cliente
+        groundItems: groundItems, // 🛑 EL FIX: Mandar la basura a los jugadores nuevos
+        trashCatalog: TRASH_CATALOG,
+        masterCatalog: MASTER_CATALOG // 📦 EL FIX: Enviamos toda la ropa e ítems
     }));
 
     // 4. NOW TELL THE LOBBY A GUEST HAS ARRIVED
@@ -1640,6 +2007,67 @@ function broadcast(data, excludeWs = null) {
         }
     });
 }
+
+// =========================================================
+// 🗑️ SISTEMA DE BASURA (TRASH PICKER)
+// =========================================================
+let groundItems = {};
+
+// Spawner de Basura (Cada 3 segundos)
+setInterval(() => {
+    // 🛑 EL FIX: Si el catálogo de la base de datos aún no ha cargado, cancelamos este turno
+    if (TRASH_CATALOG.length === 0) return;
+
+    const pKeys = Object.keys(players);
+    // Límite de 80 basuras en el mapa para no dar lag
+    if (pKeys.length > 0 && Object.keys(groundItems).length < 80) {
+        const rp = players[pKeys[Math.floor(Math.random() * pKeys.length)]];
+        if (rp && rp.worldX !== undefined && !isInSafeZone(rp.worldX, rp.worldY)) {
+            const sx = rp.worldX + (Math.random() * 800 - 400);
+            const sy = rp.worldY + (Math.random() * 800 - 400);
+
+            if (!serverCheckCollision(sx, sy)) {
+                const itemId = "trash_" + Math.random().toString(36).substr(2, 9);
+
+                // Elegimos un tipo de basura al azar de tu catálogo oficial
+                const tType = TRASH_CATALOG[Math.floor(Math.random() * TRASH_CATALOG.length)];
+
+                groundItems[itemId] = {
+                    x: sx, y: sy,
+                    type: "trash",
+                    templateId: tType.id,
+                    sx: tType.sx, sy: tType.sy,
+                    value: tType.value,
+                    name: tType.name
+                };
+                broadcast({ type: 'spawn_item', id: itemId, item: groundItems[itemId] });
+            }
+        }
+    }
+}, 3000);
+
+// =========================================================
+// ⏱️ MOTOR DE RECOMPENSAS DE TURF WARS (ZONAS DE CAPTURA)
+// =========================================================
+setInterval(async () => {
+    // 1. ¿Existe la base y tiene dueño actualmente?
+    if (centralBase && centralBase.currentOwnerSquadId) {
+        try {
+            const ownerSquad = centralBase.currentOwnerSquadId;
+            console.log(`🏰 [TURF WARS] El clan [${ownerSquad}] ha mantenido la base por otro minuto.`);
+
+            // 2. GUARDAR EL TIEMPO EN MONGODB PARA EL RANKING GLOBAL
+            // (Los ingresos pasivos de monedas fueron removidos para el futuro sistema de premios exclusivos)
+            await Squad.findOneAndUpdate(
+                { name: ownerSquad },
+                { $inc: { territoryTimeMinutes: 1 } } // Le suma 1 minuto a su récord histórico en la nube
+            );
+
+        } catch (err) {
+            console.error("💥 Error en el cronómetro de la base:", err);
+        }
+    }
+}, 60000); // 60,000 milisegundos = 1 minuto exacto
 
 // --- NUEVO: SISTEMA DE REGENERACIÓN DE VIDA (AUTO-HEAL) ---
 setInterval(() => {
