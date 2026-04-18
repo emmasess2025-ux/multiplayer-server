@@ -12,9 +12,12 @@ mongoose.connect(MONGO_URI)
 
         loadTilesetsFromDB();
         loadWorldMapFromDB();
+        loadZoneConfigsFromDB();
         loadSafeZonesFromDB();
         loadSkeletonFromDB();
-
+        loadArenasFromDB();
+        loadRanksFromDB();
+        loadPatchNotesFromDB();
         // 🛑 EL FIX: Solo llamamos al Catálogo Maestro. 
         // Ya no cargamos Weapons ni Trash por separado.
         loadMasterCatalog();
@@ -27,29 +30,61 @@ const tileSchema = new mongoose.Schema({
     l: { type: Number, default: 0 },
     tileId: Number,
     hasCollision: { type: Boolean, default: false },
-    // Logical Data: Omit defaults so these are only stored if they have values
     triggerType: String,
     destX: Number,
     destY: Number,
     itemId: String,
-    rotation: { type: Number, default: 0 }
+    rotation: { type: Number, default: 0 },
+    requiresClick: { type: Boolean, default: false },
+    npcMessage: { type: String, default: "" },
+
+    // 👇 NUEVO: FILA DE LA IMAGEN DE LA TIENDA 👇
+    itemRow: { type: Number, default: 0 },
+    shelfX: { type: Number, default: 0 },
+    shelfY: { type: Number, default: 0 }
 });
 
 const Tile = mongoose.model('Tile', tileSchema);
 
-// --- NUEVO: ESQUEMA DE BASES CAPTURABLES (TURFS) ---
+// --- ESQUEMA DE ARENAS DE SPARRING (ESCALABLE) ---
+const arenaSchema = new mongoose.Schema({
+    arenaId: { type: String, required: true, unique: true },
+    name: { type: String, default: "Arena de Combate" },
+    p1X: { type: Number, required: true },
+    p1Y: { type: Number, required: true },
+    p2X: { type: Number, required: true },
+    p2Y: { type: Number, required: true },
+    // 👇 NUEVO: CAPACIDAD DE EQUIPOS 👇
+    team1Size: { type: Number, default: 1 },
+    team2Size: { type: Number, default: 1 },
+    isRanked: { type: Boolean, default: false } // <--- NUEVO
+});
+const Arena = mongoose.model('Arena', arenaSchema);
+// Memoria RAM ultra-rápida para manejar las colas y peleas en vivo
+let arenasRAM = {};
+
 const turfSchema = new mongoose.Schema({
-    turfId: { type: String, required: true, unique: true }, // Ej: "base_120_45" (basado en sus coordenadas)
-    name: { type: String, default: "Base Central" }, // ¡Para que le pongas el nombre que quieras!
+    turfId: { type: String, required: true, unique: true },
+    name: { type: String, default: "Base Central" },
     hp: { type: Number, default: 5000 },
     maxHp: { type: Number, default: 5000 },
-    ownerSquadName: { type: String, default: null } // El clan que la controla
+    ownerSquadName: { type: String, default: null },
+    srcIdle: { type: String, default: "" },
+    srcHit: { type: String, default: "" },
+    spriteOffsetX: { type: Number, default: 0 },
+    spriteOffsetY: { type: Number, default: 0 },
+    hitboxOffsetX: { type: Number, default: 0 },
+    hitboxOffsetY: { type: Number, default: 0 },
+    // 👇 NUEVO: ANCHO Y ALTO DEL CUADRADO FÍSICO 👇
+    hitboxW: { type: Number, default: 32 },
+    hitboxH: { type: Number, default: 32 }
 });
 const Turf = mongoose.model('Turf', turfSchema);
 
-// --- NUEVO: ESQUEMA DE ZONAS SEGURAS (VECTORES) ---
+// --- ESQUEMA UNIVERSAL DE ZONAS (VECTORES) ---
 const safeZoneSchema = new mongoose.Schema({
     name: { type: String, required: true },
+    zoneType: { type: String, default: 'safe' }, // <--- NUEVO: 'safe', 'trash', 'npc', etc.
     xMin: { type: Number, required: true },
     xMax: { type: Number, required: true },
     yMin: { type: Number, required: true },
@@ -57,28 +92,113 @@ const safeZoneSchema = new mongoose.Schema({
 });
 const SafeZone = mongoose.model('SafeZone', safeZoneSchema);
 
-let safeZonesRAM = []; // Caché ultrarrápida
+let safeZonesRAM = []; // Caché ultrarrápida (Guarda todas las zonas de todos los tipos)
 
 async function loadSafeZonesFromDB() {
     try {
         safeZonesRAM = await SafeZone.find({});
-        console.log(`🛡️ Zonas Seguras cargadas en RAM (${safeZonesRAM.length} zonas).`);
-    } catch (err) { console.error("Error cargando Zonas Seguras:", err); }
+        console.log(`🗺️ Zonas Universales cargadas en RAM (${safeZonesRAM.length} zonas).`);
+    } catch (err) { console.error("Error cargando Zonas:", err); }
 }
 
-// --- HERRAMIENTA: ESCÁNER DE ZONAS SEGURAS ---
-const SERVER_TILE_SIZE = 16;
-
-// --- HERRAMIENTA: ESCÁNER MATEMÁTICO DE ZONAS SEGURAS ---
+// --- ESCÁNER MATEMÁTICO: ¿ESTOY EN UNA ZONA SEGURA? ---
 function isInSafeZone(px, py) {
     for (let i = 0; i < safeZonesRAM.length; i++) {
         let z = safeZonesRAM[i];
-        if (px >= z.xMin && px <= z.xMax && py >= z.yMin && py <= z.yMax) {
+        // 🛑 EL FIX: Solo nos protege si la zona es específicamente de tipo 'safe'
+        if ((z.zoneType === 'safe' || !z.zoneType) && px >= z.xMin && px <= z.xMax && py >= z.yMin && py <= z.yMax) {
             return true;
         }
     }
     return false;
 }
+
+// ==========================================
+// 🏆 ESQUEMA DE RANGOS ELO (MONGODB)
+// ==========================================
+const rankSchema = new mongoose.Schema({
+    name: { type: String, required: true },
+    minElo: { type: Number, required: true },
+    src: { type: String, required: true } // La imagen 32x48
+});
+const Rank = mongoose.model('Rank', rankSchema);
+
+let RANKS_CACHE = []; // RAM Cache
+
+async function loadRanksFromDB() {
+    try {
+        let ranks = await Rank.find({}).sort({ minElo: -1 }); // De mayor a menor
+
+        if (ranks.length === 0) {
+            console.log("🏆 Inicializando Rangos por defecto en MongoDB...");
+            const defaultRanks = [
+                { name: "Elite", minElo: 2500, src: "items/ranks/elite.png" },
+                { name: "Profesional", minElo: 1800, src: "items/ranks/profesional.png" },
+                { name: "Amateur", minElo: 1200, src: "items/ranks/amateur.png" },
+                { name: "Novato", minElo: 600, src: "items/ranks/novato.png" },
+                { name: "Principiante", minElo: 0, src: "items/ranks/principiante.png" }
+            ];
+            await Rank.insertMany(defaultRanks);
+            ranks = await Rank.find({}).sort({ minElo: -1 });
+        }
+        RANKS_CACHE = ranks;
+        console.log(`🏆 Rangos cargados: ${RANKS_CACHE.length} divisiones activas.`);
+    } catch (err) { console.error("Error cargando Rangos:", err); }
+}
+
+// ==========================================
+// 🗺️ ESQUEMA DE CONFIGURACIÓN DE ZONAS (MONGODB)
+// ==========================================
+const zoneConfigSchema = new mongoose.Schema({
+    id: { type: String, required: true, unique: true }, // ej: 'safe', 'trash', 'npc'
+    name: { type: String, required: true },
+    icon: { type: String, default: "❓" },
+    colorBorder: { type: String, default: "white" },
+    colorFill: { type: String, default: "rgba(255,255,255,0.2)" }
+});
+
+const ZoneConfig = mongoose.model('ZoneConfig', zoneConfigSchema);
+
+// Memoria RAM para consultas ultrarrápidas
+let ZONE_CONFIG = {};
+
+// Función para cargar desde la Base de Datos al iniciar el servidor
+async function loadZoneConfigsFromDB() {
+    try {
+        let configs = await ZoneConfig.find({});
+
+        // Si la tabla está vacía (primera vez que corres el server), inyectamos los básicos
+        if (configs.length === 0) {
+            console.log("🛠️ Inicializando Tipos de Zona por defecto en MongoDB...");
+            const defaultZones = [
+                { id: "safe", name: "Zona Segura", icon: "🛡️", colorBorder: "rgba(46, 204, 113, 0.8)", colorFill: "rgba(46, 204, 113, 0.2)" },
+                { id: "trash", name: "Basurero", icon: "🗑️", colorBorder: "rgba(230, 126, 34, 0.8)", colorFill: "rgba(230, 126, 34, 0.2)" },
+                { id: "npc", name: "Zona NPC", icon: "🤖", colorBorder: "rgba(155, 89, 182, 0.8)", colorFill: "rgba(155, 89, 182, 0.2)" },
+                { id: "dig", name: "Zona de Excavación", icon: "⛏️", colorBorder: "rgba(139, 69, 19, 0.8)", colorFill: "rgba(139, 69, 19, 0.2)" }
+            ];
+            await ZoneConfig.insertMany(defaultZones);
+            configs = await ZoneConfig.find({}); // Volver a leerlos ya con sus IDs de Mongo
+        }
+
+        // Limpiar la RAM y llenarla con los datos de Mongo
+        ZONE_CONFIG = {};
+        configs.forEach(c => {
+            ZONE_CONFIG[c.id] = {
+                name: c.name,
+                icon: c.icon,
+                colorBorder: c.colorBorder,
+                colorFill: c.colorFill
+            };
+        });
+
+        console.log(`🎨 Tipos de Zona cargados en RAM (${Object.keys(ZONE_CONFIG).length} tipos).`);
+    } catch (err) {
+        console.error("❌ Error cargando Configuración de Zonas:", err);
+    }
+}
+
+// --- HERRAMIENTA: ESCÁNER DE ZONAS SEGURAS ---
+const SERVER_TILE_SIZE = 16;
 
 // --- MODELO DEL ESQUELETO (GANI) ---
 const skeletonSchema = new mongoose.Schema({
@@ -107,6 +227,40 @@ async function loadSkeletonFromDB() {
         console.error("❌ Error al cargar las animaciones Gani:", err);
     }
 }
+
+// --- ESQUEMA DE ACTUALIZACIONES (PATCH NOTES) ---
+const patchNoteSchema = new mongoose.Schema({
+    title: { type: String, required: true },
+    description: { type: String, required: true },
+    version: { type: String, default: "1.0" },
+    date: { type: Date, default: Date.now }
+});
+const PatchNote = mongoose.model('PatchNote', patchNoteSchema);
+
+// Memoria RAM para enviarlo rápido a los jugadores al conectar
+let PATCH_NOTES_CACHE = [];
+
+async function loadPatchNotesFromDB() {
+    try {
+        // Traemos las últimas 10 actualizaciones ordenadas de la más nueva a la más vieja
+        PATCH_NOTES_CACHE = await PatchNote.find({}).sort({ date: -1 }).limit(10);
+
+        // Si está vacía, creamos una de bienvenida automáticamente
+        if (PATCH_NOTES_CACHE.length === 0) {
+            const welcomeNote = new PatchNote({
+                title: "¡Bienvenidos a MMOARGON!",
+                description: "El servidor alfa está oficialmente en línea. Explora el mapa, únete a un clan y domina la ciudad.",
+                version: "1.0.0"
+            });
+            await welcomeNote.save();
+            PATCH_NOTES_CACHE = [welcomeNote];
+        }
+        console.log(`📰 Noticias cargadas: ${PATCH_NOTES_CACHE.length} parches encontrados.`);
+    } catch (err) {
+        console.error("Error cargando Patch Notes:", err);
+    }
+}
+
 // --- THE PLAYER BLUEPRINT (SCHEMA) ---
 const userSchema = new mongoose.Schema({
     email: { type: String, required: true, unique: true },
@@ -130,6 +284,7 @@ const userSchema = new mongoose.Schema({
     // --- NUEVO: SISTEMA DE ECONOMÍA ---
     coins: { type: Number, default: 0 },
     // 👇 NUEVO: ESTADÍSTICAS DE COMBATE 👇
+    elo: { type: Number, default: 1000 },
     kills: { type: Number, default: 0 },
     losses: { type: Number, default: 0 },
     // 👇 NUEVO: GUARDADO DE SALUD (ANTI-COMBAT LOGGING) 👇
@@ -173,7 +328,10 @@ const squadSchema = new mongoose.Schema({
 
     createdAt: { type: Date, default: Date.now },
     // 👇 NUEVO: CAMPO PARA EL RANKING GLOBAL DE INFAMIA 👇
-    territoryTimeMinutes: { type: Number, default: 0 }
+    territoryTimeMinutes: { type: Number, default: 0 },
+    // 👇 NUEVOS CAMPOS PARA LOS RANKINGS ROTATIVOS 👇
+    dailyTimeMinutes: { type: Number, default: 0 },
+    weeklyTimeMinutes: { type: Number, default: 0 }
 });
 
 const Squad = mongoose.model('Squad', squadSchema);
@@ -196,6 +354,7 @@ const Item = mongoose.model('Item', itemSchema);
 let MASTER_CATALOG = {};
 let WEAPONS = {};
 let TRASH_CATALOG = [];
+let METALS_CATALOG = []; // <--- ⛏️ ¡AQUÍ ESTÁ LA LÍNEA QUE FALTABA!
 
 async function loadMasterCatalog() {
     try {
@@ -214,15 +373,18 @@ async function loadMasterCatalog() {
         MASTER_CATALOG = {};
         WEAPONS = {};
         TRASH_CATALOG = [];
+        // Añade esto donde declaras TRASH_CATALOG
+        METALS_CATALOG = [];
 
+        // En tu función loadMasterCatalog(), modifícala ligeramente para atrapar los metales:
         items.forEach(i => {
             MASTER_CATALOG[i.id] = i;
-
             if (i.category === 'weapon') {
-                // Esto es lo que mantiene vivo tu hotbar y sistema de disparo
                 WEAPONS[i.id] = { ...i.toObject(), ...i.stats };
             } else if (i.category === 'junk') {
                 TRASH_CATALOG.push({ ...i.toObject(), ...i.drawConfig, value: i.price });
+            } else if (i.category === 'metal') { // <--- ⛏️ NUEVO: Atrapa los minerales
+                METALS_CATALOG.push({ ...i.toObject(), ...i.drawConfig, value: i.price });
             }
         });
 
@@ -286,7 +448,11 @@ async function loadWorldMapFromDB() {
                 triggerType: t.triggerType,
                 destX: t.destX,
                 destY: t.destY,
-                itemId: t.itemId
+                itemId: t.itemId,
+                itemRow: t.itemRow || 0, // <--- AÑADE ESTO
+                shelfX: t.shelfX || 0,
+
+                shelfY: t.shelfY || 0
             };
 
             // 🛑 EL FIX: Detectar la Base y conectarla con su persistencia
@@ -310,6 +476,7 @@ async function loadWorldMapFromDB() {
             }
         });
         // --- RECUPERAR DATOS DE LA BASE DESDE MONGODB ---
+        // --- RECUPERAR DATOS DE LA BASE DESDE MONGODB ---
         if (centralBase) {
             let dbTurf = await Turf.findOne({ turfId: centralBase.turfId });
 
@@ -318,7 +485,10 @@ async function loadWorldMapFromDB() {
                 dbTurf = await Turf.create({
                     turfId: centralBase.turfId,
                     name: "Base Central",
-                    hp: 5000, maxHp: 5000
+                    hp: 5000, maxHp: 5000,
+                    // Valores por defecto para una base nueva
+                    hitboxW: 32,
+                    hitboxH: 32
                 });
             }
 
@@ -327,12 +497,56 @@ async function loadWorldMapFromDB() {
             centralBase.hp = dbTurf.hp;
             centralBase.maxHp = dbTurf.maxHp;
             centralBase.currentOwnerSquadId = dbTurf.ownerSquadName;
+            centralBase.srcIdle = dbTurf.srcIdle || "";
+            centralBase.srcHit = dbTurf.srcHit || "";
+            centralBase.spriteOffsetX = dbTurf.spriteOffsetX || 0;
+            centralBase.spriteOffsetY = dbTurf.spriteOffsetY || 0;
+            centralBase.hitboxOffsetX = dbTurf.hitboxOffsetX || 0;
+            centralBase.hitboxOffsetY = dbTurf.hitboxOffsetY || 0;
 
-            console.log(`🏰 [${centralBase.name}] cargada en RAM. Dueño actual: ${centralBase.currentOwnerSquadId || 'Nadie'}`);
+            // 👇 NUEVO: CARGAMOS EL ANCHO Y ALTO DEL HITBOX A LA RAM 👇
+            centralBase.hitboxW = dbTurf.hitboxW || 32;
+            centralBase.hitboxH = dbTurf.hitboxH || 32;
+
+            centralBase.lastHitTime = centralBase.lastHitTime || 0;
+            // Mantenemos el damageTracker vacío al reiniciar el servidor
+            centralBase.damageTracker = {};
+
+            console.log(`🏰 [${centralBase.name}] cargada en RAM. Dueño actual: ${centralBase.currentOwnerSquadId || 'Nadie'}. Hitbox: ${centralBase.hitboxW}x${centralBase.hitboxH}`);
         }
         console.log(`🌍 Mapa Físico cargado en RAM del servidor (${allTiles.length} bloques).`);
     } catch (err) {
         console.error("Error cargando el mapa:", err);
+    }
+}
+
+// --- CARGAR ARENAS EN LA RAM AL INICIAR EL SERVIDOR ---
+async function loadArenasFromDB() {
+    try {
+        const allArenas = await Arena.find({});
+        arenasRAM = {}; // Limpiamos por si acaso
+
+        allArenas.forEach(a => {
+            arenasRAM[a.arenaId] = {
+                arenaId: a.arenaId,
+                name: a.name,
+                p1X: a.p1X, p1Y: a.p1Y,
+                p2X: a.p2X, p2Y: a.p2Y,
+                // Si por error en el editor se guardó vacío, forzamos a que sea 1
+                team1Size: a.team1Size || 1,
+                team2Size: a.team2Size || 1,
+                queue: [], // Inician vacías al reiniciar el server
+                isOccupied: false,
+                team1: [],
+                team2: [],
+                isRanked: a.isRanked || false,
+                aliveTeam1: 0,
+                aliveTeam2: 0
+            };
+        });
+        console.log(`🥊 Arenas cargadas en RAM: ${allArenas.length} arenas activas.`);
+    } catch (err) {
+        console.error("Error cargando Arenas:", err);
     }
 }
 
@@ -342,7 +556,24 @@ function serverCheckCollision(x, y) {
     const hitX = 5;
     const hitY = 5;
     const offsetY = 3;
+    // 👇 NUEVO: HACER LA BASE SÓLIDA (CUADRADO EXACTO) 👇
+    if (centralBase) {
+        const bx = centralBase.worldX + (centralBase.hitboxOffsetX || 0);
+        const by = centralBase.worldY + (centralBase.hitboxOffsetY || 0);
+        const hw = (centralBase.hitboxW || 32) / 2;
+        const hh = (centralBase.hitboxH || 32) / 2;
 
+        // Función para ver si un punto entra en el rectángulo
+        const isInsideRect = (px, py) => (px >= bx - hw && px <= bx + hw && py >= by - hh && py <= by + hh);
+
+        // Si alguna de las 4 esquinas del jugador toca el rectángulo, choca
+        if (isInsideRect(x - hitX, y - hitY + offsetY) ||
+            isInsideRect(x + hitX, y - hitY + offsetY) ||
+            isInsideRect(x - hitX, y + hitY + offsetY) ||
+            isInsideRect(x + hitX, y + hitY + offsetY)) {
+            return true;
+        }
+    }
     const checkWall = (cx, cy) => {
         const gx = Math.floor(cx / TILE_SIZE);
         const gy = Math.floor(cy / TILE_SIZE);
@@ -494,6 +725,7 @@ wss.on('connection', async (ws) => {
                 // 👇 NUEVO: CARGAR KILLS Y LOSSES 👇
                 players[id].kills = user.kills || 0;
                 players[id].losses = user.losses || 0;
+                players[id].elo = user.elo || 1000;
                 // 👇 NUEVO: CARGAR SALUD A LA RAM 👇
                 players[id].hp = user.hp !== undefined ? user.hp : 100;
                 players[id].isDead = user.isDead || false;
@@ -594,7 +826,8 @@ wss.on('connection', async (ws) => {
                     await Tile.deleteMany(query);
 
                     // 👇 EL FIX: Si pasamos el borrador por encima de la base, la destruimos
-                    if (centralBase && centralBase.gridX === data.x && centralBase.gridY === data.y) {
+                    // 👇 EL FIX: Solo destruimos la base si borramos en la Capa 15 (Lógica)
+                    if (centralBase && centralBase.gridX === data.x && centralBase.gridY === data.y && data.l === 15) {
                         await Turf.deleteOne({ turfId: centralBase.turfId });
                         centralBase = null;
                         wss.clients.forEach(c => {
@@ -633,7 +866,8 @@ wss.on('connection', async (ws) => {
                         bulkOps.push({ deleteMany: { filter: { x: t.x, y: t.y, l: t.l } } });
 
                         // 👇 EL FIX: Si borramos la base con el borrador de arrastre masivo
-                        if (centralBase && centralBase.gridX === t.x && centralBase.gridY === t.y) {
+                        // 👇 EL FIX: Solo si borramos con arrastre masivo en la Capa 15
+                        if (centralBase && centralBase.gridX === t.x && centralBase.gridY === t.y && t.l === 15) {
                             await Turf.deleteOne({ turfId: centralBase.turfId });
                             centralBase = null;
                             wss.clients.forEach(c => {
@@ -694,11 +928,20 @@ wss.on('connection', async (ws) => {
                     updateData.destX = data.destX;
                     updateData.destY = data.destY;
                     updateData.itemId = data.itemId;
-
+                    updateData.requiresClick = data.requiresClick;
+                    updateData.npcMessage = data.npcMessage;
+                    updateData.itemRow = data.itemRow || 0; // <--- AÑADE ESTO PARA MONGODB
+                    updateData.shelfX = data.shelfX || 0; // <--- MONGODB
+                    updateData.shelfY = data.shelfY || 0;
                     // Guardar también en RAM
                     serverWorldMap[key].triggerType = data.triggerType;
                     serverWorldMap[key].destX = data.destX;
                     serverWorldMap[key].destY = data.destY;
+                    serverWorldMap[key].requiresClick = data.requiresClick;
+                    serverWorldMap[key].npcMessage = data.npcMessage;
+                    serverWorldMap[key].itemRow = data.itemRow || 0; // <--- AÑADE ESTO
+                    serverWorldMap[key].shelfX = data.shelfX || 0;
+                    serverWorldMap[key].shelfY = data.shelfY || 0;
                 }
 
                 await Tile.updateMany(query, updateData);
@@ -713,9 +956,15 @@ wss.on('connection', async (ws) => {
                         {
                             name: data.turfName || "Base Central",
                             maxHp: data.turfHp || 5000,
-                            $setOnInsert: { hp: data.turfHp || 5000, ownerSquadName: null }
+                            spriteOffsetX: data.turfOffsetX || 0, // <--- GUARDAR EN BD
+                            spriteOffsetY: data.turfOffsetY || 0,  // <--- GUARDAR EN BD
+                            hitboxOffsetX: data.turfHitX || 0, // <--- GUARDAR EN BD
+                            hitboxOffsetY: data.turfHitY || 0,  // <--- GUARDAR EN BD
+                            hitboxW: data.turfHitW || 32, // <--- GUARDAR W
+                            hitboxH: data.turfHitH || 32  // <--- GUARDAR H
+                            // 🛑 YA NO GUARDAMOS "src" AQUÍ. SE HACE DIRECTO EN MONGODB.
                         },
-                        { upsert: true, new: true }
+                        { upsert: true, returnDocument: 'after' } // <--- EL FIX
                     );
 
                     // La cargamos a la memoria RAM instantáneamente
@@ -726,6 +975,15 @@ wss.on('connection', async (ws) => {
                         hp: dbTurf.hp, maxHp: dbTurf.maxHp,
                         currentOwnerSquadId: dbTurf.ownerSquadName,
                         name: dbTurf.name,
+                        srcIdle: dbTurf.srcIdle || "",
+                        srcHit: dbTurf.srcHit || "",
+                        spriteOffsetX: dbTurf.spriteOffsetX || 0, // <--- RAM
+                        spriteOffsetY: dbTurf.spriteOffsetY || 0, // <--- RAM
+                        hitboxOffsetX: dbTurf.hitboxOffsetX || 0, // <--- RAM
+                        hitboxOffsetY: dbTurf.hitboxOffsetY || 0, // <--- RAM
+                        hitboxW: dbTurf.hitboxW || 32, // <--- RAM W
+                        hitboxH: dbTurf.hitboxH || 32, // <--- RAM H
+                        lastHitTime: centralBase ? centralBase.lastHitTime : 0, // Conservar el tiempo si ya existía
                         damageTracker: {}
                     };
 
@@ -734,9 +992,47 @@ wss.on('connection', async (ws) => {
                     wss.clients.forEach(c => {
                         if (c.readyState === WebSocket.OPEN) c.send(JSON.stringify({ type: 'base_update', base: centralBase }));
                     });
-                } else {
-                    // 👇 NUEVO: Si cambias el bloque a "Normal", DESTRUIMOS LA BASE por completo
-                    if (centralBase && centralBase.gridX === data.x && centralBase.gridY === data.y) {
+                } // 🥊 NUEVO: CREAR O ACTUALIZAR ARENA DE SPARRING
+                else if (data.triggerType === 'arena') {
+                    const uniqueArenaId = `arena_${data.x}_${data.y}`;
+
+                    const dbArena = await Arena.findOneAndUpdate(
+                        { arenaId: uniqueArenaId },
+                        {
+                            name: data.arenaName || "Coliseo",
+                            p1X: data.arenaP1X, p1Y: data.arenaP1Y,
+                            p2X: data.arenaP2X, p2Y: data.arenaP2Y,
+                            team1Size: data.team1Size || 1, // <--- GUARDAR
+                            team2Size: data.team2Size || 1,  // <--- GUARDAR
+                            isRanked: data.isRanked || false
+                        },
+                        { upsert: true, returnDocument: 'after' } // <--- EL FIX
+                    );
+
+                    // Mantener el estado en vivo (Si ya había gente en cola, no borrarlos)
+                    if (!arenasRAM[uniqueArenaId]) {
+                        arenasRAM[uniqueArenaId] = {
+                            queue: [],
+                            isOccupied: false,
+                            fighter1: null,
+                            fighter2: null
+                        };
+                    }
+
+                    // Actualizar solo las coordenadas físicas
+                    arenasRAM[uniqueArenaId].arenaId = uniqueArenaId;
+                    arenasRAM[uniqueArenaId].name = dbArena.name;
+                    arenasRAM[uniqueArenaId].p1X = dbArena.p1X;
+                    arenasRAM[uniqueArenaId].p1Y = dbArena.p1Y;
+                    arenasRAM[uniqueArenaId].p2X = dbArena.p2X;
+                    arenasRAM[uniqueArenaId].p2Y = dbArena.p2Y;
+                    arenasRAM[uniqueArenaId].doorX = data.x; // Donde está el letrero para salir
+                    arenasRAM[uniqueArenaId].doorY = data.y;
+
+                    console.log(`🥊 Arena Guardada en vivo: ${dbArena.name}`);
+                } else if (data.triggerType !== undefined) {
+                    // Si cambias el bloque a "Normal" estando en la Capa 15, DESTRUIMOS LA BASE
+                    if (centralBase && centralBase.gridX === data.x && centralBase.gridY === data.y && data.layer === 15) {
                         await Turf.deleteOne({ turfId: centralBase.turfId });
                         centralBase = null;
                         wss.clients.forEach(c => {
@@ -752,11 +1048,60 @@ wss.on('connection', async (ws) => {
                             type: 'tile_meta_update',
                             x: data.x, y: data.y, layer: data.layer, hasCollision: data.hasCollision,
                             triggerType: data.triggerType, destX: data.destX, destY: data.destY,
-                            itemId: data.itemId // <--- AÑADE ESTO
+                            itemId: data.itemId,
+                            requiresClick: data.requiresClick,
+                            npcMessage: data.npcMessage,
+                            itemRow: data.itemRow || 0, // <--- AÑADE ESTE ENVÍO AL CLIENTE
+                            shelfX: data.shelfX || 0, // <--- AL CLIENTE
+                            shelfY: data.shelfY || 0
                         }));
                     }
                 });
             } catch (err) { console.error('Meta Update Error:', err); }
+        }// --- 🥊 SISTEMA DE SPARRING (MULTIARENAS) ---
+        if (data.type === 'get_arena_info' && isAuthenticated) {
+            const arena = arenasRAM[data.arenaId];
+            if (arena) {
+                // Traducir los IDs a nombres para que el frontend los lea bonito
+                const queueNames = arena.queue.map(pid => players[pid] ? players[pid].username : "Desconectado");
+                const f1Name = arena.fighter1 && players[arena.fighter1] ? players[arena.fighter1].username : null;
+                const f2Name = arena.fighter2 && players[arena.fighter2] ? players[arena.fighter2].username : null;
+
+                ws.send(JSON.stringify({
+                    type: 'arena_info_update',
+                    arenaId: data.arenaId,
+                    name: arena.name,
+                    queue: queueNames,
+                    inQueue: arena.queue.includes(id),
+                    fighter1: f1Name,
+                    fighter2: f2Name
+                }));
+            }
+        }
+
+        if (data.type === 'join_arena_queue' && isAuthenticated) {
+            const arena = arenasRAM[data.arenaId];
+            if (arena && !arena.queue.includes(id) && arena.fighter1 !== id && arena.fighter2 !== id) {
+                arena.queue.push(id);
+                // Guardar dónde estaba para devolverlo después de pelear
+                players[id].preSparX = players[id].worldX;
+                players[id].preSparY = players[id].worldY;
+                players[id].currentArena = data.arenaId; // Marcamos en qué arena se metió
+
+                // Actualizar a todos los que estén viendo el letrero
+                broadcast({ type: 'refresh_arena_ui', arenaId: data.arenaId });
+                ws.send(JSON.stringify({ type: 'refresh_arena_ui', arenaId: data.arenaId }));
+            }
+        }
+
+        if (data.type === 'leave_arena_queue' && isAuthenticated) {
+            const arena = arenasRAM[data.arenaId];
+            if (arena) {
+                arena.queue = arena.queue.filter(pId => pId !== id);
+                players[id].currentArena = null;
+                broadcast({ type: 'refresh_arena_ui', arenaId: data.arenaId });
+                ws.send(JSON.stringify({ type: 'refresh_arena_ui', arenaId: data.arenaId }));
+            }
         }// 🛑 NUEVO: GUARDAR ATUENDO DEL GUARDARROPA (WARDROBE)
         if (data.type === 'update_wardrobe' && isAuthenticated) {
             try {
@@ -782,29 +1127,49 @@ wss.on('connection', async (ws) => {
                 }
             } catch (err) { console.error("Error actualizando guardarropa:", err); }
         }
-
-        // --- NUEVO: CREAR ZONA SEGURA (ADMIN) ---
+        // --- NUEVO: CREAR ZONA UNIVERSAL (ADMIN) ---
         if (data.type === 'create_safezone') {
             if (!players[id] || players[id].role !== 'admin') return;
 
             try {
                 const newZone = new SafeZone({
                     name: data.name,
+                    zoneType: data.zoneType || 'safe', // <--- AÑADE ESTO
                     xMin: data.xMin, xMax: data.xMax,
                     yMin: data.yMin, yMax: data.yMax
                 });
                 await newZone.save();
 
-                // Actualizar la RAM del servidor
                 safeZonesRAM.push(newZone);
 
-                // Avisarle a todos los jugadores conectados que hay una nueva zona
                 wss.clients.forEach(client => {
                     if (client.readyState === WebSocket.OPEN) {
+                        // 🛑 EL FIX ESTÁ AQUÍ 🛑 
                         client.send(JSON.stringify({ type: 'new_safezone', zone: newZone }));
                     }
                 });
-            } catch (err) { console.error("Error guardando SafeZone:", err); }
+            } catch (err) { console.error("Error guardando Zona:", err); }
+        }// --- NUEVO: ELIMINAR ZONA SEGURA (ADMIN) ---
+        if (data.type === 'delete_safezone' && isAuthenticated) {
+            if (!players[id] || players[id].role !== 'admin') return;
+
+            try {
+                // 1. Borrar de MongoDB usando su ID único
+                await SafeZone.findByIdAndDelete(data.id);
+
+                // 2. Borrar de la memoria RAM del servidor
+                safeZonesRAM = safeZonesRAM.filter(z => z._id.toString() !== data.id);
+
+                // 3. Avisarle a todos los jugadores que esa zona ya no existe
+                wss.clients.forEach(client => {
+                    if (client.readyState === WebSocket.OPEN) {
+                        client.send(JSON.stringify({ type: 'safezone_deleted', id: data.id }));
+                    }
+                });
+                console.log(`🛡️ Zona Segura eliminada: ${data.id}`);
+            } catch (err) {
+                console.error("Error eliminando SafeZone:", err);
+            }
         }
 
         // 4. HANDLE AUTO-LOGIN
@@ -846,7 +1211,7 @@ wss.on('connection', async (ws) => {
                 // 👇 NUEVO: CARGAR KILLS Y LOSSES 👇
                 players[id].kills = user.kills || 0;
                 players[id].losses = user.losses || 0;
-
+                players[id].elo = user.elo || 1000; // <--- AÑADIR ESTO
                 // 👇 NUEVO: CARGAR SALUD A LA RAM 👇
                 players[id].hp = user.hp !== undefined ? user.hp : 100;
                 players[id].isDead = user.isDead || false;
@@ -1053,12 +1418,31 @@ wss.on('connection', async (ws) => {
                     }));
                 }
             });
+        }// 👇 NUEVO: Lógica para escopetas (Múltiples balas en 1 mensaje) 👇
+        if (data.type === 'shoot_shotgun') {
+            // Reenviamos el paquete exacto a todos los demás jugadores
+            wss.clients.forEach((client) => {
+                if (client !== ws && client.readyState === WebSocket.OPEN) {
+                    client.send(JSON.stringify({
+                        type: 'shoot_shotgun',
+                        id: id, // 🛑 EL FIX: 'id' a secas, para que las balas tengan dueño
+                        x: data.x,
+                        y: data.y,
+                        angles: data.angles,
+                        weaponId: data.weaponId
+                    }));
+                }
+            });
         }
-
         // 8. MANEJAR EL DAÑO Y LA VIDA (CON ESCUDO ANTI-CHEAT DEFINITIVO)
         if (data.type === 'damage_player') {
             const shooter = players[id];
             const target = players[data.targetId];
+
+            // Evitar Fuego Amigo en la Arena
+            if (shooter.isSparring && target.isSparring && shooter.currentArena === target.currentArena) {
+                if (shooter.arenaTeam === target.arenaTeam) return; // Son del mismo equipo
+            }
 
             if (shooter && target && !target.isDead) {
 
@@ -1077,7 +1461,6 @@ wss.on('connection', async (ws) => {
 
                 // 3. RANGO
                 const dist = Math.hypot(shooter.worldX - target.worldX, shooter.worldY - target.worldY);
-                // Si es melee, el rango máximo es de la Hitbox. Si es pistola usa speed * range
                 const maxDist = stats.type === 'melee' ? (stats.dirStats?.[0]?.hitLen || 60) * 2 : (stats.range * stats.speed) * 1.3;
                 if (dist > maxDist && stats.type !== 'melee') return;
 
@@ -1105,8 +1488,6 @@ wss.on('connection', async (ws) => {
                 if (knockbackForce > 0 && !target.isDead) {
                     const angle = Math.atan2(target.worldY - shooter.worldY, target.worldX - shooter.worldX);
 
-                    // 🛑 EL FIX: En lugar de teletransportar, caminamos pasito a pasito. 
-                    // Si encontramos una pared, el empuje se cancela.
                     let stepForce = knockbackForce / 5;
                     for (let i = 0; i < 5; i++) {
                         let nextX = target.worldX + (Math.cos(angle) * stepForce);
@@ -1116,7 +1497,7 @@ wss.on('connection', async (ws) => {
                             target.worldX = nextX;
                             target.worldY = nextY;
                         } else {
-                            break; // 🧱 Chocó contra pared, salvado.
+                            break;
                         }
                     }
 
@@ -1132,8 +1513,6 @@ wss.on('connection', async (ws) => {
                         }
                     });
 
-                    // 2. Avisar a todos los DEMÁS que la víctima salió volando
-                    // 🛑 EL FIX: Quitamos el JSON.stringify
                     broadcast({ type: 'update', id: data.targetId, player: target });
                 }
 
@@ -1145,41 +1524,141 @@ wss.on('connection', async (ws) => {
                     shooter.kills = (shooter.kills || 0) + 1;
                     target.losses = (target.losses || 0) + 1;
 
-                    // Revivir al jugador después de 3 segundos
-                    setTimeout(() => {
-                        if (players[data.targetId]) {
-                            players[data.targetId].hp = 100;
-                            players[data.targetId].isDead = false;
-                            players[data.targetId].lastHitTime = Date.now();
-                            players[data.targetId].invulnerableUntil = Date.now() + 100;
+                    // 🥊 LÓGICA DE ARENA: ¿Están peleando un Match de Sparring?
+                    if (target.isSparring && shooter.isSparring && target.currentArena === shooter.currentArena) {
+                        const arena = arenasRAM[target.currentArena];
 
-                            wss.clients.forEach(client => {
-                                if (client.readyState === WebSocket.OPEN) {
-                                    client.send(JSON.stringify({
-                                        type: 'hp_update', targetId: data.targetId,
-                                        newHp: 100, damageDealt: 0, isDead: false
-                                    }));
+                        if (arena) {
+                            // Restar un vivo al equipo del que acaba de morir
+                            if (target.arenaTeam === 1) arena.aliveTeam1--;
+                            if (target.arenaTeam === 2) arena.aliveTeam2--;
+
+                            // ¿Se acabó la pelea? (Todo un equipo llegó a 0)
+                            if (arena.aliveTeam1 <= 0 || arena.aliveTeam2 <= 0) {
+                                const winningTeam = arena.aliveTeam1 <= 0 ? 2 : 1;
+
+                                // --- 🏆 MATEMÁTICAS DE ELO 🏆 ---
+                                // Buscar al "Carreador" (El jugador vivo con más HP del equipo ganador)
+                                let maxWinnerHp = 0;
+                                if (arena.isRanked) {
+                                    const winningPlayers = winningTeam === 1 ? arena.team1 : arena.team2;
+                                    winningPlayers.forEach(pid => {
+                                        if (players[pid] && !players[pid].isDead && players[pid].hp > maxWinnerHp) {
+                                            maxWinnerHp = players[pid].hp;
+                                        }
+                                    });
                                 }
-                            });
-                        }
-                    }, 3000);
-                }
 
-                // Enviar la actualización de vida a todos
-                wss.clients.forEach(client => {
-                    if (client.readyState === WebSocket.OPEN) {
-                        client.send(JSON.stringify({
-                            type: 'hp_update',
-                            targetId: data.targetId,
-                            newHp: target.hp,
-                            damageDealt: actualDamage,
-                            isDead: target.isDead || false,
-                            shooterId: id,
-                            shooterKills: shooter.kills,
-                            targetLosses: target.losses
-                        }));
+                                // Fórmula de Ganancia:
+                                let eloChange = 5;
+                                if (maxWinnerHp >= 90) eloChange = 10;
+                                else if (maxWinnerHp >= 75) eloChange = 8.5;
+                                else if (maxWinnerHp >= 50) eloChange = 7;
+
+                                // Procesar a TODOS los jugadores (los que jugaron este match)
+                                [...arena.team1, ...arena.team2].forEach(pid => {
+                                    let p = players[pid];
+                                    if (p) {
+                                        const isWinner = (winningTeam === 1 && arena.team1.includes(pid)) || (winningTeam === 2 && arena.team2.includes(pid));
+
+                                        // 🏆 Aplicar Elo si es Ranked
+                                        if (arena.isRanked) {
+                                            if (isWinner) p.elo += eloChange;
+                                            else p.elo -= eloChange;
+
+                                            if (p.elo < 0) p.elo = 0; // No bajar de 0
+
+                                            // Guardar el nuevo Elo en MongoDB silenciosamente
+                                            User.findByIdAndUpdate(p.accountId, { elo: p.elo }).catch(console.error);
+                                        }
+
+                                        p.isSparring = false;
+                                        p.arenaTeam = null;
+                                        p.currentArena = null;
+                                        p.hp = 100; // Curarlos y revivirlos para el regreso
+                                        p.isDead = false;
+                                        p.lastHitTime = Date.now();
+                                        p.invulnerableUntil = Date.now() + 2000;
+                                        p.worldX = p.preSparX;
+                                        p.worldY = p.preSparY;
+
+                                        let resultMsg = isWinner ? "¡VICTORIA! 🏆" : "DERROTA 💀";
+                                        if (arena.isRanked) {
+                                            resultMsg += isWinner ? ` (+${eloChange} Elo)` : ` (-${eloChange} Elo)`;
+                                        }
+
+                                        // 🛫 MÁNDALOS DE VUELTA A DONDE TOCARON EL LETRERO
+                                        wss.clients.forEach(c => {
+                                            if (c.playerId === pid && c.readyState === WebSocket.OPEN) {
+                                                // 🛑 EL FIX: Enviamos también el nuevo Elo al cliente
+                                                c.send(JSON.stringify({ type: 'match_finished', returnX: p.preSparX, returnY: p.preSparY, result: resultMsg, newElo: p.elo }));
+                                            }
+                                        });
+                                    }
+                                });
+
+                                // Liberar la arena para los siguientes en la fila
+                                arena.isOccupied = false;
+                                arena.team1 = [];
+                                arena.team2 = [];
+                                arena.fighter1 = null;
+                                arena.fighter2 = null;
+                                broadcast({ type: 'refresh_arena_ui', arenaId: arena.arenaId });
+                            } else {
+                                // Si es un 2v2 o 3v3 y solo murió uno, enviamos la actualización de muerte normal (se queda como fantasma hasta que acabe el round)
+                                wss.clients.forEach(client => {
+                                    if (client.readyState === WebSocket.OPEN) {
+                                        client.send(JSON.stringify({
+                                            type: 'hp_update', targetId: data.targetId, newHp: 0, damageDealt: actualDamage, isDead: true,
+                                            shooterId: id, shooterKills: shooter.kills, targetLosses: target.losses
+                                        }));
+                                    }
+                                });
+                            }
+                        }
+                    } else {
+                        // 💀 MUERTE NORMAL EN EL MUNDO ABIERTO
+
+                        // Revivir al jugador después de 3 segundos
+                        setTimeout(() => {
+                            if (players[data.targetId]) {
+                                players[data.targetId].hp = 100;
+                                players[data.targetId].isDead = false;
+                                players[data.targetId].lastHitTime = Date.now();
+                                players[data.targetId].invulnerableUntil = Date.now() + 100;
+
+                                wss.clients.forEach(client => {
+                                    if (client.readyState === WebSocket.OPEN) {
+                                        client.send(JSON.stringify({
+                                            type: 'hp_update', targetId: data.targetId,
+                                            newHp: 100, damageDealt: 0, isDead: false
+                                        }));
+                                    }
+                                });
+                            }
+                        }, 3000);
+
+                        // Enviar la actualización de vida a todos 
+                        wss.clients.forEach(client => {
+                            if (client.readyState === WebSocket.OPEN) {
+                                client.send(JSON.stringify({
+                                    type: 'hp_update', targetId: data.targetId, newHp: target.hp, damageDealt: actualDamage, isDead: true,
+                                    shooterId: id, shooterKills: shooter.kills, targetLosses: target.losses
+                                }));
+                            }
+                        });
                     }
-                });
+                } else {
+                    // SI NO MURIÓ, SOLO ENVIAMOS LA ACTUALIZACIÓN DE VIDA NORMAL A TODOS
+                    wss.clients.forEach(client => {
+                        if (client.readyState === WebSocket.OPEN) {
+                            client.send(JSON.stringify({
+                                type: 'hp_update', targetId: data.targetId, newHp: target.hp, damageDealt: actualDamage, isDead: false,
+                                shooterId: id, shooterKills: shooter.kills, targetLosses: target.losses
+                            }));
+                        }
+                    });
+                }
             }
         }
         // --- 1. SINCRONIZAR ANIMACIÓN MELEE ---
@@ -1249,21 +1728,24 @@ wss.on('connection', async (ws) => {
                 const myAccountId = players[id].accountId;
                 const targetAccountId = data.targetAccountId;
 
-                // Buscar el nombre ACTUAL del usuario en la base de datos (Magia del ID)
+                // Buscar el nombre y la ropa ACTUAL del usuario en la base de datos
                 const targetUser = await User.findById(targetAccountId);
                 const currentTargetName = targetUser ? targetUser.username : "Usuario Desconocido";
+
+                // 👇 NUEVO: Extraemos la ropa exacta que lleva puesta
+                const targetEquipped = targetUser && targetUser.equipped ? targetUser.equipped : { head: 'head_default' };
 
                 const conv = await PM.findOne({ participants: { $all: [myAccountId, targetAccountId] } });
 
                 ws.send(JSON.stringify({
                     type: 'pm_history',
                     targetAccountId: targetAccountId,
-                    targetUsername: currentTargetName, // Devolvemos el nombre real!
+                    targetUsername: currentTargetName,
+                    targetEquipped: targetEquipped, // 👈 ENVIAMOS LA ROPA AL CLIENTE
                     history: conv ? conv.messages : []
                 }));
             } catch (err) { console.error("Error pidiendo historial:", err); }
         }
-
         // 11. PEDIR LISTA DE INBOX
         if (data.type === 'get_inbox' && isAuthenticated) {
             try {
@@ -1274,15 +1756,19 @@ wss.on('connection', async (ws) => {
                 for (let c of convos) {
                     const otherPersonId = c.participants.find(p => p !== myAccountId);
 
-                    // Buscar su nombre ACTUAL
+                    // Buscar su nombre y ropa ACTUAL
                     const otherUser = await User.findById(otherPersonId);
                     const currentName = otherUser ? otherUser.username : "Usuario Desconocido";
+
+                    // 👇 NUEVO: Extraer la cabeza que trae equipada
+                    const currentHead = (otherUser && otherUser.equipped) ? otherUser.equipped.head : 'head_default';
 
                     const lastMsg = c.messages.length > 0 ? c.messages[c.messages.length - 1] : null;
 
                     inboxData.push({
                         targetAccountId: otherPersonId,
                         targetUser: currentName,
+                        targetHeadId: currentHead, // 👈 ENVIAMOS LA CABEZA A LA TARJETA DEL INBOX
                         lastMessage: lastMsg ? lastMsg.text : "Comienza a chatear...",
                         time: lastMsg ? lastMsg.timestamp : 0
                     });
@@ -1292,48 +1778,103 @@ wss.on('connection', async (ws) => {
                 ws.send(JSON.stringify({ type: 'inbox_data', inbox: inboxData }));
             } catch (err) { console.error("Error pidiendo inbox:", err); }
         }
-        // 12. PEDIR LISTA DE AMIGOS ACTUALIZADA (Versión Optimizada)
+        // 12. PEDIR LISTA DE AMIGOS ACTUALIZADA (Versión Optimizada y con Ropa)
         if (data.type === 'get_friends_list' && isAuthenticated) {
             try {
                 const myUser = await User.findOne({ email: currentUser });
 
-                // 1. Filtramos en milisegundos (en RAM) solo los IDs que sí son válidos
+                // Filtramos en milisegundos solo los IDs que sí son válidos
                 const validFriendIds = (myUser.friends || []).filter(id => mongoose.Types.ObjectId.isValid(id));
 
-                // 2. LA MAGIA: Le pedimos a MongoDB que nos traiga TODOS esos usuarios en 1 SOLA CONSULTA
-                const friendsUsers = await User.find({ _id: { $in: validFriendIds } });
+                // LA MAGIA: Le pedimos a MongoDB que nos traiga TODOS esos usuarios
+                // Usamos .lean() para que la consulta sea hiper-rápida
+                const friendsUsers = await User.find({ _id: { $in: validFriendIds } }).lean();
 
-                // 3. Armamos el paquete para enviarlo al juego
+                // Armamos el paquete incluyendo TODA la ropa y stats
                 const friendsData = friendsUsers.map(fUser => ({
                     accountId: fUser._id.toString(),
-                    username: fUser.username
+                    username: fUser.username,
+                    role: fUser.role || 'player',
+                    equipped: fUser.equipped || { head: 'head_default', body: 'body_default', hat: 'none' },
+                    elo: fUser.elo || 1000,
+                    kills: fUser.kills || 0,
+                    losses: fUser.losses || 0,
+                    coins: fUser.coins || 0
                 }));
 
                 ws.send(JSON.stringify({ type: 'friends_list_data', friends: friendsData }));
             } catch (err) { console.error("Error pidiendo amigos:", err); }
+        }// 27. BÚSQUEDA GLOBAL DE JUGADORES
+        if (data.type === 'search_players' && isAuthenticated) {
+            try {
+                const query = data.query.trim();
+                // Bloqueo de seguridad: Mínimo 3 caracteres para no saturar la base de datos
+                if (query.length < 3) return;
+
+                // Buscar en MongoDB (Ignora mayúsculas y busca en cualquier parte del nombre)
+                const users = await User.find({
+                    username: { $regex: query, $options: 'i' }
+                }).limit(20).lean(); // Límite de 20 resultados para no crear lag
+
+                // Empaquetamos TODOS los datos para que el perfil offline se dibuje perfecto
+                const searchResults = users.map(u => ({
+                    accountId: u._id.toString(),
+                    username: u.username,
+                    role: u.role || 'player',
+                    equipped: u.equipped || { head: 'head_default', body: 'body_default', hat: 'none' },
+                    elo: u.elo || 1000,
+                    kills: u.kills || 0,
+                    losses: u.losses || 0,
+                    coins: u.coins || 0
+                }));
+
+                ws.send(JSON.stringify({ type: 'search_players_results', results: searchResults }));
+            } catch (err) {
+                console.error("Error buscando jugadores:", err);
+            }
         }
         // 13. SISTEMA DE COMPRAS SEGURAS (TIENDA)
         if (data.type === 'buy_item' && isAuthenticated) {
             const p = players[id];
             if (!p) return;
 
-            const weaponId = data.itemId;
-            const weaponStats = WEAPONS[weaponId];
+            const itemId = data.itemId;
 
-            if (!weaponStats) return ws.send(JSON.stringify({ type: 'buy_error', message: 'Este objeto no existe.' }));
-            if (p.inventory && p.inventory.includes(weaponId)) return ws.send(JSON.stringify({ type: 'buy_error', message: 'Ya posees esta arma.' }));
-            if (p.coins < weaponStats.price) return ws.send(JSON.stringify({ type: 'buy_error', message: 'Monedas insuficientes.' }));
+            // 🛑 EL FIX: Buscar en TODO el catálogo maestro, no solo en la carpeta de armas
+            const itemStats = WEAPONS[itemId] || MASTER_CATALOG[itemId];
+
+            if (!itemStats) return ws.send(JSON.stringify({ type: 'buy_error', message: 'Este objeto no existe en la base de datos.' }));
+
+            // Verificamos si ya lo tiene en su inventario
+            const alreadyOwned = p.inventory && p.inventory.some(i => (typeof i === 'object' ? i.id : i) === itemId);
+            if (alreadyOwned) return ws.send(JSON.stringify({ type: 'buy_error', message: 'Ya posees este objeto.' }));
+
+            if (p.coins < itemStats.price) return ws.send(JSON.stringify({ type: 'buy_error', message: 'Monedas insuficientes.' }));
 
             try {
-                p.coins -= weaponStats.price;
+                // Cobrar y entregar el ítem
+                p.coins -= itemStats.price;
                 if (!p.inventory) p.inventory = [];
-                p.inventory.push(weaponId);
+                p.inventory.push(itemId);
 
+                // Guardar en MongoDB
                 await User.findByIdAndUpdate(p.accountId, { coins: p.coins, inventory: p.inventory });
 
-                ws.send(JSON.stringify({ type: 'buy_success', message: `¡Compraste ${weaponStats.name}!`, newCoins: p.coins, newInventory: p.inventory }));
-                ws.send(JSON.stringify({ type: 'update', id: id, player: p })); // Actualiza al jugador
-            } catch (err) { console.error("Error al comprar:", err); }
+                // Avisar al jugador que la compra fue un éxito
+                ws.send(JSON.stringify({
+                    type: 'buy_success',
+                    message: `¡Compraste ${itemStats.name}!`,
+                    newCoins: p.coins,
+                    newInventory: p.inventory
+                }));
+
+                // Actualizar al jugador en vivo para todos
+                broadcast({ type: 'update', id: id, player: p }, ws);
+                ws.send(JSON.stringify({ type: 'update', id: id, player: p }));
+            } catch (err) {
+                console.error("Error al comprar:", err);
+                ws.send(JSON.stringify({ type: 'buy_error', message: 'Error interno del servidor.' }));
+            }
         }
 
         // 14. CREAR SQUAD (CLAN) CON COBRO Y LOGO
@@ -1464,7 +2005,40 @@ wss.on('connection', async (ws) => {
                 ws.send(JSON.stringify({ type: 'my_squad_data', squad: squadData }));
             } catch (err) { console.error(err); }
         }
+        // 26. SOLICITAR EL LEADERBOARD (PUNTAJES DE SQUADS Y BASES EN VIVO)
+        if (data.type === 'get_squad_leaderboard' && isAuthenticated) {
+            try {
+                // 1. Obtener a todos los clanes y solo traer los campos necesarios para no saturar la red
+                const allSquads = await Squad.find({}, 'name logo dailyTimeMinutes weeklyTimeMinutes territoryTimeMinutes').lean();
 
+                // 2. Preparar la vista "En Vivo" (Actualmente solo tienes centralBase, pero lo hacemos como array por si en el futuro agregas más bases)
+                const liveBases = [];
+                if (centralBase) {
+                    // Buscamos el logo del dueño actual para que se vea bonito en el menú
+                    let ownerLogo = "";
+                    if (centralBase.currentOwnerSquadId) {
+                        const sq = await Squad.findOne({ name: centralBase.currentOwnerSquadId });
+                        if (sq) ownerLogo = sq.logo;
+                    }
+
+                    liveBases.push({
+                        name: centralBase.name,
+                        owner: centralBase.currentOwnerSquadId || "Nadie",
+                        ownerLogo: ownerLogo,
+                        hp: centralBase.hp,
+                        maxHp: centralBase.maxHp
+                    });
+                }
+
+                ws.send(JSON.stringify({
+                    type: 'squad_leaderboard_data',
+                    squads: allSquads,
+                    liveBases: liveBases
+                }));
+            } catch (err) {
+                console.error("Error cargando el Leaderboard:", err);
+            }
+        }
         // 18. NUEVO: EDITAR SQUAD (COBRO DE 350 SOLO SI CAMBIA EL NOMBRE)
         if (data.type === 'edit_squad' && isAuthenticated) {
             try {
@@ -1832,6 +2406,185 @@ wss.on('connection', async (ws) => {
             }));
 
             broadcast({ type: 'update', id: id, player: p }, ws);
+        }// ⛏️ NUEVO: SISTEMA DE EXCAVACIÓN (CON FATIGA DINÁMICA BASADA EN EL ARMA)
+        if (data.type === 'dig' && isAuthenticated) {
+            const p = players[id];
+            if (!p) return;
+
+            const now = Date.now();
+
+            // 👇 NUEVO: LEER ESTADÍSTICAS DE LA PALA DESDE LA RAM DEL SERVIDOR 👇
+            const weaponId = p.equippedWeapon || 'none';
+            const weaponStats = WEAPONS[weaponId] || {};
+
+            // Extraemos la resistencia de la pala (Por defecto 15 si es básica o no está configurada)
+            const maxSwingsAllowed = weaponStats.maxFatigue || 15;
+
+            // ==========================================
+            // 🛡️ CAPA 1: FATIGA DE MINERO (DINÁMICA)
+            // ==========================================
+            // Si pasaron más de 8 segundos sin excavar, el jugador recupera su energía
+            if (now - (p.lastDigTime || 0) > 8000) {
+                p.digFatigue = 0;
+            }
+
+            // Cooldown básico de 1 segundo entre palazos
+            if (now - (p.lastDigTime || 0) < 1000) return;
+
+            p.digFatigue = (p.digFatigue || 0) + 1;
+            p.lastDigTime = now;
+
+            // 🛑 EL FIX: Comparamos contra la resistencia de LA PALA, no un número fijo
+            if (p.digFatigue > maxSwingsAllowed) {
+                ws.send(JSON.stringify({
+                    type: 'system_message',
+                    text: `Estás exhausto. ${maxSwingsAllowed} golpes seguidos. Descansa.`,
+                    color: '#e74c3c'
+                }));
+                // Engañamos al timer poniéndolo en el futuro para forzar el descanso
+                p.lastDigTime = now + 8000;
+                return;
+            }
+
+            const hitX = data.hitX;
+            const hitY = data.hitY;
+
+            // ==========================================
+            // 🛡️ CAPA 2: TIERRA AGOTADA (ANTI-AUTO-CLICK)
+            // ==========================================
+            p.lastDigLocationX = p.lastDigLocationX || 0;
+            p.lastDigLocationY = p.lastDigLocationY || 0;
+
+            const distFromLastDig = Math.hypot(p.worldX - p.lastDigLocationX, p.worldY - p.lastDigLocationY);
+
+            if (p.lastDigLocationX !== 0 && distFromLastDig < 40) {
+                ws.send(JSON.stringify({
+                    type: 'system_message',
+                    text: "Ya escarbaste todo aquí. ¡Camina hacia otro lado!",
+                    color: '#e67e22'
+                }));
+                broadcast({ type: 'spawn_hole', x: hitX, y: hitY }, ws);
+                ws.send(JSON.stringify({ type: 'spawn_hole', x: hitX, y: hitY }));
+                return;
+            }
+
+            // ==========================================
+            // 🌍 LÓGICA NORMAL DE ZONAS Y PREMIOS
+            // ==========================================
+            let inDigZone = false;
+            for (let z of safeZonesRAM) {
+                if (z.zoneType === 'dig' && hitX >= z.xMin && hitX <= z.xMax && hitY >= z.yMin && hitY <= z.yMax) {
+                    inDigZone = true;
+                    break;
+                }
+            }
+
+            if (!inDigZone) {
+                ws.send(JSON.stringify({ type: 'system_message', text: "Aquí no hay tierra blanda para excavar.", color: '#e67e22' }));
+                return;
+            }
+
+            p.lastDigLocationX = p.worldX;
+            p.lastDigLocationY = p.worldY;
+
+            broadcast({ type: 'spawn_hole', x: hitX, y: hitY }, ws);
+            ws.send(JSON.stringify({ type: 'spawn_hole', x: hitX, y: hitY }));
+
+            if (Math.random() <= 0.40 && METALS_CATALOG.length > 0) {
+                const foundItem = METALS_CATALOG[Math.floor(Math.random() * METALS_CATALOG.length)];
+
+                if (!p.inventory) p.inventory = [];
+                let existingStack = p.inventory.find(i => typeof i === 'object' && i.id === foundItem.id);
+                if (existingStack) {
+                    existingStack.quantity += 1;
+                } else {
+                    p.inventory.push({ id: foundItem.id, quantity: 1 });
+                }
+
+                User.findByIdAndUpdate(p.accountId, { inventory: p.inventory }).catch(console.error);
+
+                ws.send(JSON.stringify({ type: 'system_message', text: `💎 Desenterraste: ${foundItem.name}!`, color: '#3498db' }));
+                ws.send(JSON.stringify({ type: 'inventory_update', inventory: p.inventory }));
+                broadcast({ type: 'update', id: id, player: p }, ws);
+            }
+        }// =========================================================
+        // 💎 VENDER TODOS LOS METALES (JOYERÍA)
+        // =========================================================
+        if (data.type === 'sell_all_metals' && isAuthenticated) {
+            const p = players[id];
+            if (!p.inventory) return;
+
+            let totalEarned = 0;
+            let newInventory = [];
+
+            for (let item of p.inventory) {
+                let isMetal = false;
+                if (typeof item === 'object' && item.id) {
+                    let catalogItem = METALS_CATALOG.find(m => m.id === item.id);
+                    if (catalogItem) {
+                        const qty = item.quantity || 1;
+                        totalEarned += (catalogItem.value * qty);
+                        isMetal = true;
+                    }
+                }
+
+                if (!isMetal) {
+                    newInventory.push(item); // Conservamos lo que no sea metal
+                }
+            }
+
+            if (totalEarned > 0) {
+                p.coins += totalEarned;
+                p.inventory = newInventory;
+                User.findByIdAndUpdate(p.accountId, { coins: p.coins, inventory: p.inventory }).catch(console.error);
+
+                ws.send(JSON.stringify({ type: 'sell_success', earned: totalEarned, newCoins: p.coins, newInventory: p.inventory }));
+                broadcast({ type: 'update', id: id, player: p }, ws);
+            } else {
+                ws.send(JSON.stringify({ type: 'system_message', text: "Error: No se encontraron metales para vender.", color: '#e74c3c' }));
+            }
+        }
+        // =========================================================
+        // 💎 VENDER METAL INDIVIDUAL
+        // =========================================================
+        if (data.type === 'sell_individual_metal' && isAuthenticated) {
+            const p = players[id];
+            const requestedItemId = data.itemId;
+            const requestedQty = parseInt(data.quantity);
+
+            if (!p.inventory || !requestedItemId || !requestedQty || requestedQty <= 0) return;
+
+            const catalogItem = METALS_CATALOG.find(m => m.id === requestedItemId);
+            if (!catalogItem) return;
+
+            let stackIndex = -1;
+            let existingStack = p.inventory.find((item, index) => {
+                if (typeof item === 'object' && item.id === requestedItemId) {
+                    stackIndex = index;
+                    return true;
+                }
+                return false;
+            });
+
+            if (!existingStack || existingStack.quantity < requestedQty) {
+                ws.send(JSON.stringify({ type: 'system_message', text: "🛑 No tienes suficiente cantidad de este metal.", color: '#e74c3c' }));
+                return;
+            }
+
+            const totalEarned = catalogItem.value * requestedQty;
+            p.coins += totalEarned;
+            existingStack.quantity -= requestedQty;
+
+            if (existingStack.quantity <= 0) {
+                p.inventory.splice(stackIndex, 1);
+            }
+
+            User.findByIdAndUpdate(p.accountId, { coins: p.coins, inventory: p.inventory }).catch(console.error);
+
+            // Reusamos sell_success para que el cliente procese la animación de monedas y cierre la tienda
+            ws.send(JSON.stringify({ type: 'sell_success', earned: totalEarned, newCoins: p.coins, newInventory: p.inventory }));
+            broadcast({ type: 'update', id: id, player: p }, ws);
+
         } else if (data.type === 'sync_weapon_pivot') {
             if (weaponsDB[data.weaponId]) {
                 weaponsDB[data.weaponId].pivotX = data.pivotX;
@@ -1898,6 +2651,7 @@ wss.on('connection', async (ws) => {
 
                 // 3B. RUTINA DE ATAQUE (Enemigos)
                 centralBase.hp -= actualDamage;
+                centralBase.lastHitTime = Date.now(); // ⏱️ ¡REGISTRAMOS EL GOLPE!
 
                 // Registrar en la "Libreta de Daño" quién le está pegando
                 if (!centralBase.damageTracker[shooter.squadName]) centralBase.damageTracker[shooter.squadName] = 0;
@@ -1955,7 +2709,8 @@ wss.on('connection', async (ws) => {
                         isDead: players[id].isDead,
                         // 👇 NUEVO: GUARDAR KILLS Y LOSSES 👇
                         kills: players[id].kills,
-                        losses: players[id].losses
+                        losses: players[id].losses,
+                        elo: players[id].elo // <--- AÑADIR ESTO
                     }
                 );
             } catch (err) { console.error(err); }
@@ -1985,7 +2740,11 @@ wss.on('connection', async (ws) => {
         centralBase: centralBase, // 🛑 EL FIX: Añadimos la base a la memoria del cliente
         groundItems: groundItems, // 🛑 EL FIX: Mandar la basura a los jugadores nuevos
         trashCatalog: TRASH_CATALOG,
-        masterCatalog: MASTER_CATALOG // 📦 EL FIX: Enviamos toda la ropa e ítems
+        masterCatalog: MASTER_CATALOG, // 📦 EL FIX: Enviamos toda la ropa e ítems
+        zoneConfig: ZONE_CONFIG, // <--- 👇 AÑADE ESTA LÍNEA 👇
+        ranksDB: RANKS_CACHE,
+        patchNotes: PATCH_NOTES_CACHE // 📰 NUEVO: Enviamos las noticias
+
     }));
 
     // 4. NOW TELL THE LOBBY A GUEST HAS ARRIVED
@@ -2009,37 +2768,155 @@ function broadcast(data, excludeWs = null) {
 }
 
 // =========================================================
-// 🗑️ SISTEMA DE BASURA (TRASH PICKER)
+// 🥊 MATCHMAKER GLOBAL (Soporta 1v1, 2v2, 3v1, 4v4, etc.)
+// =========================================================
+setInterval(() => {
+    for (let aId in arenasRAM) {
+        let arena = arenasRAM[aId];
+
+        // 1. Limpiar desconectados de la cola
+        arena.queue = arena.queue.filter(pid => players[pid] && !players[pid].isDead);
+
+        // 🛑 EL FIX: Asegurar que los números sean reales, si no, por defecto 1v1
+        const t1Needed = parseInt(arena.team1Size) || 1;
+        const t2Needed = parseInt(arena.team2Size) || 1;
+        const totalPlayersNeeded = t1Needed + t2Needed;
+
+        // 2. Si la arena está libre y la cola tiene suficientes jugadores...
+        if (!arena.isOccupied && arena.queue.length >= totalPlayersNeeded) {
+            arena.isOccupied = true;
+            arena.team1 = [];
+            arena.team2 = [];
+            arena.aliveTeam1 = t1Needed;
+            arena.aliveTeam2 = t2Needed;
+
+            // 3. Repartir a los jugadores de la fila en los equipos
+            for (let i = 0; i < t1Needed; i++) {
+                arena.team1.push(arena.queue.shift());
+            }
+            for (let i = 0; i < t2Needed; i++) {
+                arena.team2.push(arena.queue.shift());
+            }
+
+            // Para la pantalla, marcamos a los primeros de la lista como los "Representantes"
+            arena.fighter1 = arena.team1[0];
+            arena.fighter2 = arena.team2[0];
+
+            // Avisar a la UI que la lista cambió y la pelea empezó
+            broadcast({ type: 'refresh_arena_ui', arenaId: aId });
+
+            // 4. Preparar y Teletransportar al EQUIPO 1 (Azul)
+            arena.team1.forEach((pid, index) => {
+                let p = players[pid];
+                p.isSparring = true;
+                p.arenaTeam = 1;
+                p.hp = 100;
+
+                const spawnOffset = (index * 32) - (((t1Needed - 1) * 32) / 2);
+                const worldSpawnX = (arena.p1X * 16) + 8 + spawnOffset;
+                const worldSpawnY = (arena.p1Y * 16) + 8;
+
+                // 👇 EL FIX: Guardar en RAM 👇
+                p.worldX = worldSpawnX;
+                p.worldY = worldSpawnY;
+
+                wss.clients.forEach(c => {
+                    if (c.playerId === pid && c.readyState === WebSocket.OPEN) {
+                        c.send(JSON.stringify({ type: 'match_found', targetX: worldSpawnX, targetY: worldSpawnY }));
+                    }
+                });
+            });
+
+            // 5. Preparar y Teletransportar al EQUIPO 2 (Rojo)
+            arena.team2.forEach((pid, index) => {
+                let p = players[pid];
+                p.isSparring = true;
+                p.arenaTeam = 2;
+                p.hp = 100;
+
+                const spawnOffset = (index * 32) - (((t2Needed - 1) * 32) / 2);
+                const worldSpawnX = (arena.p2X * 16) + 8 + spawnOffset;
+                const worldSpawnY = (arena.p2Y * 16) + 8;
+
+                // 👇 EL FIX: Guardar en RAM 👇
+                p.worldX = worldSpawnX;
+                p.worldY = worldSpawnY;
+
+                wss.clients.forEach(c => {
+                    if (c.playerId === pid && c.readyState === WebSocket.OPEN) {
+                        c.send(JSON.stringify({ type: 'match_found', targetX: worldSpawnX, targetY: worldSpawnY }));
+                    }
+                });
+            });
+        }
+    }
+}, 3000);
+// =========================================================
+// 🗑️ SISTEMA DE BASURA (DENTRO DE "TRASH ZONES" UNIVERSALES)
 // =========================================================
 let groundItems = {};
 
-// Spawner de Basura (Cada 3 segundos)
 setInterval(() => {
-    // 🛑 EL FIX: Si el catálogo de la base de datos aún no ha cargado, cancelamos este turno
     if (TRASH_CATALOG.length === 0) return;
 
-    const pKeys = Object.keys(players);
-    // Límite de 80 basuras en el mapa para no dar lag
-    if (pKeys.length > 0 && Object.keys(groundItems).length < 80) {
-        const rp = players[pKeys[Math.floor(Math.random() * pKeys.length)]];
-        if (rp && rp.worldX !== undefined && !isInSafeZone(rp.worldX, rp.worldY)) {
-            const sx = rp.worldX + (Math.random() * 800 - 400);
-            const sy = rp.worldY + (Math.random() * 800 - 400);
+    const currentTrashCount = Object.keys(groundItems).length;
 
-            if (!serverCheckCollision(sx, sy)) {
+    if (currentTrashCount < 80) {
+
+        // 1. Filtrar las zonas que sean específicamente para basura
+        const trashZones = safeZonesRAM.filter(z => z.zoneType === 'trash');
+
+        // Si el Admin no ha dibujado ninguna Zona de Basura, cancelamos el proceso
+        if (trashZones.length === 0) return;
+
+        const spawnAmount = Math.min(5, 80 - currentTrashCount);
+
+        for (let i = 0; i < spawnAmount; i++) {
+            let validPos = false;
+            let sx, sy;
+            let attempts = 0;
+
+            while (!validPos && attempts < 20) {
+                // 1. Elegimos una de las Zonas de Basura al azar
+                const targetZone = trashZones[Math.floor(Math.random() * trashZones.length)];
+
+                // 2. Spawneamos estrictamente DENTRO de esa zona
+                sx = (Math.random() * (targetZone.xMax - targetZone.xMin)) + targetZone.xMin;
+                sy = (Math.random() * (targetZone.yMax - targetZone.yMin)) + targetZone.yMin;
+
+                // 👇 EL FIX ESTRICTO: Revisar el bloque completo (Grid) 👇
+                const gridX = Math.floor(sx / 16); // 16 es tu TILE_SIZE
+                const gridY = Math.floor(sy / 16);
+
+                let hitWall = false;
+
+                // Escaneamos las 16 capas de ESE cuadrito exacto
+                for (let l = 0; l <= 15; l++) {
+                    const tileKey = `${gridX},${gridY},${l}`;
+                    if (serverWorldMap[tileKey] && serverWorldMap[tileKey].hasCollision) {
+                        hitWall = true;
+                        break; // Chocó con algo, detenemos la búsqueda en esta capa
+                    }
+                }
+
+                let inSafeZone = isInSafeZone(sx, sy); // Evita conflictos de zonas cruzadas
+
+                // Si el bloque está totalmente libre y no es zona segura, es válido
+                if (!hitWall && !inSafeZone) {
+                    validPos = true;
+                }
+                attempts++;
+            }
+
+            if (validPos) {
                 const itemId = "trash_" + Math.random().toString(36).substr(2, 9);
-
-                // Elegimos un tipo de basura al azar de tu catálogo oficial
                 const tType = TRASH_CATALOG[Math.floor(Math.random() * TRASH_CATALOG.length)];
 
                 groundItems[itemId] = {
-                    x: sx, y: sy,
-                    type: "trash",
-                    templateId: tType.id,
-                    sx: tType.sx, sy: tType.sy,
-                    value: tType.value,
-                    name: tType.name
+                    x: sx, y: sy, type: "trash", templateId: tType.id,
+                    sx: tType.sx, sy: tType.sy, value: tType.value, name: tType.name
                 };
+
                 broadcast({ type: 'spawn_item', id: itemId, item: groundItems[itemId] });
             }
         }
@@ -2056,11 +2933,16 @@ setInterval(async () => {
             const ownerSquad = centralBase.currentOwnerSquadId;
             console.log(`🏰 [TURF WARS] El clan [${ownerSquad}] ha mantenido la base por otro minuto.`);
 
-            // 2. GUARDAR EL TIEMPO EN MONGODB PARA EL RANKING GLOBAL
-            // (Los ingresos pasivos de monedas fueron removidos para el futuro sistema de premios exclusivos)
+            // 2. GUARDAR EL TIEMPO EN MONGODB (Total, Diario y Semanal)
             await Squad.findOneAndUpdate(
                 { name: ownerSquad },
-                { $inc: { territoryTimeMinutes: 1 } } // Le suma 1 minuto a su récord histórico en la nube
+                {
+                    $inc: {
+                        territoryTimeMinutes: 1,
+                        dailyTimeMinutes: 1,
+                        weeklyTimeMinutes: 1
+                    }
+                }
             );
 
         } catch (err) {
