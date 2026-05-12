@@ -1,6 +1,7 @@
 const WebSocket = require('ws');
 const mongoose = require('mongoose');
 const bcrypt = require('bcryptjs');
+const { encode, decode } = require('@msgpack/msgpack'); // <--- ADD THIS
 require('dotenv').config(); // <--- ADD THIS LINE TO READ THE .ENV FILE
 
 // --- DATABASE CONNECTION ---
@@ -96,7 +97,9 @@ let safeZonesRAM = []; // Caché ultrarrápida (Guarda todas las zonas de todos 
 
 async function loadSafeZonesFromDB() {
     try {
-        safeZonesRAM = await SafeZone.find({});
+        const rawZones = await SafeZone.find({}).lean();
+        // ⚡ Convert the complex ObjectId into a pure String for MessagePack
+        safeZonesRAM = rawZones.map(z => ({ ...z, _id: z._id.toString() }));
         console.log(`🗺️ Zonas Universales cargadas en RAM (${safeZonesRAM.length} zonas).`);
     } catch (err) { console.error("Error cargando Zonas:", err); }
 }
@@ -127,7 +130,7 @@ let RANKS_CACHE = []; // RAM Cache
 
 async function loadRanksFromDB() {
     try {
-        let ranks = await Rank.find({}).sort({ minElo: -1 }); // De mayor a menor
+        let ranks = await Rank.find({}, { _id: 0, __v: 0 }).sort({ minElo: -1 }).lean();
 
         if (ranks.length === 0) {
             console.log("🏆 Inicializando Rangos por defecto en MongoDB...");
@@ -139,7 +142,7 @@ async function loadRanksFromDB() {
                 { name: "Principiante", minElo: 0, src: "items/ranks/principiante.png" }
             ];
             await Rank.insertMany(defaultRanks);
-            ranks = await Rank.find({}).sort({ minElo: -1 });
+            ranks = await Rank.find({}, { _id: 0, __v: 0 }).sort({ minElo: -1 }).lean();
         }
         RANKS_CACHE = ranks;
         console.log(`🏆 Rangos cargados: ${RANKS_CACHE.length} divisiones activas.`);
@@ -165,7 +168,7 @@ let ZONE_CONFIG = {};
 // Función para cargar desde la Base de Datos al iniciar el servidor
 async function loadZoneConfigsFromDB() {
     try {
-        let configs = await ZoneConfig.find({});
+        let configs = await ZoneConfig.find({}, { _id: 0, __v: 0 }).lean();
 
         // Si la tabla está vacía (primera vez que corres el server), inyectamos los básicos
         if (configs.length === 0) {
@@ -177,7 +180,7 @@ async function loadZoneConfigsFromDB() {
                 { id: "dig", name: "Zona de Excavación", icon: "⛏️", colorBorder: "rgba(139, 69, 19, 0.8)", colorFill: "rgba(139, 69, 19, 0.2)" }
             ];
             await ZoneConfig.insertMany(defaultZones);
-            configs = await ZoneConfig.find({}); // Volver a leerlos ya con sus IDs de Mongo
+            configs = await ZoneConfig.find({}, { _id: 0, __v: 0 }).lean();
         }
 
         // Limpiar la RAM y llenarla con los datos de Mongo
@@ -215,7 +218,7 @@ let skeletonRAM = {};
 async function loadSkeletonFromDB() {
     try {
         // Buscamos el registro sin filtros innecesarios
-        const skel = await Skeleton.findOne({});
+        const skel = await Skeleton.findOne({}, { _id: 0, __v: 0 }).lean();
         if (skel && skel.anchors) {
             skeletonRAM = skel.anchors;
             console.log("✅ Animaciones Gani cargadas correctamente desde MongoDB!");
@@ -243,8 +246,7 @@ let PATCH_NOTES_CACHE = [];
 async function loadPatchNotesFromDB() {
     try {
         // Traemos las últimas 10 actualizaciones ordenadas de la más nueva a la más vieja
-        PATCH_NOTES_CACHE = await PatchNote.find({}).sort({ date: -1 }).limit(10);
-
+        PATCH_NOTES_CACHE = await PatchNote.find({}, { _id: 0, __v: 0 }).sort({ date: -1 }).limit(10).lean();
         // Si está vacía, creamos una de bienvenida automáticamente
         if (PATCH_NOTES_CACHE.length === 0) {
             const welcomeNote = new PatchNote({
@@ -368,24 +370,23 @@ async function loadMasterCatalog() {
         /* await Item.findOneAndUpdate({ id: "katana_azulado" }, { ... }, { upsert: true }); 
         */
 
-        // 2. Cargar TODO a la memoria RAM (Esto es lo que reemplaza a las funciones viejas)
-        const items = await Item.find({});
+        // ⚡ ADD { _id: 0, __v: 0 } PROJECTION:
+        const items = await Item.find({}, { _id: 0, __v: 0 }).lean();
 
         MASTER_CATALOG = {};
         WEAPONS = {};
         TRASH_CATALOG = [];
-        // Añade esto donde declaras TRASH_CATALOG
         METALS_CATALOG = [];
 
-        // En tu función loadMasterCatalog(), modifícala ligeramente para atrapar los metales:
         items.forEach(i => {
             MASTER_CATALOG[i.id] = i;
+            // ⚡ REMOVE the .toObject() calls because .lean() already made them raw objects!
             if (i.category === 'weapon') {
-                WEAPONS[i.id] = { ...i.toObject(), ...i.stats };
+                WEAPONS[i.id] = { ...i, ...i.stats };
             } else if (i.category === 'junk') {
-                TRASH_CATALOG.push({ ...i.toObject(), ...i.drawConfig, value: i.price });
-            } else if (i.category === 'metal') { // <--- ⛏️ NUEVO: Atrapa los minerales
-                METALS_CATALOG.push({ ...i.toObject(), ...i.drawConfig, value: i.price });
+                TRASH_CATALOG.push({ ...i, ...i.drawConfig, value: i.price });
+            } else if (i.category === 'metal') {
+                METALS_CATALOG.push({ ...i, ...i.drawConfig, value: i.price });
             }
         });
 
@@ -411,7 +412,7 @@ let TILESETS = []; // Caché en RAM para los tilesets
 
 async function loadTilesetsFromDB() {
     try {
-        const dbTilesets = await Tileset.find({}).sort({ startId: 1 });
+        const dbTilesets = await Tileset.find({}, { _id: 0, __v: 0 }).sort({ startId: 1 }).lean();
 
         if (dbTilesets.length === 0) {
             console.log('📦 Migrando TILESET_CONFIG a MongoDB por primera vez...');
@@ -420,7 +421,7 @@ async function loadTilesetsFromDB() {
             const defaultTilesets = [];
 
             await Tileset.insertMany(defaultTilesets);
-            TILESETS = await Tileset.find({}).sort({ startId: 1 });
+            TILESETS = await Tileset.find({}, { _id: 0, __v: 0 }).sort({ startId: 1 }).lean();
             console.log('✅ ¡60 Tilesets migrados a MongoDB exitosamente!');
         } else {
             TILESETS = dbTilesets;
@@ -437,7 +438,8 @@ let centralBase = null;
 
 async function loadWorldMapFromDB() {
     try {
-        const allTiles = await Tile.find({});
+        // 2. FETCH WORLD DATA
+        const allTiles = await Tile.find({}, { _id: 0, __v: 0 }).lean();
 
         // Reiniciamos la base por si acaso recargamos el mapa
         centralBase = null;
@@ -610,6 +612,47 @@ const wss = new WebSocket.Server({ port: PORT });
 // This object acts as the server's memory. It holds every player's current state.
 const players = {};
 
+// ==========================================
+// 🗺️ SPATIAL PARTITIONING ENGINE (ANTI-LAG)
+// ==========================================
+// A chunk of 512x512 pixels (32x32 tiles) is perfect for a 2D MMO.
+const CHUNK_SIZE = 512;
+
+function getChunkId(x, y) {
+    const cx = Math.floor(x / CHUNK_SIZE);
+    const cy = Math.floor(y / CHUNK_SIZE);
+    return `${cx},${cy}`;
+}
+
+// Gets the player's chunk + the 8 chunks surrounding them (3x3 grid)
+function getVisibleChunks(chunkId) {
+    if (!chunkId) return [];
+    const [cx, cy] = chunkId.split(',').map(Number);
+    return [
+        `${cx - 1},${cy - 1}`, `${cx},${cy - 1}`, `${cx + 1},${cy - 1}`,
+        `${cx - 1},${cy}`, `${cx},${cy}`, `${cx + 1},${cy}`,
+        `${cx - 1},${cy + 1}`, `${cx},${cy + 1}`, `${cx + 1},${cy + 1}`
+    ];
+}
+
+// The New Targeted Broadcast (AoI)
+function broadcastToZone(data, targetChunkId, excludeWs = null) {
+    if (!targetChunkId) return;
+
+    // ⚡ ENCODE ONCE, SEND TO MANY
+    const payload = encode(data);
+    const visibleChunks = getVisibleChunks(targetChunkId);
+
+    wss.clients.forEach((client) => {
+        if (client !== excludeWs && client.readyState === WebSocket.OPEN && client.playerId) {
+            const targetPlayer = players[client.playerId];
+            if (targetPlayer && visibleChunks.includes(targetPlayer.chunkId)) {
+                client.send(payload);
+            }
+        }
+    });
+}
+
 // --- WEBSOCKET LOGIC ---
 wss.on('connection', async (ws) => {
     const id = Math.random().toString(36).substring(2, 9);
@@ -632,7 +675,8 @@ wss.on('connection', async (ws) => {
         ammo: 8,
         lastShotTime: 0,
         isReloading: false,
-        equipped: { head: 'head_default', body: 'body_default', hands: 'none' }
+        equipped: { head: 'head_default', body: 'body_default', hands: 'none' },
+        chunkId: getChunkId(0, 0)
     };
 
     ws.on('message', async (message) => {
@@ -661,13 +705,14 @@ wss.on('connection', async (ws) => {
             return; // Detenemos la ejecución aquí. Salvamos la CPU del servidor.
         }
 
-        const data = JSON.parse(message);
+        // ⚡ Decode the incoming binary buffer back into a Javascript Object
+        const data = decode(message);
 
         // 1. HANDLE REGISTRATION
         if (data.type === 'register') {
             try {
                 const existingUser = await User.findOne({ email: data.email });
-                if (existingUser) return ws.send(JSON.stringify({ type: 'auth_error', message: 'Email already registered' }));
+                if (existingUser) return ws.send(encode({ type: 'auth_error', message: 'Email already registered' }));
 
                 const hashedPassword = await bcrypt.hash(data.password, 10);
                 const newUser = new User({
@@ -677,8 +722,8 @@ wss.on('connection', async (ws) => {
                 });
                 await newUser.save();
 
-                ws.send(JSON.stringify({ type: 'register_success', message: 'Account created! You can now log in.' }));
-            } catch (err) { console.error(err); ws.send(JSON.stringify({ type: 'auth_error', message: 'Server error.' })); }
+                ws.send(encode({ type: 'register_success', message: 'Account created! You can now log in.' }));
+            } catch (err) { console.error(err); ws.send(encode({ type: 'auth_error', message: 'Server error.' })); }
         }
 
         // 2. HANDLE LOGIN
@@ -686,10 +731,10 @@ wss.on('connection', async (ws) => {
             try {
                 // Search by EMAIL instead of username
                 const user = await User.findOne({ email: data.email });
-                if (!user) return ws.send(JSON.stringify({ type: 'auth_error', message: 'Email not found' }));
+                if (!user) return ws.send(encode({ type: 'auth_error', message: 'Email not found' }));
 
                 const isMatch = await bcrypt.compare(data.password, user.password);
-                if (!isMatch) return ws.send(JSON.stringify({ type: 'auth_error', message: 'Incorrect password' }));
+                if (!isMatch) return ws.send(encode({ type: 'auth_error', message: 'Incorrect password' }));
 
                 // --- NEW: RETROACTIVELY GIVE EXISTING PLAYERS THE GUN ---
                 if (!user.inventory || user.inventory.length === 0) {
@@ -760,7 +805,7 @@ wss.on('connection', async (ws) => {
                     }
                 }
                 // Send success and include their friends list!
-                ws.send(JSON.stringify({
+                ws.send(encode({
                     type: 'login_success',
                     player: players[id],
                     token: newToken,
@@ -779,7 +824,7 @@ wss.on('connection', async (ws) => {
                 await User.findOneAndUpdate({ email: currentUser }, { username: newUsername });
                 players[id].username = newUsername;
                 broadcast({ type: 'update', id: id, player: players[id] }, ws);
-                ws.send(JSON.stringify({ type: 'profile_updated', username: newUsername }));
+                ws.send(encode({ type: 'profile_updated', username: newUsername }));
             } catch (err) { console.error("Error cambiando nombre:", err); }
         }
 
@@ -802,7 +847,7 @@ wss.on('connection', async (ws) => {
                     if (targetWsId) {
                         wss.clients.forEach(client => {
                             if (client.playerId === targetWsId && client.readyState === WebSocket.OPEN) {
-                                client.send(JSON.stringify({
+                                client.send(encode({
                                     type: 'friend_request',
                                     senderAccountId: players[id].accountId, // Enviamos el ID del que lo pide
                                     senderUsername: players[id].username,
@@ -841,7 +886,7 @@ wss.on('connection', async (ws) => {
                         await Turf.deleteOne({ turfId: centralBase.turfId });
                         centralBase = null;
                         wss.clients.forEach(c => {
-                            if (c.readyState === WebSocket.OPEN) c.send(JSON.stringify({ type: 'base_update', base: null }));
+                            if (c.readyState === WebSocket.OPEN) c.send(encode({ type: 'base_update', base: null }));
                         });
                         console.log("🗑️ Base destruida con el Borrador.");
                     }
@@ -855,7 +900,7 @@ wss.on('connection', async (ws) => {
                 wss.clients.forEach(client => {
                     // --- EL FIX: Agregamos client !== ws para no mandarnos ecos ---
                     if (client !== ws && client.readyState === WebSocket.OPEN) {
-                        client.send(JSON.stringify({
+                        client.send(encode({
                             type: 'tile_update', x: data.x, y: data.y, l: data.l, tileId: data.tileId
                         }));
                     }
@@ -881,7 +926,7 @@ wss.on('connection', async (ws) => {
                             await Turf.deleteOne({ turfId: centralBase.turfId });
                             centralBase = null;
                             wss.clients.forEach(c => {
-                                if (c.readyState === WebSocket.OPEN) c.send(JSON.stringify({ type: 'base_update', base: null }));
+                                if (c.readyState === WebSocket.OPEN) c.send(encode({ type: 'base_update', base: null }));
                             });
                         }
                     } else {
@@ -905,7 +950,7 @@ wss.on('connection', async (ws) => {
                 wss.clients.forEach(client => {
                     // --- EL FIX: Agregamos client !== ws ---
                     if (client !== ws && client.readyState === WebSocket.OPEN) {
-                        client.send(JSON.stringify({
+                        client.send(encode({
                             type: 'tile_update_bulk', tiles: data.tiles
                         }));
                     }
@@ -1000,7 +1045,7 @@ wss.on('connection', async (ws) => {
                     console.log(`🏰 Base Guardada/Actualizada en vivo: ${centralBase.name} (${centralBase.maxHp} HP)`);
 
                     wss.clients.forEach(c => {
-                        if (c.readyState === WebSocket.OPEN) c.send(JSON.stringify({ type: 'base_update', base: centralBase }));
+                        if (c.readyState === WebSocket.OPEN) c.send(encode({ type: 'base_update', base: centralBase }));
                     });
                 } // 🥊 NUEVO: CREAR O ACTUALIZAR ARENA DE SPARRING
                 else if (data.triggerType === 'arena') {
@@ -1046,7 +1091,7 @@ wss.on('connection', async (ws) => {
                         await Turf.deleteOne({ turfId: centralBase.turfId });
                         centralBase = null;
                         wss.clients.forEach(c => {
-                            if (c.readyState === WebSocket.OPEN) c.send(JSON.stringify({ type: 'base_update', base: null }));
+                            if (c.readyState === WebSocket.OPEN) c.send(encode({ type: 'base_update', base: null }));
                         });
                         console.log(`🗑️ Base eliminada mediante el Inspector.`);
                     }
@@ -1054,7 +1099,7 @@ wss.on('connection', async (ws) => {
 
                 wss.clients.forEach(client => {
                     if (client !== ws && client.readyState === WebSocket.OPEN) {
-                        client.send(JSON.stringify({
+                        client.send(encode({
                             type: 'tile_meta_update',
                             x: data.x, y: data.y, layer: data.layer, hasCollision: data.hasCollision,
                             triggerType: data.triggerType, destX: data.destX, destY: data.destY,
@@ -1077,7 +1122,7 @@ wss.on('connection', async (ws) => {
                 const f1Name = arena.fighter1 && players[arena.fighter1] ? players[arena.fighter1].username : null;
                 const f2Name = arena.fighter2 && players[arena.fighter2] ? players[arena.fighter2].username : null;
 
-                ws.send(JSON.stringify({
+                ws.send(encode({
                     type: 'arena_info_update',
                     arenaId: data.arenaId,
                     name: arena.name,
@@ -1100,7 +1145,7 @@ wss.on('connection', async (ws) => {
 
                 // Actualizar a todos los que estén viendo el letrero
                 broadcast({ type: 'refresh_arena_ui', arenaId: data.arenaId });
-                ws.send(JSON.stringify({ type: 'refresh_arena_ui', arenaId: data.arenaId }));
+                ws.send(encode({ type: 'refresh_arena_ui', arenaId: data.arenaId }));
             }
         }
 
@@ -1110,7 +1155,7 @@ wss.on('connection', async (ws) => {
                 arena.queue = arena.queue.filter(pId => pId !== id);
                 players[id].currentArena = null;
                 broadcast({ type: 'refresh_arena_ui', arenaId: data.arenaId });
-                ws.send(JSON.stringify({ type: 'refresh_arena_ui', arenaId: data.arenaId }));
+                ws.send(encode({ type: 'refresh_arena_ui', arenaId: data.arenaId }));
             }
         }// 🛑 NUEVO: GUARDAR ATUENDO DEL GUARDARROPA (WARDROBE)
         if (data.type === 'update_wardrobe' && isAuthenticated) {
@@ -1127,11 +1172,6 @@ wss.on('connection', async (ws) => {
                     p.equipped.head = data.head;
                     p.equipped.body = data.body;
                     p.equipped.hat = data.hat;
-
-                    await User.findOneAndUpdate(
-                        { email: currentUser },
-                        { "equipped.head": data.head, "equipped.body": data.body, "equipped.hat": data.hat }
-                    );
 
                     broadcast({ type: 'update', id: id, player: p }, ws);
                 }
@@ -1155,7 +1195,7 @@ wss.on('connection', async (ws) => {
                 wss.clients.forEach(client => {
                     if (client.readyState === WebSocket.OPEN) {
                         // 🛑 EL FIX ESTÁ AQUÍ 🛑 
-                        client.send(JSON.stringify({ type: 'new_safezone', zone: newZone }));
+                        client.send(encode({ type: 'new_safezone', zone: newZone }));
                     }
                 });
             } catch (err) { console.error("Error guardando Zona:", err); }
@@ -1173,7 +1213,7 @@ wss.on('connection', async (ws) => {
                 // 3. Avisarle a todos los jugadores que esa zona ya no existe
                 wss.clients.forEach(client => {
                     if (client.readyState === WebSocket.OPEN) {
-                        client.send(JSON.stringify({ type: 'safezone_deleted', id: data.id }));
+                        client.send(encode({ type: 'safezone_deleted', id: data.id }));
                     }
                 });
                 console.log(`🛡️ Zona Segura eliminada: ${data.id}`);
@@ -1189,7 +1229,7 @@ wss.on('connection', async (ws) => {
                 const user = await User.findOne({ token: data.token });
 
                 if (!user) {
-                    return ws.send(JSON.stringify({ type: 'auth_error', message: 'Session expired. Please log in again.' }));
+                    return ws.send(encode({ type: 'auth_error', message: 'Session expired. Please log in again.' }));
                 }
 
                 // --- NEW: RETROACTIVELY GIVE EXISTING PLAYERS THE GUN ---
@@ -1254,7 +1294,7 @@ wss.on('connection', async (ws) => {
                 }
 
                 // Send success back to the browser
-                ws.send(JSON.stringify({
+                ws.send(encode({
                     type: 'login_success',
                     player: players[id],
                     token: user.token,
@@ -1325,7 +1365,7 @@ wss.on('connection', async (ws) => {
             if (!isAdmin && !isLegalTeleport && (dist > MAX_ALLOWED_DIST || isColliding)) {
 
                 // 🚔 ¡HACKER DETECTADO! 
-                ws.send(JSON.stringify({
+                ws.send(encode({
                     type: 'force_position',
                     x: p.worldX,
                     y: p.worldY
@@ -1333,8 +1373,31 @@ wss.on('connection', async (ws) => {
 
             } else {
                 // Movimiento legal (o Teleport Autorizado)
+                const oldChunk = p.chunkId;
                 p.worldX = requestedX;
                 p.worldY = requestedY;
+                p.chunkId = getChunkId(p.worldX, p.worldY);
+
+                // GHOST-BUSTER: Did they cross a chunk border?
+                if (oldChunk !== p.chunkId) {
+                    const oldVisible = getVisibleChunks(oldChunk);
+                    const newVisible = getVisibleChunks(p.chunkId);
+
+                    // Find chunks they left behind and tell those players to delete their avatar
+                    const chunksLeftBehind = oldVisible.filter(c => !newVisible.includes(c));
+
+                    if (chunksLeftBehind.length > 0) {
+                        const despawnPayload = encode({ type: 'left', id: id });
+                        wss.clients.forEach(client => {
+                            if (client !== ws && client.readyState === WebSocket.OPEN && client.playerId) {
+                                const observer = players[client.playerId];
+                                if (observer && chunksLeftBehind.includes(observer.chunkId)) {
+                                    client.send(despawnPayload);
+                                }
+                            }
+                        });
+                    }
+                }
             }
 
             p.frameX = data.player.frameX;
@@ -1346,12 +1409,8 @@ wss.on('connection', async (ws) => {
             p.message = safeMsg.substring(0, 100);
             p.messageTimer = Math.min(data.player.messageTimer || 0, 600);
 
-            // Enviar posición oficial a los demás
-            wss.clients.forEach(client => {
-                if (client !== ws && client.readyState === WebSocket.OPEN) {
-                    client.send(JSON.stringify({ type: 'update', id: id, player: p }));
-                }
-            });
+            // 🎯 SEND MOVEMENT ONLY TO LOCAL CHUNK
+            broadcastToZone({ type: 'update', id: id, player: p }, p.chunkId, ws);
         }
 
         // --- NUEVO: RUTA SEGURA PARA EQUIPAR ARMAS ---
@@ -1423,19 +1482,16 @@ wss.on('connection', async (ws) => {
                     p.isDead = false;
                 }
 
-                // Guardamos en la base de datos con la HP que le haya quedado
-                User.findByIdAndUpdate(p.accountId, { hp: p.hp, isDead: p.isDead }).catch(console.error);
-
                 // Avisar a todos del estado actualizado
                 wss.clients.forEach(client => {
                     if (client.readyState === WebSocket.OPEN) {
-                        client.send(JSON.stringify({
+                        client.send(encode({
                             type: 'hp_update', targetId: id, newHp: p.hp, damageDealt: 0, isDead: p.isDead
                         }));
                     }
                 });
 
-                ws.send(JSON.stringify({
+                ws.send(encode({
                     type: 'system_message',
                     text: "🛠️ Tu personaje ha sido desbugueado.",
                     color: "#2ecc71"
@@ -1468,29 +1524,22 @@ wss.on('connection', async (ws) => {
             }
             shooter.lastShotTime = now;
 
-            // Replicar la bala a todos los demás instantáneamente sin hacer preguntas
-            wss.clients.forEach(client => {
-                if (client !== ws && client.readyState === WebSocket.OPEN) {
-                    client.send(JSON.stringify({
-                        type: 'shoot', id: id, x: data.x, y: data.y, angle: data.angle, weaponId: weaponId
-                    }));
-                }
-            });
+            // 🎯 SEND BULLETS ONLY TO LOCAL CHUNK
+            broadcastToZone({ type: 'shoot', id: id, x: data.x, y: data.y, angle: data.angle, weaponId: weaponId }, shooter.chunkId, ws);
         }// 👇 NUEVO: Lógica para escopetas (Múltiples balas en 1 mensaje) 👇
         if (data.type === 'shoot_shotgun') {
-            // Reenviamos el paquete exacto a todos los demás jugadores
-            wss.clients.forEach((client) => {
-                if (client !== ws && client.readyState === WebSocket.OPEN) {
-                    client.send(JSON.stringify({
-                        type: 'shoot_shotgun',
-                        id: id, // 🛑 EL FIX: 'id' a secas, para que las balas tengan dueño
-                        x: data.x,
-                        y: data.y,
-                        angles: data.angles,
-                        weaponId: data.weaponId
-                    }));
-                }
-            });
+            const p = players[id];
+            if (!p) return; // Failsafe
+
+            // 🎯 SEND SHOTGUN SPREAD ONLY TO LOCAL CHUNK
+            broadcastToZone({
+                type: 'shoot_shotgun', // Must match what the client expects
+                id: id,
+                x: data.x,
+                y: data.y,
+                angles: data.angles,   // Shotguns use an array of angles!
+                weaponId: data.weaponId
+            }, p.chunkId, ws);
         }
         // 8. MANEJAR EL DAÑO Y LA VIDA (CON ESCUDO ANTI-CHEAT DEFINITIVO)
         if (data.type === 'damage_player') {
@@ -1562,7 +1611,7 @@ wss.on('connection', async (ws) => {
                     // Avisar a la cámara de la víctima
                     wss.clients.forEach(c => {
                         if (c.playerId === data.targetId && c.readyState === WebSocket.OPEN) {
-                            c.send(JSON.stringify({
+                            c.send(encode({
                                 type: 'force_position',
                                 x: target.worldX,
                                 y: target.worldY,
@@ -1626,8 +1675,6 @@ wss.on('connection', async (ws) => {
 
                                             if (p.elo < 0) p.elo = 0; // No bajar de 0
 
-                                            // Guardar el nuevo Elo en MongoDB silenciosamente
-                                            User.findByIdAndUpdate(p.accountId, { elo: p.elo }).catch(console.error);
                                         }
 
                                         p.isSparring = false;
@@ -1649,7 +1696,7 @@ wss.on('connection', async (ws) => {
                                         wss.clients.forEach(c => {
                                             if (c.playerId === pid && c.readyState === WebSocket.OPEN) {
                                                 // 🛑 EL FIX: Enviamos también el nuevo Elo al cliente
-                                                c.send(JSON.stringify({ type: 'match_finished', returnX: p.preSparX, returnY: p.preSparY, result: resultMsg, newElo: p.elo }));
+                                                c.send(encode({ type: 'match_finished', returnX: p.preSparX, returnY: p.preSparY, result: resultMsg, newElo: p.elo }));
                                             }
                                         });
                                     }
@@ -1666,7 +1713,7 @@ wss.on('connection', async (ws) => {
                                 // Si es un 2v2 o 3v3 y solo murió uno, enviamos la actualización de muerte normal (se queda como fantasma hasta que acabe el round)
                                 wss.clients.forEach(client => {
                                     if (client.readyState === WebSocket.OPEN) {
-                                        client.send(JSON.stringify({
+                                        client.send(encode({
                                             type: 'hp_update', targetId: data.targetId, newHp: 0, damageDealt: actualDamage, isDead: true,
                                             shooterId: id, shooterKills: shooter.kills, targetLosses: target.losses
                                         }));
@@ -1687,7 +1734,7 @@ wss.on('connection', async (ws) => {
 
                                 wss.clients.forEach(client => {
                                     if (client.readyState === WebSocket.OPEN) {
-                                        client.send(JSON.stringify({
+                                        client.send(encode({
                                             type: 'hp_update', targetId: data.targetId,
                                             newHp: 100, damageDealt: 0, isDead: false
                                         }));
@@ -1696,21 +1743,17 @@ wss.on('connection', async (ws) => {
                             }
                         }, 3000);
 
-                        // Enviar la actualización de vida a todos 
-                        wss.clients.forEach(client => {
-                            if (client.readyState === WebSocket.OPEN) {
-                                client.send(JSON.stringify({
-                                    type: 'hp_update', targetId: data.targetId, newHp: target.hp, damageDealt: actualDamage, isDead: true,
-                                    shooterId: id, shooterKills: shooter.kills, targetLosses: target.losses
-                                }));
-                            }
-                        });
+                        // 🎯 SEND HP UPDATES ONLY TO OBSERVERS
+                        broadcastToZone({
+                            type: 'hp_update', targetId: data.targetId, newHp: target.hp, damageDealt: actualDamage, isDead: true,
+                            shooterId: id, shooterKills: shooter.kills, targetLosses: target.losses
+                        }, target.chunkId);
                     }
                 } else {
                     // SI NO MURIÓ, SOLO ENVIAMOS LA ACTUALIZACIÓN DE VIDA NORMAL A TODOS
                     wss.clients.forEach(client => {
                         if (client.readyState === WebSocket.OPEN) {
-                            client.send(JSON.stringify({
+                            client.send(encode({
                                 type: 'hp_update', targetId: data.targetId, newHp: target.hp, damageDealt: actualDamage, isDead: false,
                                 shooterId: id, shooterKills: shooter.kills, targetLosses: target.losses
                             }));
@@ -1721,13 +1764,15 @@ wss.on('connection', async (ws) => {
         }
         // --- 1. SINCRONIZAR ANIMACIÓN MELEE ---
         if (data.type === 'melee_swing') {
-            // 🛑 EL FIX: Quitamos el JSON.stringify porque la función 'broadcast' ya lo hace internamente.
-            // También usamos 'id' directo en lugar de 'ws.playerId'.
-            broadcast({
-                type: 'player_swing',
+            const p = players[id];
+            if (!p) return;
+
+            // 🎯 SEND SWING ANIMATION ONLY TO LOCAL CHUNK
+            broadcastToZone({
+                type: 'player_swing',  // The client listens for 'player_swing', not 'shoot'
                 id: id,
                 weaponId: data.weaponId
-            }, ws);
+            }, p.chunkId, ws);
         }
 
         // 9. ENVIAR MENSAJE PRIVADO
@@ -1766,7 +1811,7 @@ wss.on('connection', async (ws) => {
                 if (targetWsId) {
                     wss.clients.forEach(client => {
                         if (client.playerId === targetWsId && client.readyState === WebSocket.OPEN) {
-                            client.send(JSON.stringify({
+                            client.send(encode({
                                 type: 'receive_pm',
                                 senderAccountId: myAccountId,
                                 senderUsername: players[id].username,
@@ -1776,7 +1821,7 @@ wss.on('connection', async (ws) => {
                     });
                 }
 
-                ws.send(JSON.stringify({ type: 'pm_history', targetAccountId: targetAccountId, targetUsername: data.targetUsername, history: conv.messages }));
+                ws.send(encode({ type: 'pm_history', targetAccountId: targetAccountId, targetUsername: data.targetUsername, history: conv.messages }));
             } catch (err) { console.error("Error en PM:", err); }
         }
 
@@ -1795,7 +1840,7 @@ wss.on('connection', async (ws) => {
 
                 const conv = await PM.findOne({ participants: { $all: [myAccountId, targetAccountId] } });
 
-                ws.send(JSON.stringify({
+                ws.send(encode({
                     type: 'pm_history',
                     targetAccountId: targetAccountId,
                     targetUsername: currentTargetName,
@@ -1833,7 +1878,7 @@ wss.on('connection', async (ws) => {
                 }
 
                 inboxData.sort((a, b) => new Date(b.time) - new Date(a.time));
-                ws.send(JSON.stringify({ type: 'inbox_data', inbox: inboxData }));
+                ws.send(encode({ type: 'inbox_data', inbox: inboxData }));
             } catch (err) { console.error("Error pidiendo inbox:", err); }
         }
         // 12. PEDIR LISTA DE AMIGOS ACTUALIZADA (Versión Optimizada y con Ropa)
@@ -1860,7 +1905,7 @@ wss.on('connection', async (ws) => {
                     coins: fUser.coins || 0
                 }));
 
-                ws.send(JSON.stringify({ type: 'friends_list_data', friends: friendsData }));
+                ws.send(encode({ type: 'friends_list_data', friends: friendsData }));
             } catch (err) { console.error("Error pidiendo amigos:", err); }
         }// 27. BÚSQUEDA GLOBAL DE JUGADORES
         if (data.type === 'search_players' && isAuthenticated) {
@@ -1886,7 +1931,7 @@ wss.on('connection', async (ws) => {
                     coins: u.coins || 0
                 }));
 
-                ws.send(JSON.stringify({ type: 'search_players_results', results: searchResults }));
+                ws.send(encode({ type: 'search_players_results', results: searchResults }));
             } catch (err) {
                 console.error("Error buscando jugadores:", err);
             }
@@ -1901,13 +1946,13 @@ wss.on('connection', async (ws) => {
             // 🛑 EL FIX: Buscar en TODO el catálogo maestro, no solo en la carpeta de armas
             const itemStats = WEAPONS[itemId] || MASTER_CATALOG[itemId];
 
-            if (!itemStats) return ws.send(JSON.stringify({ type: 'buy_error', message: 'Este objeto no existe en la base de datos.' }));
+            if (!itemStats) return ws.send(encode({ type: 'buy_error', message: 'Este objeto no existe en la base de datos.' }));
 
             // Verificamos si ya lo tiene en su inventario
             const alreadyOwned = p.inventory && p.inventory.some(i => (typeof i === 'object' ? i.id : i) === itemId);
-            if (alreadyOwned) return ws.send(JSON.stringify({ type: 'buy_error', message: 'Ya posees este objeto.' }));
+            if (alreadyOwned) return ws.send(encode({ type: 'buy_error', message: 'Ya posees este objeto.' }));
 
-            if (p.coins < itemStats.price) return ws.send(JSON.stringify({ type: 'buy_error', message: 'Monedas insuficientes.' }));
+            if (p.coins < itemStats.price) return ws.send(encode({ type: 'buy_error', message: 'Monedas insuficientes.' }));
 
             try {
                 // Cobrar y entregar el ítem
@@ -1915,11 +1960,8 @@ wss.on('connection', async (ws) => {
                 if (!p.inventory) p.inventory = [];
                 p.inventory.push(itemId);
 
-                // Guardar en MongoDB
-                await User.findByIdAndUpdate(p.accountId, { coins: p.coins, inventory: p.inventory });
-
                 // Avisar al jugador que la compra fue un éxito
-                ws.send(JSON.stringify({
+                ws.send(encode({
                     type: 'buy_success',
                     message: `¡Compraste ${itemStats.name}!`,
                     newCoins: p.coins,
@@ -1928,10 +1970,10 @@ wss.on('connection', async (ws) => {
 
                 // Actualizar al jugador en vivo para todos
                 broadcast({ type: 'update', id: id, player: p }, ws);
-                ws.send(JSON.stringify({ type: 'update', id: id, player: p }));
+                ws.send(encode({ type: 'update', id: id, player: p }));
             } catch (err) {
                 console.error("Error al comprar:", err);
-                ws.send(JSON.stringify({ type: 'buy_error', message: 'Error interno del servidor.' }));
+                ws.send(encode({ type: 'buy_error', message: 'Error interno del servidor.' }));
             }
         }
 
@@ -1944,21 +1986,21 @@ wss.on('connection', async (ws) => {
                 const SQUAD_PRICE = 2000;
 
                 if (squadName.length < 3 || squadName.length > 20) {
-                    return ws.send(JSON.stringify({ type: 'squad_error', message: 'El nombre debe tener entre 3 y 20 letras.' }));
+                    return ws.send(encode({ type: 'squad_error', message: 'El nombre debe tener entre 3 y 20 letras.' }));
                 }
 
                 // SEGURIDAD: Solo URLs de Pinterest
                 if (squadLogo !== "" && !squadLogo.startsWith("https://i.pinimg.com/")) {
-                    return ws.send(JSON.stringify({ type: 'squad_error', message: 'El logo debe ser de Pinterest (Empieza con https://i.pinimg.com/)' }));
+                    return ws.send(encode({ type: 'squad_error', message: 'El logo debe ser de Pinterest (Empieza con https://i.pinimg.com/)' }));
                 }
 
-                if (p.coins < SQUAD_PRICE) return ws.send(JSON.stringify({ type: 'squad_error', message: `Necesitas ${SQUAD_PRICE} 🪙 para fundar un clan.` }));
+                if (p.coins < SQUAD_PRICE) return ws.send(encode({ type: 'squad_error', message: `Necesitas ${SQUAD_PRICE} 🪙 para fundar un clan.` }));
 
                 const myUser = await User.findOne({ email: currentUser });
-                if (myUser.squad) return ws.send(JSON.stringify({ type: 'squad_error', message: 'Ya eres miembro de un Squad principal.' }));
+                if (myUser.squad) return ws.send(encode({ type: 'squad_error', message: 'Ya eres miembro de un Squad principal.' }));
 
                 const existingSquad = await Squad.findOne({ name: new RegExp('^' + squadName + '$', 'i') });
-                if (existingSquad) return ws.send(JSON.stringify({ type: 'squad_error', message: 'Ese nombre ya está en uso.' }));
+                if (existingSquad) return ws.send(encode({ type: 'squad_error', message: 'Ese nombre ya está en uso.' }));
 
                 p.coins -= SQUAD_PRICE;
                 myUser.coins = p.coins;
@@ -1977,9 +2019,9 @@ wss.on('connection', async (ws) => {
                 p.squadName = newSquad.name;
                 p.squadLogo = newSquad.logo;
 
-                ws.send(JSON.stringify({ type: 'squad_success', message: `¡Has fundado el Squad [${squadName}]!`, newCoins: p.coins, squadName: newSquad.name, squadLogo: squadLogo }));
+                ws.send(encode({ type: 'squad_success', message: `¡Has fundado el Squad [${squadName}]!`, newCoins: p.coins, squadName: newSquad.name, squadLogo: squadLogo }));
                 broadcast({ type: 'update', id: id, player: p }, ws);
-            } catch (err) { ws.send(JSON.stringify({ type: 'squad_error', message: 'Error interno del servidor.' })); }
+            } catch (err) { ws.send(encode({ type: 'squad_error', message: 'Error interno del servidor.' })); }
         }
         // 15. ELIMINAR AMIGO
         if (data.type === 'remove_friend' && isAuthenticated) {
@@ -2008,7 +2050,7 @@ wss.on('connection', async (ws) => {
                     }
 
                     // 5. Avisarte que fue un éxito
-                    ws.send(JSON.stringify({ type: 'friend_removed', targetId: data.targetId }));
+                    ws.send(encode({ type: 'friend_removed', targetId: data.targetId }));
                 }
             } catch (err) {
                 console.error("Error eliminando amigo:", err);
@@ -2021,7 +2063,7 @@ wss.on('connection', async (ws) => {
                 const myUser = await User.findOne({ email: currentUser });
                 const mySquads = await Squad.find({ $or: [{ leader: myUser._id }, { 'members.accountId': myUser._id }] });
 
-                if (mySquads.length === 0) return ws.send(JSON.stringify({ type: 'no_squads_found' }));
+                if (mySquads.length === 0) return ws.send(encode({ type: 'no_squads_found' }));
 
                 mySquads.sort((a, b) => {
                     const aIsLeader = a.leader.toString() === myUser._id.toString();
@@ -2039,7 +2081,7 @@ wss.on('connection', async (ws) => {
                     memberCount: sq.members.length + 1
                 }));
 
-                ws.send(JSON.stringify({ type: 'my_squads_list_data', squads: listData }));
+                ws.send(encode({ type: 'my_squads_list_data', squads: listData }));
             } catch (err) { console.error(err); }
         }
 
@@ -2060,7 +2102,7 @@ wss.on('connection', async (ws) => {
                     }).filter(m => m !== null)
                 };
 
-                ws.send(JSON.stringify({ type: 'my_squad_data', squad: squadData }));
+                ws.send(encode({ type: 'my_squad_data', squad: squadData }));
             } catch (err) { console.error(err); }
         }
         // 26. SOLICITAR EL LEADERBOARD (PUNTAJES DE SQUADS Y BASES EN VIVO)
@@ -2088,7 +2130,7 @@ wss.on('connection', async (ws) => {
                     });
                 }
 
-                ws.send(JSON.stringify({
+                ws.send(encode({
                     type: 'squad_leaderboard_data',
                     squads: allSquads,
                     liveBases: liveBases
@@ -2106,22 +2148,22 @@ wss.on('connection', async (ws) => {
 
                 // Seguridad: Verificar si existe y si soy el líder
                 if (!squad || squad.leader.toString() !== myUser._id.toString()) {
-                    return ws.send(JSON.stringify({ type: 'edit_squad_error', message: 'No tienes permisos de Líder.' }));
+                    return ws.send(encode({ type: 'edit_squad_error', message: 'No tienes permisos de Líder.' }));
                 }
 
                 const newName = data.newName.trim();
                 const newLogo = data.newLogo ? data.newLogo.trim() : "";
 
-                if (newName.length < 3 || newName.length > 20) return ws.send(JSON.stringify({ type: 'edit_squad_error', message: 'El nombre debe tener entre 3 y 20 letras.' }));
-                if (newLogo !== "" && !newLogo.startsWith("https://i.pinimg.com/")) return ws.send(JSON.stringify({ type: 'edit_squad_error', message: 'El logo debe ser una imagen de Pinterest.' }));
+                if (newName.length < 3 || newName.length > 20) return ws.send(encode({ type: 'edit_squad_error', message: 'El nombre debe tener entre 3 y 20 letras.' }));
+                if (newLogo !== "" && !newLogo.startsWith("https://i.pinimg.com/")) return ws.send(encode({ type: 'edit_squad_error', message: 'El logo debe ser una imagen de Pinterest.' }));
 
                 // ¿Cambió el nombre? Si es así, validamos y cobramos 350
                 let nameChanged = (newName !== squad.name);
                 if (nameChanged) {
-                    if (p.coins < 350) return ws.send(JSON.stringify({ type: 'edit_squad_error', message: 'Necesitas 350 🪙 para cambiar el nombre.' }));
+                    if (p.coins < 350) return ws.send(encode({ type: 'edit_squad_error', message: 'Necesitas 350 🪙 para cambiar el nombre.' }));
 
                     const existingSquad = await Squad.findOne({ name: new RegExp('^' + newName + '$', 'i') });
-                    if (existingSquad) return ws.send(JSON.stringify({ type: 'edit_squad_error', message: 'Ese nombre ya está en uso por otra banda.' }));
+                    if (existingSquad) return ws.send(encode({ type: 'edit_squad_error', message: 'Ese nombre ya está en uso por otra banda.' }));
 
                     // Cobrar
                     p.coins -= 350;
@@ -2134,8 +2176,8 @@ wss.on('connection', async (ws) => {
                 squad.logo = newLogo;
                 await squad.save();
 
-                ws.send(JSON.stringify({ type: 'edit_squad_success', message: '¡Actualizado!', newCoins: p.coins, squadId: squad._id, squadName: p.squadName, squadLogo: p.squadLogo }));;
-            } catch (err) { ws.send(JSON.stringify({ type: 'edit_squad_error', message: 'Error del servidor.' })); }
+                ws.send(encode({ type: 'edit_squad_success', message: '¡Actualizado!', newCoins: p.coins, squadId: squad._id, squadName: p.squadName, squadLogo: p.squadLogo }));;
+            } catch (err) { ws.send(encode({ type: 'edit_squad_error', message: 'Error del servidor.' })); }
         }// 🔍 BUSCAR SQUADS EN LA BASE DE DATOS
         if (data.type === 'search_squads' && isAuthenticated) {
             try {
@@ -2161,7 +2203,7 @@ wss.on('connection', async (ws) => {
                     infamia: sq.territoryTimeMinutes || 0
                 }));
 
-                ws.send(JSON.stringify({ type: 'squad_search_results', results: results }));
+                ws.send(encode({ type: 'squad_search_results', results: results }));
             } catch (err) {
                 console.error("Error al buscar squads:", err);
             }
@@ -2182,7 +2224,7 @@ wss.on('connection', async (ws) => {
                 const isMember = squad.members.some(m => m.accountId.toString() === myUser._id.toString());
 
                 if (!isLeader && !isMember) {
-                    return ws.send(JSON.stringify({ type: 'squad_error', message: 'No perteneces a este squad.' }));
+                    return ws.send(encode({ type: 'squad_error', message: 'No perteneces a este squad.' }));
                 }
 
                 // 2. Lógica del "Interruptor" (Toggle)
@@ -2207,7 +2249,7 @@ wss.on('connection', async (ws) => {
                 // 3. Guardar en Base de Datos y avisar a todos
                 await myUser.save();
 
-                ws.send(JSON.stringify({ type: 'toggle_squad_success', isActive: isActive, squadId: squadId, squadName: p.squadName, squadLogo: p.squadLogo }));
+                ws.send(encode({ type: 'toggle_squad_success', isActive: isActive, squadId: squadId, squadName: p.squadName, squadLogo: p.squadLogo }));
 
                 // Avisarle a los demás jugadores conectados que cambiaste tu Tag
                 broadcast({ type: 'update', id: id, player: p }, ws);
@@ -2219,7 +2261,7 @@ wss.on('connection', async (ws) => {
         if (data.type === 'send_squad_invite' && isAuthenticated) {
             try {
                 const p = players[id];
-                if (!p.squad) return ws.send(JSON.stringify({ type: 'squad_error', message: 'Primero equipa tu Tag para invitar.' }));
+                if (!p.squad) return ws.send(encode({ type: 'squad_error', message: 'Primero equipa tu Tag para invitar.' }));
 
                 const squad = await Squad.findById(p.squad);
                 if (!squad) return;
@@ -2229,14 +2271,14 @@ wss.on('connection', async (ws) => {
                 const memberData = squad.members.find(m => m.accountId.toString() === myUser._id.toString());
                 const canInvite = isLeader || (memberData && memberData.canInvite);
 
-                if (!canInvite) return ws.send(JSON.stringify({ type: 'squad_error', message: 'No tienes permisos para reclutar.' }));
+                if (!canInvite) return ws.send(encode({ type: 'squad_error', message: 'No tienes permisos para reclutar.' }));
 
                 // --- NUEVA VALIDACIÓN: ¿El objetivo ya está en ESTE clan? ---
                 const targetIsLeader = squad.leader.toString() === data.targetAccountId;
                 const targetIsMember = squad.members.some(m => m.accountId.toString() === data.targetAccountId);
 
                 if (targetIsLeader || targetIsMember) {
-                    return ws.send(JSON.stringify({ type: 'squad_error', message: 'Este jugador ya pertenece a tu clan.' }));
+                    return ws.send(encode({ type: 'squad_error', message: 'Este jugador ya pertenece a tu clan.' }));
                 }
 
                 // Buscar al objetivo y ver si está conectado
@@ -2248,7 +2290,7 @@ wss.on('connection', async (ws) => {
                 if (targetWsId) {
                     wss.clients.forEach(client => {
                         if (client.playerId === targetWsId && client.readyState === WebSocket.OPEN) {
-                            client.send(JSON.stringify({
+                            client.send(encode({
                                 type: 'squad_invite',
                                 squadId: squad._id,
                                 squadName: squad.name,
@@ -2258,9 +2300,9 @@ wss.on('connection', async (ws) => {
                             }));
                         }
                     });
-                    ws.send(JSON.stringify({ type: 'squad_success', message: 'Invitación enviada.' }));
+                    ws.send(encode({ type: 'squad_success', message: 'Invitación enviada.' }));
                 } else {
-                    ws.send(JSON.stringify({ type: 'squad_error', message: 'El jugador no está en línea.' }));
+                    ws.send(encode({ type: 'squad_error', message: 'El jugador no está en línea.' }));
                 }
             } catch (err) { console.error("Error invitando al clan:", err); }
         }
@@ -2269,12 +2311,12 @@ wss.on('connection', async (ws) => {
         if (data.type === 'accept_squad_invite' && isAuthenticated) {
             try {
                 const squad = await Squad.findById(data.squadId);
-                if (!squad) return ws.send(JSON.stringify({ type: 'squad_error', message: 'El clan ya no existe.' }));
+                if (!squad) return ws.send(encode({ type: 'squad_error', message: 'El clan ya no existe.' }));
 
                 const myUser = await User.findOne({ email: currentUser });
 
                 // Regla 1: Límite de miembros (Excluye al líder)
-                if (squad.members.length >= 24) return ws.send(JSON.stringify({ type: 'squad_error', message: 'El clan está lleno.' }));
+                if (squad.members.length >= 24) return ws.send(encode({ type: 'squad_error', message: 'El clan está lleno.' }));
 
                 // Regla 2: ¿Ya estoy en este clan?
                 const isMember = squad.members.some(m => m.accountId.toString() === myUser._id.toString());
@@ -2285,9 +2327,9 @@ wss.on('connection', async (ws) => {
                     squad.members.push({ accountId: myUser._id });
                     await squad.save();
 
-                    ws.send(JSON.stringify({ type: 'squad_success', message: `¡Te has unido al clan [${squad.name}]!` }));
+                    ws.send(encode({ type: 'squad_success', message: `¡Te has unido al clan [${squad.name}]!` }));
                 } else {
-                    ws.send(JSON.stringify({ type: 'squad_error', message: 'Ya eres miembro de este clan.' }));
+                    ws.send(encode({ type: 'squad_error', message: 'Ya eres miembro de este clan.' }));
                 }
             } catch (err) { console.error("Error aceptando clan:", err); }
         }
@@ -2308,7 +2350,7 @@ wss.on('connection', async (ws) => {
 
                 wss.clients.forEach(client => {
                     if (client.readyState === WebSocket.OPEN) {
-                        client.send(JSON.stringify({ type: 'sync_weapon_pivot', weaponId: data.weaponId, pivotX: data.pivotX, pivotY: data.pivotY }));
+                        client.send(encode({ type: 'sync_weapon_pivot', weaponId: data.weaponId, pivotX: data.pivotX, pivotY: data.pivotY }));
                     }
                 });
             } catch (err) { console.error("Error guardando pivote:", err); }
@@ -2335,7 +2377,7 @@ wss.on('connection', async (ws) => {
 
                 wss.clients.forEach(client => {
                     if (client.readyState === WebSocket.OPEN) {
-                        client.send(JSON.stringify({ type: 'sync_melee_stats', weaponId: data.weaponId, direction: data.direction, stats: data.stats }));
+                        client.send(encode({ type: 'sync_melee_stats', weaponId: data.weaponId, direction: data.direction, stats: data.stats }));
                     }
                 });
             } catch (err) { console.error("💥 ERROR al guardar en MongoDB:", err); }
@@ -2361,20 +2403,17 @@ wss.on('connection', async (ws) => {
                     p.inventory.push({ id: item.templateId, quantity: 1 });
                 }
 
-                // Marcar el array como modificado para que Mongoose lo guarde bien
-                User.findByIdAndUpdate(p.accountId, { inventory: p.inventory }).catch(console.error);
-
                 broadcast({ type: 'remove_item', id: itemId });
 
                 // Avisamos visualmente que entró a la mochila
-                ws.send(JSON.stringify({
+                ws.send(encode({
                     type: 'system_message',
                     text: `🎒 Recogiste: ${item.name}`,
                     color: '#3498db'
                 }));
 
                 // 🛑 EL FIX: El servidor le envía a tu pantalla tu nueva mochila
-                ws.send(JSON.stringify({
+                ws.send(encode({
                     type: 'inventory_update',
                     inventory: p.inventory
                 }));
@@ -2423,9 +2462,7 @@ wss.on('connection', async (ws) => {
                 p.coins += totalEarned;
                 p.inventory = newInventory;
 
-                User.findByIdAndUpdate(p.accountId, { coins: p.coins, inventory: p.inventory }).catch(console.error);
-
-                ws.send(JSON.stringify({
+                ws.send(encode({
                     type: 'sell_success',
                     earned: totalEarned,
                     newCoins: p.coins,
@@ -2434,7 +2471,7 @@ wss.on('connection', async (ws) => {
                 broadcast({ type: 'update', id: id, player: p }, ws);
             } else {
                 // 🛑 EL FIX: Si por algo falla, que el servidor te avise en pantalla en lugar de ignorarte
-                ws.send(JSON.stringify({ type: 'system_message', text: "Error: No se encontró basura válida para vender.", color: '#e74c3c' }));
+                ws.send(encode({ type: 'system_message', text: "Error: No se encontró basura válida para vender.", color: '#e74c3c' }));
             }
         } // =========================================================
         // 🛑 NUEVO: VENDER CANTIDAD ESPECÍFICA DE UN ÍTEM INDIVIDUAL (YONKE) 🛑
@@ -2463,7 +2500,7 @@ wss.on('connection', async (ws) => {
 
             // 4. Validar que tengas suficientes para vender
             if (!existingStack || existingStack.quantity < requestedQty) {
-                ws.send(JSON.stringify({ type: 'system_message', text: "🛑 No tienes suficiente cantidad de este ítem.", color: '#e74c3c' }));
+                ws.send(encode({ type: 'system_message', text: "🛑 No tienes suficiente cantidad de este ítem.", color: '#e74c3c' }));
                 return;
             }
 
@@ -2479,13 +2516,10 @@ wss.on('connection', async (ws) => {
                 p.inventory.splice(stackIndex, 1);
             }
 
-            // 6. Guardar Cambios en MongoDB Atlas
-            User.findByIdAndUpdate(p.accountId, { coins: p.coins, inventory: p.inventory }).catch(console.error);
-
             console.log(`🏗️ Venta Individual: ${p.name} vendió x${requestedQty} ${catalogItem.name} por ${totalEarned} 🪙`);
 
             // 7. Avisar al cliente del éxito (Reusamos el paquete sell_success existente en demo.html)
-            ws.send(JSON.stringify({
+            ws.send(encode({
                 type: 'sell_success',
                 earned: totalEarned, // Monto de esta venta específica
                 newCoins: p.coins,
@@ -2523,7 +2557,7 @@ wss.on('connection', async (ws) => {
 
             // 🛑 EL FIX: Comparamos contra la resistencia de LA PALA, no un número fijo
             if (p.digFatigue > maxSwingsAllowed) {
-                ws.send(JSON.stringify({
+                ws.send(encode({
                     type: 'system_message',
                     text: `Estás exhausto. ${maxSwingsAllowed} golpes seguidos. Descansa.`,
                     color: '#e74c3c'
@@ -2545,13 +2579,13 @@ wss.on('connection', async (ws) => {
             const distFromLastDig = Math.hypot(p.worldX - p.lastDigLocationX, p.worldY - p.lastDigLocationY);
 
             if (p.lastDigLocationX !== 0 && distFromLastDig < 40) {
-                ws.send(JSON.stringify({
+                ws.send(encode({
                     type: 'system_message',
                     text: "Ya escarbaste todo aquí. ¡Camina hacia otro lado!",
                     color: '#e67e22'
                 }));
                 broadcast({ type: 'spawn_hole', x: hitX, y: hitY }, ws);
-                ws.send(JSON.stringify({ type: 'spawn_hole', x: hitX, y: hitY }));
+                ws.send(encode({ type: 'spawn_hole', x: hitX, y: hitY }));
                 return;
             }
 
@@ -2567,7 +2601,7 @@ wss.on('connection', async (ws) => {
             }
 
             if (!inDigZone) {
-                ws.send(JSON.stringify({ type: 'system_message', text: "Aquí no hay tierra blanda para excavar.", color: '#e67e22' }));
+                ws.send(encode({ type: 'system_message', text: "Aquí no hay tierra blanda para excavar.", color: '#e67e22' }));
                 return;
             }
 
@@ -2575,7 +2609,7 @@ wss.on('connection', async (ws) => {
             p.lastDigLocationY = p.worldY;
 
             broadcast({ type: 'spawn_hole', x: hitX, y: hitY }, ws);
-            ws.send(JSON.stringify({ type: 'spawn_hole', x: hitX, y: hitY }));
+            ws.send(encode({ type: 'spawn_hole', x: hitX, y: hitY }));
 
             if (Math.random() <= 0.40 && METALS_CATALOG.length > 0) {
                 const foundItem = METALS_CATALOG[Math.floor(Math.random() * METALS_CATALOG.length)];
@@ -2590,8 +2624,8 @@ wss.on('connection', async (ws) => {
 
                 User.findByIdAndUpdate(p.accountId, { inventory: p.inventory }).catch(console.error);
 
-                ws.send(JSON.stringify({ type: 'system_message', text: `💎 Desenterraste: ${foundItem.name}!`, color: '#3498db' }));
-                ws.send(JSON.stringify({ type: 'inventory_update', inventory: p.inventory }));
+                ws.send(encode({ type: 'system_message', text: `💎 Desenterraste: ${foundItem.name}!`, color: '#3498db' }));
+                ws.send(encode({ type: 'inventory_update', inventory: p.inventory }));
                 broadcast({ type: 'update', id: id, player: p }, ws);
             }
         }// =========================================================
@@ -2623,12 +2657,10 @@ wss.on('connection', async (ws) => {
             if (totalEarned > 0) {
                 p.coins += totalEarned;
                 p.inventory = newInventory;
-                User.findByIdAndUpdate(p.accountId, { coins: p.coins, inventory: p.inventory }).catch(console.error);
-
-                ws.send(JSON.stringify({ type: 'sell_success', earned: totalEarned, newCoins: p.coins, newInventory: p.inventory }));
+                ws.send(encode({ type: 'sell_success', earned: totalEarned, newCoins: p.coins, newInventory: p.inventory }));
                 broadcast({ type: 'update', id: id, player: p }, ws);
             } else {
-                ws.send(JSON.stringify({ type: 'system_message', text: "Error: No se encontraron metales para vender.", color: '#e74c3c' }));
+                ws.send(encode({ type: 'system_message', text: "Error: No se encontraron metales para vender.", color: '#e74c3c' }));
             }
         }
         // =========================================================
@@ -2654,7 +2686,7 @@ wss.on('connection', async (ws) => {
             });
 
             if (!existingStack || existingStack.quantity < requestedQty) {
-                ws.send(JSON.stringify({ type: 'system_message', text: "🛑 No tienes suficiente cantidad de este metal.", color: '#e74c3c' }));
+                ws.send(encode({ type: 'system_message', text: "🛑 No tienes suficiente cantidad de este metal.", color: '#e74c3c' }));
                 return;
             }
 
@@ -2666,10 +2698,8 @@ wss.on('connection', async (ws) => {
                 p.inventory.splice(stackIndex, 1);
             }
 
-            User.findByIdAndUpdate(p.accountId, { coins: p.coins, inventory: p.inventory }).catch(console.error);
-
             // Reusamos sell_success para que el cliente procese la animación de monedas y cierre la tienda
-            ws.send(JSON.stringify({ type: 'sell_success', earned: totalEarned, newCoins: p.coins, newInventory: p.inventory }));
+            ws.send(encode({ type: 'sell_success', earned: totalEarned, newCoins: p.coins, newInventory: p.inventory }));
             broadcast({ type: 'update', id: id, player: p }, ws);
 
         } else if (data.type === 'sync_weapon_pivot') {
@@ -2691,7 +2721,7 @@ wss.on('connection', async (ws) => {
             // 2. ¡MAGIA! Rebotamos la animación a TODOS los jugadores en vivo
             wss.clients.forEach(client => {
                 if (client.readyState === WebSocket.OPEN) {
-                    client.send(JSON.stringify({
+                    client.send(encode({
                         type: 'sync_skeleton',
                         anchors: skeletonRAM
                     }));
@@ -2772,7 +2802,7 @@ wss.on('connection', async (ws) => {
             // 4. Avisar a todas las pantallas cómo va la vida de la base (sea daño o curación)
             wss.clients.forEach(client => {
                 if (client.readyState === WebSocket.OPEN) {
-                    client.send(JSON.stringify({ type: 'base_update', base: centralBase }));
+                    client.send(encode({ type: 'base_update', base: centralBase }));
                 }
             });
         }
@@ -2791,14 +2821,16 @@ wss.on('connection', async (ws) => {
                         worldY: players[id].worldY,
                         equippedWeapon: players[id].equippedWeapon,
                         hotbar: players[id].hotbar,
-                        quickSwaps: players[id].quickSwaps, // 🆕 Nueva línea
+                        quickSwaps: players[id].quickSwaps,
                         coins: players[id].coins,
                         hp: players[id].hp,
                         isDead: players[id].isDead,
-                        // 👇 NUEVO: GUARDAR KILLS Y LOSSES 👇
                         kills: players[id].kills,
                         losses: players[id].losses,
-                        elo: players[id].elo // <--- AÑADIR ESTO
+                        elo: players[id].elo,
+                        // ⚡ ADD THESE TWO LINES:
+                        inventory: players[id].inventory,
+                        equipped: players[id].equipped
                     }
                 );
             } catch (err) { console.error(err); }
@@ -2807,16 +2839,17 @@ wss.on('connection', async (ws) => {
         delete players[id];
         wss.clients.forEach(client => {
             if (client.readyState === WebSocket.OPEN) {
-                client.send(JSON.stringify({ type: 'left', id: id }));
+                client.send(encode({ type: 'left', id: id }));
             }
         });
     });
 
     // 2. FETCH WORLD DATA
-    const allTiles = await Tile.find({});
+    // 2. FETCH WORLD DATA (Cleaned for MessagePack)
+    const allTiles = await Tile.find({}, { _id: 0, __v: 0 }).lean();
 
     // 3. TELL THE NEW GUEST WHO THEY ARE (INIT)
-    ws.send(JSON.stringify({
+    ws.send(encode({
         type: 'init',
         id: id,
         players: players,
@@ -2838,17 +2871,16 @@ wss.on('connection', async (ws) => {
     // 4. NOW TELL THE LOBBY A GUEST HAS ARRIVED
     wss.clients.forEach(client => {
         if (client !== ws && client.readyState === WebSocket.OPEN) {
-            client.send(JSON.stringify({ type: 'joined', id: id, player: players[id] }));
+            client.send(encode({ type: 'joined', id: id, player: players[id] }));
         }
     });
 
 });
 
-// Helper function to shout messages to everyone EXCEPT the person who sent it
+// Global Broadcast (Only for things like server shutdown or global events)
 function broadcast(data, excludeWs = null) {
-    const payload = JSON.stringify(data);
+    const payload = encode(data);
     wss.clients.forEach((client) => {
-        // Only send if the connection is open and it's not the original sender
         if (client !== excludeWs && client.readyState === WebSocket.OPEN) {
             client.send(payload);
         }
@@ -2910,7 +2942,7 @@ setInterval(() => {
 
                 wss.clients.forEach(c => {
                     if (c.playerId === pid && c.readyState === WebSocket.OPEN) {
-                        c.send(JSON.stringify({ type: 'match_found', targetX: worldSpawnX, targetY: worldSpawnY }));
+                        c.send(encode({ type: 'match_found', targetX: worldSpawnX, targetY: worldSpawnY }));
                     }
                 });
             });
@@ -2932,7 +2964,7 @@ setInterval(() => {
 
                 wss.clients.forEach(c => {
                     if (c.playerId === pid && c.readyState === WebSocket.OPEN) {
-                        c.send(JSON.stringify({ type: 'match_found', targetX: worldSpawnX, targetY: worldSpawnY }));
+                        c.send(encode({ type: 'match_found', targetX: worldSpawnX, targetY: worldSpawnY }));
                     }
                 });
             });
@@ -3055,12 +3087,12 @@ setInterval(() => {
                 // Le sumamos 5 de vida, sin pasarnos del 100
                 p.hp = Math.min(100, p.hp + 5);
 
-                const hpMsg = JSON.stringify({
+                const hpMsg = encode({
                     type: 'hp_update',
                     targetId: id,
                     newHp: p.hp,
                     isDead: false,
-                    damageDealt: -5 // Un número negativo le dice al cliente que es curación
+                    damageDealt: -5
                 });
 
                 // Enviar a todos los clientes para que vean que este jugador se curó
@@ -3071,5 +3103,52 @@ setInterval(() => {
         }
     }
 }, 1000); // Revisa a todos los jugadores 1 vez por segundo
+
+// ==========================================
+// 💾 ASYNC MEMORY FLUSHER (PRIORITY 3)
+// ==========================================
+// This worker wakes up every 60 seconds and saves EVERYONE in one massive, parallel swoop.
+setInterval(async () => {
+    const bulkOps = [];
+
+    for (let id in players) {
+        const p = players[id];
+        // Only save registered users with a database ID
+        if (p.accountId) {
+            bulkOps.push({
+                updateOne: {
+                    filter: { _id: p.accountId },
+                    update: {
+                        $set: {
+                            worldX: p.worldX,
+                            worldY: p.worldY,
+                            equippedWeapon: p.equippedWeapon,
+                            hotbar: p.hotbar,
+                            quickSwaps: p.quickSwaps,
+                            coins: p.coins,
+                            hp: p.hp,
+                            isDead: p.isDead,
+                            kills: p.kills,
+                            losses: p.losses,
+                            elo: p.elo,
+                            inventory: p.inventory,
+                            equipped: p.equipped
+                        }
+                    }
+                }
+            });
+        }
+    }
+
+    if (bulkOps.length > 0) {
+        try {
+            // ordered: false is the magic command. It tells Mongo to write everything at the same time.
+            await User.bulkWrite(bulkOps, { ordered: false });
+            console.log(`💾 [AUTO-SAVE] Flushed ${bulkOps.length} players to MongoDB.`);
+        } catch (err) {
+            console.error("🔥 Background Save Error:", err);
+        }
+    }
+}, 60000); // 60,000 ms = 1 minute
 
 console.log(`WebSocket server running on port ${PORT}`);
