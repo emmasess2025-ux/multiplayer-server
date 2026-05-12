@@ -273,6 +273,7 @@ const userSchema = new mongoose.Schema({
     inventory: { type: [mongoose.Schema.Types.Mixed], default: [] },
     equippedWeapon: { type: String, default: "none" },
     hotbar: { type: Array, default: ["none", "none", "none"] },
+    quickSwaps: { type: Array, default: [] },
     equipped: { // 👕 EL WARDROBE
         hands: { type: String, default: 'none' },
         head: { type: String, default: 'head_default' },
@@ -718,6 +719,7 @@ wss.on('connection', async (ws) => {
 
                 // --- THE HOTBAR PERSISTENCE FIX ---
                 players[id].hotbar = user.hotbar || ["none", "none", "none"];
+                players[id].quickSwaps = user.quickSwaps || []; // 🆕 Nueva línea
 
                 // --- NUEVO: CARGAR MONEDAS A LA RAM ---
                 players[id].coins = user.coins || 0;
@@ -739,6 +741,14 @@ wss.on('connection', async (ws) => {
 
                 // --- NUEVO: PASAR EL ROL A LA MEMORIA ---
                 players[id].role = user.role || 'player';
+
+                // 👇 EL FIX ANTI-COMA: Si te conectas y estabas muerto, revives automáticamente 👇
+                if (players[id].isDead || players[id].hp <= 0) {
+                    players[id].hp = 100;
+                    players[id].isDead = false;
+                    // Forzamos a que MongoDB también se entere de que ya no estás muerto
+                    User.findByIdAndUpdate(user._id, { hp: 100, isDead: false }).catch(console.error);
+                }
 
                 // --- NUEVO: CARGAR EL TAG DEL SQUAD EN RAM ---
                 if (user.squad) {
@@ -1204,6 +1214,7 @@ wss.on('connection', async (ws) => {
                 // --- THE PERSISTENCE FIX: Load the saved weapon! ---
                 players[id].equippedWeapon = user.equippedWeapon || "none";
                 players[id].equipped = user.equipped || { head: 'head_default', body: 'body_default', hands: 'none' }; players[id].hotbar = user.hotbar || ["none", "none", "none"];
+                players[id].quickSwaps = user.quickSwaps || []; // 🆕 Nueva línea
 
                 // --- NUEVO: CARGAR MONEDAS A LA RAM ---
                 players[id].coins = user.coins || 0;
@@ -1225,7 +1236,13 @@ wss.on('connection', async (ws) => {
 
                 // --- NUEVO: PASAR EL ROL A LA MEMORIA ---
                 players[id].role = user.role || 'player';
-
+                // 👇 EL FIX ANTI-COMA: Si te conectas y estabas muerto, revives automáticamente 👇
+                if (players[id].isDead || players[id].hp <= 0) {
+                    players[id].hp = 100;
+                    players[id].isDead = false;
+                    // Forzamos a que MongoDB también se entere de que ya no estás muerto
+                    User.findByIdAndUpdate(user._id, { hp: 100, isDead: false }).catch(console.error);
+                }
                 // --- NUEVO: CARGAR EL TAG DEL SQUAD EN RAM ---
                 if (user.squad) {
                     const mySquad = await Squad.findById(user.squad);
@@ -1383,7 +1400,48 @@ wss.on('connection', async (ws) => {
                 p.hotbar[data.slotIndex] = data.weaponId;
             }
         }
+        // --- NUEVO: RUTA SEGURA PARA ACTUALIZAR QUICK SWAPS ---
+        if (data.type === 'update_quickswaps' && isAuthenticated) {
+            if (players[id]) {
+                players[id].quickSwaps = data.quickSwaps;
+            }
+        }// 🛠️ COMANDO DE RESCATE (/fix)
+        if (data.type === 'force_unstuck' && isAuthenticated) {
+            const p = players[id];
+            if (p) {
+                // Limpiamos los estados de trabado
+                p.isReloading = false;
 
+                if (ws.reloadTimeout) {
+                    clearTimeout(ws.reloadTimeout);
+                    delete ws.reloadTimeout;
+                }
+
+                // 🛡️ EL FIX: Solo revivir si realmente su HP era 0
+                if (p.hp <= 0 || p.isDead) {
+                    p.hp = 100;
+                    p.isDead = false;
+                }
+
+                // Guardamos en la base de datos con la HP que le haya quedado
+                User.findByIdAndUpdate(p.accountId, { hp: p.hp, isDead: p.isDead }).catch(console.error);
+
+                // Avisar a todos del estado actualizado
+                wss.clients.forEach(client => {
+                    if (client.readyState === WebSocket.OPEN) {
+                        client.send(JSON.stringify({
+                            type: 'hp_update', targetId: id, newHp: p.hp, damageDealt: 0, isDead: p.isDead
+                        }));
+                    }
+                });
+
+                ws.send(JSON.stringify({
+                    type: 'system_message',
+                    text: "🛠️ Tu personaje ha sido desbugueado.",
+                    color: "#2ecc71"
+                }));
+            }
+        }
         // 7. HANDLE SHOOTING (SINCRO VISUAL ABSOLUTA ANTI-FANTASMAS)
         if (data.type === 'shoot') {
             const shooter = players[id];
@@ -2078,6 +2136,35 @@ wss.on('connection', async (ws) => {
 
                 ws.send(JSON.stringify({ type: 'edit_squad_success', message: '¡Actualizado!', newCoins: p.coins, squadId: squad._id, squadName: p.squadName, squadLogo: p.squadLogo }));;
             } catch (err) { ws.send(JSON.stringify({ type: 'edit_squad_error', message: 'Error del servidor.' })); }
+        }// 🔍 BUSCAR SQUADS EN LA BASE DE DATOS
+        if (data.type === 'search_squads' && isAuthenticated) {
+            try {
+                const query = data.query ? data.query.trim() : "";
+                let filter = {};
+
+                // Si hay texto, buscamos por nombre (insensible a mayúsculas)
+                if (query.length > 0) {
+                    filter = { name: { $regex: query, $options: 'i' } };
+                }
+
+                // Traemos los resultados (limitado a 20 para no saturar) ordenados por popularidad (territorio)
+                const squads = await Squad.find(filter)
+                    .sort({ territoryTimeMinutes: -1 })
+                    .limit(20)
+                    .lean();
+
+                const results = squads.map(sq => ({
+                    id: sq._id,
+                    name: sq.name,
+                    logo: sq.logo,
+                    memberCount: (sq.members ? sq.members.length : 0) + 1, // +1 por el líder
+                    infamia: sq.territoryTimeMinutes || 0
+                }));
+
+                ws.send(JSON.stringify({ type: 'squad_search_results', results: results }));
+            } catch (err) {
+                console.error("Error al buscar squads:", err);
+            }
         }
 
         // 19. EQUIPAR O QUITAR TAG DE SQUAD
@@ -2704,6 +2791,7 @@ wss.on('connection', async (ws) => {
                         worldY: players[id].worldY,
                         equippedWeapon: players[id].equippedWeapon,
                         hotbar: players[id].hotbar,
+                        quickSwaps: players[id].quickSwaps, // 🆕 Nueva línea
                         coins: players[id].coins,
                         hp: players[id].hp,
                         isDead: players[id].isDead,
