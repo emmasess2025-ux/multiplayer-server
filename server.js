@@ -4,12 +4,23 @@ const bcrypt = require('bcryptjs');
 const { encode, decode } = require('@msgpack/msgpack'); // <--- ADD THIS
 require('dotenv').config(); // <--- ADD THIS LINE TO READ THE .ENV FILE
 
+// Global RAM for Squad Chats (Ultra-fast, ephemeral)
+const SQUAD_CHATS_RAM = {};
 // --- DATABASE CONNECTION ---
 const MONGO_URI = process.env.MONGO_URI;
 
 mongoose.connect(MONGO_URI)
-    .then(() => {
+    .then(async () => {
         console.log('🔥 Connected to MongoDB!');
+
+        // 🛑 EL FIX: Cargar la Playlist de MongoDB a la RAM
+        let config = await ServerConfig.findOne();
+        if (!config) {
+            // Si es la primera vez que prendes el server, crea el documento base
+            config = new ServerConfig({ bgmPlaylist: ["audio/music/track1.mp3"] }); // Pon la ruta real que tengas en Github luego
+            await config.save();
+        }
+        GLOBAL_BGM_PLAYLIST = config.bgmPlaylist;
 
         loadTilesetsFromDB();
         loadWorldMapFromDB();
@@ -170,7 +181,7 @@ async function loadZoneConfigsFromDB() {
     try {
         let configs = await ZoneConfig.find({}, { _id: 0, __v: 0 }).lean();
 
-        // Si la tabla está vacía (primera vez que corres el server), inyectamos los básicos
+        // Si la tabla está vacía, inyectamos los básicos
         if (configs.length === 0) {
             console.log("🛠️ Inicializando Tipos de Zona por defecto en MongoDB...");
             const defaultZones = [
@@ -183,15 +194,17 @@ async function loadZoneConfigsFromDB() {
             configs = await ZoneConfig.find({}, { _id: 0, __v: 0 }).lean();
         }
 
+        // 🛑 EL FIX: Si tu base de datos ya existía pero no tenía la zona "indoor", la inyectamos a la fuerza
+        if (!configs.find(c => c.id === 'indoor')) {
+            console.log("🏠 Añadiendo nueva zona de Techos a la base de datos...");
+            await ZoneConfig.create({ id: "indoor", name: "Interior (Sin Lluvia)", icon: "🏠", colorBorder: "rgba(52, 152, 219, 0.8)", colorFill: "rgba(52, 152, 219, 0.2)" });
+            configs = await ZoneConfig.find({}, { _id: 0, __v: 0 }).lean();
+        }
+
         // Limpiar la RAM y llenarla con los datos de Mongo
         ZONE_CONFIG = {};
         configs.forEach(c => {
-            ZONE_CONFIG[c.id] = {
-                name: c.name,
-                icon: c.icon,
-                colorBorder: c.colorBorder,
-                colorFill: c.colorFill
-            };
+            ZONE_CONFIG[c.id] = { name: c.name, icon: c.icon, colorBorder: c.colorBorder, colorFill: c.colorFill };
         });
 
         console.log(`🎨 Tipos de Zona cargados en RAM (${Object.keys(ZONE_CONFIG).length} tipos).`);
@@ -340,6 +353,16 @@ const squadSchema = new mongoose.Schema({
 const Squad = mongoose.model('Squad', squadSchema);
 
 // ==========================================
+// CONFIGURACIÓN GLOBAL DEL SERVIDOR (MUSIC, ETC)
+// ==========================================
+const serverConfigSchema = new mongoose.Schema({
+    bgmPlaylist: { type: [String], default: [] }
+});
+const ServerConfig = mongoose.model('ServerConfig', serverConfigSchema);
+
+let GLOBAL_BGM_PLAYLIST = []; // Memoria RAM ultrarrápida
+
+// ==========================================
 // 📦 TABLA MAESTRA DE ÍTEMS (MASTER CATALOG)
 // ==========================================
 const itemSchema = new mongoose.Schema({
@@ -349,7 +372,17 @@ const itemSchema = new mongoose.Schema({
     src: { type: String, required: true },
     price: { type: Number, default: 0 },
     stats: { type: Object, default: {} },
-    drawConfig: { type: Object, default: {} }
+    drawConfig: { type: Object, default: {} },
+
+    // 🔊 NUEVO: DICCIONARIO DE AUDIO
+    audio: {
+        type: Object,
+        default: {
+            use: null,     // Sonido al usar/disparar/swing
+            reload: null,  // Sonido de recarga
+            equip: null    // Sonido genérico al equiparlo en la mano
+        }
+    }
 });
 
 const Item = mongoose.model('Item', itemSchema);
@@ -358,6 +391,8 @@ let MASTER_CATALOG = {};
 let WEAPONS = {};
 let TRASH_CATALOG = [];
 let METALS_CATALOG = []; // <--- ⛏️ ¡AQUÍ ESTÁ LA LÍNEA QUE FALTABA!
+
+
 
 async function loadMasterCatalog() {
     try {
@@ -673,10 +708,15 @@ wss.on('connection', async (ws) => {
         hp: 100,
         isDead: false,
         ammo: 8,
+        weaponAmmo: {},
         lastShotTime: 0,
         isReloading: false,
         equipped: { head: 'head_default', body: 'body_default', hands: 'none' },
-        chunkId: getChunkId(0, 0)
+        chunkId: getChunkId(0, 0),
+
+        // 🛑 EL FIX 1: ¡El servidor necesita saber que los invitados SÍ tienen la Ghost Gun!
+        inventory: ["ghost_gun"],
+        equippedWeapon: "ghost_gun"
     };
 
     ws.on('message', async (message) => {
@@ -760,6 +800,7 @@ wss.on('connection', async (ws) => {
                 players[id].inventory = user.inventory;
 
                 players[id].equippedWeapon = user.equippedWeapon || "none";
+                players[id].weaponAmmo = {};
                 players[id].equipped = user.equipped || { head: 'head_default', body: 'body_default', hands: 'none' };
 
                 // --- THE HOTBAR PERSISTENCE FIX ---
@@ -802,6 +843,11 @@ wss.on('connection', async (ws) => {
                         players[id].squad = mySquad._id.toString();
                         players[id].squadName = mySquad.name;
                         players[id].squadLogo = mySquad.logo;
+
+                        // 🛑 EL FIX: Revisar si soy líder o si tengo el permiso de invitar
+                        const isLeader = mySquad.leader.toString() === user._id.toString();
+                        const myData = mySquad.members.find(m => m.accountId.toString() === user._id.toString());
+                        players[id].squadCanInvite = isLeader || (myData && myData.canInvite) || false;
                     }
                 }
                 // Send success and include their friends list!
@@ -1184,18 +1230,23 @@ wss.on('connection', async (ws) => {
             try {
                 const newZone = new SafeZone({
                     name: data.name,
-                    zoneType: data.zoneType || 'safe', // <--- AÑADE ESTO
+                    zoneType: data.zoneType || 'safe',
                     xMin: data.xMin, xMax: data.xMax,
                     yMin: data.yMin, yMax: data.yMax
                 });
                 await newZone.save();
 
-                safeZonesRAM.push(newZone);
+                // 🛑 EL FIX: Convertir el Documento de Mongoose a Objeto Plano y limpiar el ID
+                const plainZone = newZone.toObject();
+                plainZone._id = plainZone._id.toString();
 
+                // Guardarlo en la RAM
+                safeZonesRAM.push(plainZone);
+
+                // Enviarlo a los clientes (Ahora MessagePack lo empaquetará sin problemas)
                 wss.clients.forEach(client => {
                     if (client.readyState === WebSocket.OPEN) {
-                        // 🛑 EL FIX ESTÁ AQUÍ 🛑 
-                        client.send(encode({ type: 'new_safezone', zone: newZone }));
+                        client.send(encode({ type: 'new_safezone', zone: plainZone }));
                     }
                 });
             } catch (err) { console.error("Error guardando Zona:", err); }
@@ -1290,6 +1341,11 @@ wss.on('connection', async (ws) => {
                         players[id].squad = mySquad._id.toString();
                         players[id].squadName = mySquad.name;
                         players[id].squadLogo = mySquad.logo;
+
+                        // 🛑 EL FIX: Revisar si soy líder o si tengo el permiso de invitar
+                        const isLeader = mySquad.leader.toString() === user._id.toString();
+                        const myData = mySquad.members.find(m => m.accountId.toString() === user._id.toString());
+                        players[id].squadCanInvite = isLeader || (myData && myData.canInvite) || false;
                     }
                 }
 
@@ -1405,6 +1461,11 @@ wss.on('connection', async (ws) => {
             p.isMoving = data.player.isMoving;
             p.isTyping = data.player.isTyping;
 
+            // 🛑 EL FIX 2: Sincronizar el arma para que los demás la vean en tu mano
+            if (data.player.equippedWeapon !== undefined) {
+                p.equippedWeapon = data.player.equippedWeapon;
+            }
+
             let safeMsg = data.player.message || "";
             p.message = safeMsg.substring(0, 100);
             p.messageTimer = Math.min(data.player.messageTimer || 0, 600);
@@ -1418,33 +1479,32 @@ wss.on('connection', async (ws) => {
             const p = players[id];
             if (!p) return;
 
-            if (data.weaponId === "none" || (p.hotbar && p.hotbar.includes(data.weaponId))) {
+            // 🛡️ ANTI-HACK: Escáner de inventario a prueba de formatos mixtos
+            let ownsWeapon = false;
+            if (data.weaponId === "none") {
+                ownsWeapon = true;
+            } else if (p.inventory) {
+                ownsWeapon = p.inventory.some(item => {
+                    const itemId = (typeof item === 'object') ? item.id : item;
+                    return itemId === data.weaponId;
+                });
+            }
+
+            if (ownsWeapon) {
                 p.equippedWeapon = data.weaponId;
 
-                // --- EL FIX ANTI-CRASH: Guardar el Timer en 'ws' en lugar de 'p' ---
-                if (ws.reloadTimeout) clearTimeout(ws.reloadTimeout);
-
-                // Limpiar la variable contaminada por si acaso quedó viva
-                delete p.reloadTimeout;
-
+                // Inicializamos la memoria de balas del servidor si es un arma nueva
                 const stats = WEAPONS[data.weaponId];
-                if (stats) {
-                    p.ammo = 0;
-                    p.isReloading = true;
-
-                    ws.reloadTimeout = setTimeout(() => {
-                        if (players[id] && players[id].equippedWeapon === data.weaponId) {
-                            players[id].ammo = stats.magSize;
-                            players[id].isReloading = false;
-                        }
-                    }, stats.reloadTime);
-                } else {
-                    p.ammo = 0;
-                    p.isReloading = false;
+                if (stats && stats.type === 'ranged') {
+                    if (p.weaponAmmo[data.weaponId] === undefined) {
+                        p.weaponAmmo[data.weaponId] = stats.magSize;
+                    }
                 }
 
-                // Ahora 'p' está 100% limpio de Timers de Node.js
+                // Avisamos a los demás jugadores qué arma traes en la mano
                 broadcast({ type: 'update', id: id, player: p }, ws);
+            } else {
+                console.warn(`[ANTI-HACK] ${p.username} intentó equipar un arma fantasma: ${data.weaponId}`);
             }
         }
 
@@ -1453,10 +1513,30 @@ wss.on('connection', async (ws) => {
             const p = players[id];
             if (!p) return;
 
-            // Verificar que el arma que quiere poner en el hotbar realmente exista en su inventario
-            if (data.weaponId === "none" || (p.inventory && p.inventory.includes(data.weaponId))) {
+            // 🛡️ ANTI-HACK: Escáner de inventario a prueba de formatos mixtos
+            let ownsWeapon = false;
+            if (data.weaponId === "none") {
+                ownsWeapon = true;
+            } else if (p.inventory) {
+                ownsWeapon = p.inventory.some(item => {
+                    const itemId = (typeof item === 'object') ? item.id : item;
+                    return itemId === data.weaponId;
+                });
+            }
+
+            if (ownsWeapon) {
                 if (!p.hotbar) p.hotbar = ["none", "none", "none"];
                 p.hotbar[data.slotIndex] = data.weaponId;
+            } else {
+                console.warn(`[ANTI-HACK] ${p.username} intentó equipar ${data.weaponId} sin comprarlo.`);
+            }
+        }
+        // 🔄 NUEVO: AVISO DE RECARGA AL SERVIDOR
+        if (data.type === 'reload_weapon') {
+            const p = players[id];
+            const stats = WEAPONS[data.weaponId];
+            if (p && stats && stats.type === 'ranged') {
+                p.weaponAmmo[data.weaponId] = stats.magSize;
             }
         }
         // --- NUEVO: RUTA SEGURA PARA ACTUALIZAR QUICK SWAPS ---
@@ -1501,44 +1581,48 @@ wss.on('connection', async (ws) => {
         // 7. HANDLE SHOOTING (SINCRO VISUAL ABSOLUTA ANTI-FANTASMAS)
         if (data.type === 'shoot') {
             const shooter = players[id];
-            const weaponId = shooter.equippedWeapon || "none";
+
+            // 🛑 EL FIX 3: Usar el ID del arma que manda el gatillo, no el de la memoria lenta
+            const weaponId = data.weaponId || shooter.equippedWeapon || "none";
             const stats = WEAPONS[weaponId];
 
-            if (!stats || weaponId === "none") return;
-
-            // BLOQUEO DE DISPARO EN ZONA SEGURA
-            if (isInSafeZone(shooter.worldX, shooter.worldY)) {
-                return;
-            }
+            if (!stats || weaponId === "none" || isInSafeZone(shooter.worldX, shooter.worldY)) return;
 
             const now = Date.now();
 
-            // 🛑 EL FIX: Quitamos la lógica estricta de munición de este bloque.
-            // Las balas visuales NO hacen daño. El verdadero escudo anti-hack está en 'damage_player'.
-            // Al hacer esto, evitamos la desincronización y el lag de internet.
-
-            // Solo dejamos un Anti-Spam básico (Ej. máximo 20 balas visuales por segundo)
-            // para evitar que un hacker malicioso sature la pantalla de luces.
-            if (now - (shooter.lastShotTime || 0) < 50) {
-                return;
-            }
+            // 🛡️ ANTI-HACK: Control de Spam (Fire Rate)
+            if (now - (shooter.lastShotTime || 0) < ((stats.fireRate || 300) - 50)) return;
             shooter.lastShotTime = now;
 
-            // 🎯 SEND BULLETS ONLY TO LOCAL CHUNK
+            // 🛡️ ANTI-HACK: Control de Balas Mágicas
+            if (stats.type === 'ranged') {
+                if (shooter.weaponAmmo[weaponId] === undefined) shooter.weaponAmmo[weaponId] = stats.magSize;
+                if (shooter.weaponAmmo[weaponId] <= 0) return; // 🛑 HACKER INTENTANDO DISPARAR SIN BALAS
+                shooter.weaponAmmo[weaponId]--; // Descontamos la bala oficial
+            }
+
+            // 🛑 EL FIX 4: Reenviar usando weaponId para que tu oponente dibuje la bala y escuche tu disparo
             broadcastToZone({ type: 'shoot', id: id, x: data.x, y: data.y, angle: data.angle, weaponId: weaponId }, shooter.chunkId, ws);
         }// 👇 NUEVO: Lógica para escopetas (Múltiples balas en 1 mensaje) 👇
         if (data.type === 'shoot_shotgun') {
             const p = players[id];
-            if (!p) return; // Failsafe
+            const stats = WEAPONS[data.weaponId];
+            if (!p || !stats || isInSafeZone(p.worldX, p.worldY)) return;
 
-            // 🎯 SEND SHOTGUN SPREAD ONLY TO LOCAL CHUNK
+            const now = Date.now();
+            // 🛡️ ANTI-HACK: Control de Spam
+            if (now - (p.lastShotTime || 0) < ((stats.fireRate || 300) - 50)) return;
+            p.lastShotTime = now;
+
+            // 🛡️ ANTI-HACK: Control de Balas Mágicas
+            if (stats.type === 'ranged') {
+                if (p.weaponAmmo[data.weaponId] === undefined) p.weaponAmmo[data.weaponId] = stats.magSize;
+                if (p.weaponAmmo[data.weaponId] <= 0) return;
+                p.weaponAmmo[data.weaponId]--;
+            }
+
             broadcastToZone({
-                type: 'shoot_shotgun', // Must match what the client expects
-                id: id,
-                x: data.x,
-                y: data.y,
-                angles: data.angles,   // Shotguns use an array of angles!
-                weaponId: data.weaponId
+                type: 'shoot_shotgun', id: id, x: data.x, y: data.y, angles: data.angles, weaponId: data.weaponId
             }, p.chunkId, ws);
         }
         // 8. MANEJAR EL DAÑO Y LA VIDA (CON ESCUDO ANTI-CHEAT DEFINITIVO)
@@ -1546,41 +1630,35 @@ wss.on('connection', async (ws) => {
             const shooter = players[id];
             const target = players[data.targetId];
 
-            // Evitar Fuego Amigo en la Arena
             if (shooter.isSparring && target.isSparring && shooter.currentArena === target.currentArena) {
-                if (shooter.arenaTeam === target.arenaTeam) return; // Son del mismo equipo
+                if (shooter.arenaTeam === target.arenaTeam) return;
             }
 
             if (shooter && target && !target.isDead) {
-
                 const weaponId = data.weaponId || shooter.equippedWeapon || "none";
                 const stats = WEAPONS[weaponId];
                 if (!stats || weaponId === "none") return;
 
                 const now = Date.now();
 
-                // 2. ANTI-METRALLETA DE DAÑO
+                // 🛡️ 1. ANTI-METRALLETA DE DAÑO
                 const lastDamage = shooter.lastDamageTime || 0;
-                if (now - lastDamage < ((stats.fireRate || 300) - 50)) {
-                    return;
-                }
+                if (now - lastDamage < ((stats.fireRate || 300) - 50)) return;
                 shooter.lastDamageTime = now;
 
-                // 3. RANGO
+                // 🛡️ 2. RANGO ESTRICTO EN SERVIDOR (Cero disparos desde la base)
                 const dist = Math.hypot(shooter.worldX - target.worldX, shooter.worldY - target.worldY);
-                const maxDist = stats.type === 'melee' ? (stats.dirStats?.[0]?.hitLen || 60) * 2 : (stats.range * stats.speed) * 1.3;
-                if (dist > maxDist && stats.type !== 'melee') return;
+                const maxDist = stats.type === 'melee' ? (stats.dirStats?.[0]?.hitLen || 60) * 2 : (stats.range * stats.speed) * 1.5;
+                if (dist > maxDist && stats.type !== 'melee') {
+                    console.warn(`[ANTI-HACK] ${shooter.username} atacó a ${target.username} fuera de rango.`);
+                    return; // 🛑 HACK DE RANGO DETECTADO
+                }
 
-                // 4. FUEGO AMIGO
                 if (shooter.squad && target.squad && shooter.squad === target.squad) return;
-
-                // 4.5 ZONA SEGURA
                 if (isInSafeZone(shooter.worldX, shooter.worldY) || isInSafeZone(target.worldX, target.worldY)) return;
-
-                // 5. ESCUDO DE PROTECCIÓN AL REVIVIR
                 if (target.invulnerableUntil && now < target.invulnerableUntil) return;
 
-                // 🛑 EL FIX FINAL ANTI-FANTASMA
+                // 🛡️ 3. DAÑO AUTORITATIVO REAL (El servidor hace la resta)
                 const actualDamage = Number(stats.damage) || 10;
                 target.hp = (Number(target.hp) || 100) - actualDamage;
                 target.lastHitTime = Date.now();
@@ -1831,39 +1909,39 @@ wss.on('connection', async (ws) => {
                 const myAccountId = players[id].accountId;
                 const targetAccountId = data.targetAccountId;
 
-                // Buscar el nombre y la ropa ACTUAL del usuario en la base de datos
-                const targetUser = await User.findById(targetAccountId);
+                // 🛑 EL FIX: Añadir .lean() para limpiar el objeto de Mongoose
+                const targetUser = await User.findById(targetAccountId).lean();
                 const currentTargetName = targetUser ? targetUser.username : "Usuario Desconocido";
-
-                // 👇 NUEVO: Extraemos la ropa exacta que lleva puesta
                 const targetEquipped = targetUser && targetUser.equipped ? targetUser.equipped : { head: 'head_default' };
 
-                const conv = await PM.findOne({ participants: { $all: [myAccountId, targetAccountId] } });
+                // 🛑 EL FIX: Añadir .lean() al historial de mensajes
+                const conv = await PM.findOne({ participants: { $all: [myAccountId, targetAccountId] } }).lean();
 
                 ws.send(encode({
                     type: 'pm_history',
                     targetAccountId: targetAccountId,
                     targetUsername: currentTargetName,
-                    targetEquipped: targetEquipped, // 👈 ENVIAMOS LA ROPA AL CLIENTE
+                    targetEquipped: targetEquipped,
                     history: conv ? conv.messages : []
                 }));
             } catch (err) { console.error("Error pidiendo historial:", err); }
         }
+
         // 11. PEDIR LISTA DE INBOX
         if (data.type === 'get_inbox' && isAuthenticated) {
             try {
                 const myAccountId = players[id].accountId;
-                const convos = await PM.find({ participants: myAccountId });
+
+                // 🛑 EL FIX: Añadir .lean()
+                const convos = await PM.find({ participants: myAccountId }).lean();
 
                 const inboxData = [];
                 for (let c of convos) {
                     const otherPersonId = c.participants.find(p => p !== myAccountId);
 
-                    // Buscar su nombre y ropa ACTUAL
-                    const otherUser = await User.findById(otherPersonId);
+                    // 🛑 EL FIX: Añadir .lean()
+                    const otherUser = await User.findById(otherPersonId).lean();
                     const currentName = otherUser ? otherUser.username : "Usuario Desconocido";
-
-                    // 👇 NUEVO: Extraer la cabeza que trae equipada
                     const currentHead = (otherUser && otherUser.equipped) ? otherUser.equipped.head : 'head_default';
 
                     const lastMsg = c.messages.length > 0 ? c.messages[c.messages.length - 1] : null;
@@ -1871,7 +1949,7 @@ wss.on('connection', async (ws) => {
                     inboxData.push({
                         targetAccountId: otherPersonId,
                         targetUser: currentName,
-                        targetHeadId: currentHead, // 👈 ENVIAMOS LA CABEZA A LA TARJETA DEL INBOX
+                        targetHeadId: currentHead,
                         lastMessage: lastMsg ? lastMsg.text : "Comienza a chatear...",
                         time: lastMsg ? lastMsg.timestamp : 0
                     });
@@ -1880,6 +1958,60 @@ wss.on('connection', async (ws) => {
                 inboxData.sort((a, b) => new Date(b.time) - new Date(a.time));
                 ws.send(encode({ type: 'inbox_data', inbox: inboxData }));
             } catch (err) { console.error("Error pidiendo inbox:", err); }
+        }
+        // ==========================================
+        // 💬 SQUAD CHAT (RAM-DRIVEN)
+        // ==========================================
+
+        // A. Fetch History when opening the clan menu
+        if (data.type === 'get_squad_chat' && isAuthenticated) {
+            const myUser = await User.findOne({ email: currentUser });
+            if (!myUser || !myUser.squad) return;
+            const sqId = myUser.squad.toString();
+
+            // If the RAM array doesn't exist for this squad yet, create it
+            if (!SQUAD_CHATS_RAM[sqId]) SQUAD_CHATS_RAM[sqId] = [];
+
+            ws.send(encode({
+                type: 'squad_chat_history',
+                history: SQUAD_CHATS_RAM[sqId]
+            }));
+        }
+
+        // B. Receive and Broadcast a new message
+        if (data.type === 'send_squad_chat' && isAuthenticated) {
+            const myUser = await User.findOne({ email: currentUser });
+            if (!myUser || !myUser.squad) return;
+            const sqId = myUser.squad.toString();
+
+            if (!SQUAD_CHATS_RAM[sqId]) SQUAD_CHATS_RAM[sqId] = [];
+
+            const chatMsg = {
+                senderId: myUser._id.toString(),
+                senderName: myUser.username,
+                // 🛑 EL FIX: Guardar la cabeza actual en el historial
+                senderHead: players[id] && players[id].equipped ? players[id].equipped.head : 'head_default',
+                text: data.text.substring(0, 150),
+                timestamp: new Date().toISOString()
+            };
+
+            // Push to RAM
+            SQUAD_CHATS_RAM[sqId].push(chatMsg);
+
+            // Limit to the last 30 messages
+            if (SQUAD_CHATS_RAM[sqId].length > 30) {
+                SQUAD_CHATS_RAM[sqId].shift();
+            }
+
+            // Broadcast instantly to all ONLINE members of this exact squad
+            wss.clients.forEach(client => {
+                if (client.readyState === WebSocket.OPEN && players[client.playerId] && players[client.playerId].squad === sqId) {
+                    client.send(encode({
+                        type: 'new_squad_chat',
+                        message: chatMsg
+                    }));
+                }
+            });
         }
         // 12. PEDIR LISTA DE AMIGOS ACTUALIZADA (Versión Optimizada y con Ropa)
         if (data.type === 'get_friends_list' && isAuthenticated) {
@@ -1977,51 +2109,79 @@ wss.on('connection', async (ws) => {
             }
         }
 
-        // 14. CREAR SQUAD (CLAN) CON COBRO Y LOGO
+        // 14. CREAR SQUAD (CLAN)
         if (data.type === 'create_squad' && isAuthenticated) {
             try {
-                const p = players[id];
-                const squadName = data.squadName.trim();
-                const squadLogo = data.logo ? data.logo.trim() : ""; // <--- NUEVO
-                const SQUAD_PRICE = 2000;
-
-                if (squadName.length < 3 || squadName.length > 20) {
-                    return ws.send(encode({ type: 'squad_error', message: 'El nombre debe tener entre 3 y 20 letras.' }));
-                }
-
-                // SEGURIDAD: Solo URLs de Pinterest
-                if (squadLogo !== "" && !squadLogo.startsWith("https://i.pinimg.com/")) {
-                    return ws.send(encode({ type: 'squad_error', message: 'El logo debe ser de Pinterest (Empieza con https://i.pinimg.com/)' }));
-                }
-
-                if (p.coins < SQUAD_PRICE) return ws.send(encode({ type: 'squad_error', message: `Necesitas ${SQUAD_PRICE} 🪙 para fundar un clan.` }));
-
                 const myUser = await User.findOne({ email: currentUser });
-                if (myUser.squad) return ws.send(encode({ type: 'squad_error', message: 'Ya eres miembro de un Squad principal.' }));
+                if (!myUser) return;
 
-                const existingSquad = await Squad.findOne({ name: new RegExp('^' + squadName + '$', 'i') });
-                if (existingSquad) return ws.send(encode({ type: 'squad_error', message: 'Ese nombre ya está en uso.' }));
+                // 🛑 EL FIX: Borrar la validación que bloqueaba si ya tenías un Tag equipado.
+                // En su lugar, revisamos en la base de datos si ya eres DUEÑO de un clan.
+                const alreadyLeader = await Squad.findOne({ leader: myUser._id });
+                if (alreadyLeader) {
+                    return ws.send(encode({
+                        type: 'squad_error',
+                        message: 'Ya eres fundador de un Squad. Solo puedes ser dueño de uno.'
+                    }));
+                }
 
-                p.coins -= SQUAD_PRICE;
-                myUser.coins = p.coins;
+                // Revisar el dinero
+                if (myUser.coins < 2000) {
+                    return ws.send(encode({
+                        type: 'squad_error',
+                        message: 'No tienes suficientes Argons (Cuesta 2000 🪙).'
+                    }));
+                }
+
+                // Revisar si el nombre ya está en uso por otro clan
+                const existingName = await Squad.findOne({ name: data.squadName });
+                if (existingName) {
+                    return ws.send(encode({
+                        type: 'squad_error',
+                        message: 'Ese nombre ya está registrado.'
+                    }));
+                }
+
+                // 1. Cobrar y Crear
+                myUser.coins -= 2000;
 
                 const newSquad = new Squad({
-                    name: squadName,
+                    name: data.squadName,
+                    logo: data.logo || "",
                     leader: myUser._id,
-                    logo: squadLogo, // <--- GUARDAMOS EL LOGO
-                    members: []
+                    members: [] // Entra sin miembros, él es el líder
                 });
                 await newSquad.save();
 
+                // 2. Equiparle automáticamente su nuevo Tag de Fundador
                 myUser.squad = newSquad._id;
                 await myUser.save();
-                p.squad = newSquad._id.toString();
-                p.squadName = newSquad.name;
-                p.squadLogo = newSquad.logo;
 
-                ws.send(encode({ type: 'squad_success', message: `¡Has fundado el Squad [${squadName}]!`, newCoins: p.coins, squadName: newSquad.name, squadLogo: squadLogo }));
-                broadcast({ type: 'update', id: id, player: p }, ws);
-            } catch (err) { ws.send(encode({ type: 'squad_error', message: 'Error interno del servidor.' })); }
+                // 3. Actualizar la memoria RAM del servidor
+                if (players[id]) {
+                    players[id].coins = myUser.coins;
+                    players[id].squad = newSquad._id.toString();
+                    players[id].squadName = newSquad.name;
+                    players[id].squadLogo = newSquad.logo;
+                    players[id].squadCanInvite = true; // El líder siempre puede invitar
+                }
+
+                // 4. Avisar al jugador que fue un éxito
+                ws.send(encode({
+                    type: 'squad_success',
+                    message: `¡Has fundado el Squad [${newSquad.name}]!`,
+                    newCoins: myUser.coins,
+                    squadName: newSquad.name,
+                    squadLogo: newSquad.logo,
+                    squadId: newSquad._id.toString()
+                }));
+
+                // 5. Avisar al resto del mapa para que vean su nueva placa
+                broadcast({ type: 'update', id: id, player: players[id] }, ws);
+
+            } catch (err) {
+                console.error("Error creando squad:", err);
+            }
         }
         // 15. ELIMINAR AMIGO
         if (data.type === 'remove_friend' && isAuthenticated) {
@@ -2074,9 +2234,9 @@ wss.on('connection', async (ws) => {
                 });
 
                 const listData = mySquads.map(sq => ({
-                    id: sq._id,
+                    id: sq._id.toString(), // 🛑 EL FIX: Forzar a que sea texto
                     name: sq.name,
-                    logo: sq.logo, // <--- ENVIAMOS EL LOGO
+                    logo: sq.logo,
                     isLeader: sq.leader.toString() === myUser._id.toString(),
                     memberCount: sq.members.length + 1
                 }));
@@ -2085,20 +2245,44 @@ wss.on('connection', async (ws) => {
             } catch (err) { console.error(err); }
         }
 
-        // 17. OBTENER DETALLES DE UN SQUAD ESPECÍFICO (Con Logo)
+        // 17. OBTENER DETALLES DE UN SQUAD ESPECÍFICO (Con Logo y Stats)
         if (data.type === 'get_squad_details' && isAuthenticated) {
             try {
-                const squad = await Squad.findById(data.squadId).populate('leader', 'username').populate('members.accountId', 'username');
+                const squad = await Squad.findById(data.squadId)
+                    // 🛑 EL FIX: Pedir explícitamente los stats de combate y economía
+                    .populate('leader', 'username equipped elo kills losses coins')
+                    .populate('members.accountId', 'username equipped elo kills losses coins');
+
                 if (!squad) return;
 
                 const squadData = {
-                    id: squad._id,
+                    id: squad._id.toString(),
                     name: squad.name,
-                    logo: squad.logo, // <--- ENVIAMOS EL LOGO AL PERFIL
-                    leader: { id: squad.leader._id, name: squad.leader.username },
+                    logo: squad.logo,
+                    leader: {
+                        accountId: squad.leader._id.toString(), // Estandarizado a accountId
+                        name: squad.leader.username,
+                        equipped: squad.leader.equipped || { head: 'head_default', body: 'body_default', hat: 'none' },
+                        elo: squad.leader.elo || 1000,
+                        kills: squad.leader.kills || 0,
+                        losses: squad.leader.losses || 0,
+                        coins: squad.leader.coins || 0
+                    },
                     members: squad.members.map(m => {
                         if (!m.accountId) return null;
-                        return { id: m.accountId._id, name: m.accountId.username, title: m.customTitle };
+                        return {
+                            accountId: m.accountId._id.toString(),
+                            name: m.accountId.username,
+                            equipped: m.accountId.equipped || { head: 'head_default', body: 'body_default', hat: 'none' },
+                            elo: m.accountId.elo || 1000,
+                            kills: m.accountId.kills || 0,
+                            losses: m.accountId.losses || 0,
+                            coins: m.accountId.coins || 0,
+                            title: m.customTitle,
+                            canInvite: m.canInvite,
+                            canKick: m.canKick,
+                            canAssignRoles: m.canAssignRoles
+                        };
                     }).filter(m => m !== null)
                 };
 
@@ -2108,13 +2292,18 @@ wss.on('connection', async (ws) => {
         // 26. SOLICITAR EL LEADERBOARD (PUNTAJES DE SQUADS Y BASES EN VIVO)
         if (data.type === 'get_squad_leaderboard' && isAuthenticated) {
             try {
-                // 1. Obtener a todos los clanes y solo traer los campos necesarios para no saturar la red
+                // 1. Obtener a todos los clanes
                 const allSquads = await Squad.find({}, 'name logo dailyTimeMinutes weeklyTimeMinutes territoryTimeMinutes').lean();
 
-                // 2. Preparar la vista "En Vivo" (Actualmente solo tienes centralBase, pero lo hacemos como array por si en el futuro agregas más bases)
+                // 🛑 EL FIX ARQUITECTÓNICO: Convertir los ObjectId a Strings ligeros antes de enviarlos
+                const cleanSquads = allSquads.map(sq => ({
+                    ...sq,
+                    _id: sq._id.toString()
+                }));
+
+                // 2. Preparar la vista "En Vivo"
                 const liveBases = [];
                 if (centralBase) {
-                    // Buscamos el logo del dueño actual para que se vea bonito en el menú
                     let ownerLogo = "";
                     if (centralBase.currentOwnerSquadId) {
                         const sq = await Squad.findOne({ name: centralBase.currentOwnerSquadId });
@@ -2132,7 +2321,7 @@ wss.on('connection', async (ws) => {
 
                 ws.send(encode({
                     type: 'squad_leaderboard_data',
-                    squads: allSquads,
+                    squads: cleanSquads, // 👈 Enviamos la lista sanitizada
                     liveBases: liveBases
                 }));
             } catch (err) {
@@ -2195,11 +2384,12 @@ wss.on('connection', async (ws) => {
                     .limit(20)
                     .lean();
 
+                // Empaquetamos TODOS los datos para que el perfil offline se dibuje perfecto
                 const results = squads.map(sq => ({
-                    id: sq._id,
+                    id: sq._id.toString(), // 🛑 EL FIX: Forzar a que sea texto
                     name: sq.name,
                     logo: sq.logo,
-                    memberCount: (sq.members ? sq.members.length : 0) + 1, // +1 por el líder
+                    memberCount: (sq.members ? sq.members.length : 0) + 1,
                     infamia: sq.territoryTimeMinutes || 0
                 }));
 
@@ -2232,17 +2422,14 @@ wss.on('connection', async (ws) => {
 
                 // Si el squad que me envió es el mismo que ya tengo equipado, significa que lo quiero QUITAR
                 if (myUser.squad && myUser.squad.toString() === squadId) {
-                    myUser.squad = null;
-                    p.squad = null;
-                    p.squadName = null; // <--- NUEVO
-                    p.squadLogo = null; // <--- NUEVO
+                    myUser.squad = null; p.squad = null; p.squadName = null; p.squadLogo = null;
+                    p.squadCanInvite = false; // Pierdes el permiso
                     isActive = false;
+
                 } else {
                     // Si es distinto o estaba en null, lo quiero EQUIPAR (reemplaza a cualquier otro)
-                    myUser.squad = squad._id;
-                    p.squad = squad._id.toString();
-                    p.squadName = squad.name; // <--- NUEVO
-                    p.squadLogo = squad.logo; // <--- NUEVO
+                    myUser.squad = squad._id; p.squad = squad._id.toString(); p.squadName = squad.name; p.squadLogo = squad.logo;
+                    p.squadCanInvite = isLeader || (isMember && squad.members.find(m => m.accountId.toString() === myUser._id.toString()).canInvite);
                     isActive = true;
                 }
 
@@ -2292,7 +2479,7 @@ wss.on('connection', async (ws) => {
                         if (client.playerId === targetWsId && client.readyState === WebSocket.OPEN) {
                             client.send(encode({
                                 type: 'squad_invite',
-                                squadId: squad._id,
+                                squadId: squad._id.toString(), // 🛑 EL FIX 2: Evita enviar como Buffer Binario
                                 squadName: squad.name,
                                 senderUsername: p.username,
                                 senderFrameX: p.frameX,
@@ -2310,12 +2497,15 @@ wss.on('connection', async (ws) => {
         // 21. ACEPTAR INVITACIÓN AL CLAN
         if (data.type === 'accept_squad_invite' && isAuthenticated) {
             try {
-                const squad = await Squad.findById(data.squadId);
+                // 🛑 ESCUDO ANTI-BUFFER
+                const cleanSquadId = data.squadId.buffer ? Buffer.from(data.squadId).toString('hex') : data.squadId.toString();
+
+                const squad = await Squad.findById(cleanSquadId);
                 if (!squad) return ws.send(encode({ type: 'squad_error', message: 'El clan ya no existe.' }));
 
                 const myUser = await User.findOne({ email: currentUser });
 
-                // Regla 1: Límite de miembros (Excluye al líder)
+                // Regla 1: Límite de miembros
                 if (squad.members.length >= 24) return ws.send(encode({ type: 'squad_error', message: 'El clan está lleno.' }));
 
                 // Regla 2: ¿Ya estoy en este clan?
@@ -2323,11 +2513,35 @@ wss.on('connection', async (ws) => {
                 const isLeader = squad.leader.toString() === myUser._id.toString();
 
                 if (!isMember && !isLeader) {
-                    // Lo agregamos como miembro básico
+
+                    // 1. Agregar al jugador a la Base de Datos del Clan
                     squad.members.push({ accountId: myUser._id });
                     await squad.save();
 
-                    ws.send(encode({ type: 'squad_success', message: `¡Te has unido al clan [${squad.name}]!` }));
+                    // 2. 🛑 EL FIX 3: Sellar el Clan en la Base de Datos del Jugador
+                    myUser.squad = squad._id;
+                    await myUser.save();
+
+                    // 3. Actualizar la RAM del servidor
+                    if (players[id]) {
+                        players[id].squad = squad._id.toString();
+                        players[id].squadName = squad.name;
+                        players[id].squadLogo = squad.logo;
+                        players[id].squadCanInvite = false; // Entra sin poderes
+                    }
+
+                    // 4. Avisar al jugador del éxito (Enviando sus nuevos datos)
+                    ws.send(encode({
+                        type: 'squad_success',
+                        message: `¡Te has unido al clan [${squad.name}]!`,
+                        squadName: squad.name,
+                        squadLogo: squad.logo,
+                        squadId: squad._id.toString() // 🛑 EL FIX: Enviar el ID a la RAM
+                    }));
+
+                    // 5. Avisar a todo el mapa que el jugador tiene nuevo Tag
+                    broadcast({ type: 'update', id: id, player: players[id] }, ws);
+
                 } else {
                     ws.send(encode({ type: 'squad_error', message: 'Ya eres miembro de este clan.' }));
                 }
@@ -2473,6 +2687,49 @@ wss.on('connection', async (ws) => {
                 // 🛑 EL FIX: Si por algo falla, que el servidor te avise en pantalla en lugar de ignorarte
                 ws.send(encode({ type: 'system_message', text: "Error: No se encontró basura válida para vender.", color: '#e74c3c' }));
             }
+        }// 28. ACTUALIZAR ROL DE UN MIEMBRO DEL CLAN
+        if (data.type === 'update_squad_member' && isAuthenticated) {
+            try {
+                const myUser = await User.findOne({ email: currentUser });
+                if (!myUser.squad) return;
+
+                const squad = await Squad.findById(myUser.squad);
+                if (!squad) return;
+
+                // 1. Verificar si tengo permisos
+                const isLeader = squad.leader.toString() === myUser._id.toString();
+                const myData = squad.members.find(m => m.accountId.toString() === myUser._id.toString());
+                const iCanAssignRoles = isLeader || (myData && myData.canAssignRoles);
+
+                if (!iCanAssignRoles) return ws.send(encode({ type: 'system_message', text: "No tienes permisos de Administrador en el Clan.", color: "#e74c3c" }));
+
+                // 2. Buscar al miembro que queremos editar
+                const targetMember = squad.members.find(m => m.accountId.toString() === data.targetAccountId);
+                if (!targetMember) return;
+
+                // 3. Aplicar cambios
+                targetMember.customTitle = data.title;
+                targetMember.canInvite = data.canInvite;
+                targetMember.canKick = data.canKick;
+                targetMember.canAssignRoles = data.canAssignRoles;
+
+                await squad.save();
+                ws.send(encode({ type: 'get_squad_details', squadId: squad._id.toString() }));
+
+                // 🛑 NUEVO: Avisarle al miembro afectado en TIEMPO REAL si le cambiaron sus poderes
+                let targetWsId = Object.keys(players).find(key => players[key].accountId === data.targetAccountId);
+                if (targetWsId && players[targetWsId]) {
+                    players[targetWsId].squadCanInvite = data.canInvite;
+                    wss.clients.forEach(c => {
+                        if (c.playerId === targetWsId && c.readyState === WebSocket.OPEN) {
+                            c.send(encode({ type: 'update_permissions', canInvite: data.canInvite }));
+                        }
+                    });
+                }
+
+            } catch (err) {
+                console.error("Error editando roles del squad:", err);
+            }
         } // =========================================================
         // 🛑 NUEVO: VENDER CANTIDAD ESPECÍFICA DE UN ÍTEM INDIVIDUAL (YONKE) 🛑
         // =========================================================
@@ -2569,6 +2826,12 @@ wss.on('connection', async (ws) => {
 
             const hitX = data.hitX;
             const hitY = data.hitY;
+
+            // 🛡️ ANTI-HACK: Validar que la pala alcance la tierra
+            const distToDig = Math.hypot(p.worldX - hitX, p.worldY - hitY);
+            if (distToDig > 80) { // 80 píxeles es un buen margen
+                return; // Ignorar si intenta minar a distancia
+            }
 
             // ==========================================
             // 🛡️ CAPA 2: TIERRA AGOTADA (ANTI-AUTO-CLICK)
@@ -2852,6 +3115,7 @@ wss.on('connection', async (ws) => {
     ws.send(encode({
         type: 'init',
         id: id,
+        playlist: GLOBAL_BGM_PLAYLIST, // 🛑 LA SOLUCIÓN: Le decimos qué canción debe poner apenas entre
         players: players,
         worldMap: allTiles,
         weaponsDB: WEAPONS,
