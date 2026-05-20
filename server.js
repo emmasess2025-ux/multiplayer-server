@@ -42,6 +42,7 @@ const tileSchema = new mongoose.Schema({
     l: { type: Number, default: 0 },
     tileId: Number,
     hasCollision: { type: Boolean, default: false },
+    isSit: { type: Boolean, default: false },
     triggerType: String,
     destX: Number,
     destY: Number,
@@ -96,11 +97,14 @@ const Turf = mongoose.model('Turf', turfSchema);
 // --- ESQUEMA UNIVERSAL DE ZONAS (VECTORES) ---
 const safeZoneSchema = new mongoose.Schema({
     name: { type: String, required: true },
-    zoneType: { type: String, default: 'safe' }, // <--- NUEVO: 'safe', 'trash', 'npc', etc.
+    zoneType: { type: String, default: 'safe' }, // 'safe', 'trash', 'turf', etc.
     xMin: { type: Number, required: true },
     xMax: { type: Number, required: true },
     yMin: { type: Number, required: true },
-    yMax: { type: Number, required: true }
+    yMax: { type: Number, required: true },
+    // 🏴 TURF: punto de spawn al que van los que mueren dentro de esta zona
+    spawnX: { type: Number, default: null },
+    spawnY: { type: Number, default: null }
 });
 const SafeZone = mongoose.model('SafeZone', safeZoneSchema);
 
@@ -198,6 +202,13 @@ async function loadZoneConfigsFromDB() {
         if (!configs.find(c => c.id === 'indoor')) {
             console.log("🏠 Añadiendo nueva zona de Techos a la base de datos...");
             await ZoneConfig.create({ id: "indoor", name: "Interior (Sin Lluvia)", icon: "🏠", colorBorder: "rgba(52, 152, 219, 0.8)", colorFill: "rgba(52, 152, 219, 0.2)" });
+            configs = await ZoneConfig.find({}, { _id: 0, __v: 0 }).lean();
+        }
+
+        // 🏴 Inyectar zona Turf si no existe
+        if (!configs.find(c => c.id === 'turf')) {
+            console.log("🏴 Añadiendo zona Turf (Respawn personalizado) a la base de datos...");
+            await ZoneConfig.create({ id: "turf", name: "Turf (Respawn)", icon: "🏴", colorBorder: "rgba(231, 76, 60, 0.9)", colorFill: "rgba(231, 76, 60, 0.15)" });
             configs = await ZoneConfig.find({}, { _id: 0, __v: 0 }).lean();
         }
 
@@ -313,6 +324,8 @@ const userSchema = new mongoose.Schema({
 });
 
 const User = mongoose.model('User', userSchema);
+
+
 
 // --- ESQUEMA DE LOS SQUADS (CLANES) ---
 
@@ -482,14 +495,15 @@ async function loadWorldMapFromDB() {
         allTiles.forEach(t => {
             const l = t.l || 0;
             serverWorldMap[`${t.x},${t.y},${l}`] = {
+                tileId: t.tileId,
                 hasCollision: t.hasCollision || false,
+                isSit: t.isSit || false,
                 triggerType: t.triggerType,
                 destX: t.destX,
                 destY: t.destY,
                 itemId: t.itemId,
                 itemRow: t.itemRow || 0, // <--- AÑADE ESTO
                 shelfX: t.shelfX || 0,
-
                 shelfY: t.shelfY || 0
             };
 
@@ -669,6 +683,195 @@ function getVisibleChunks(chunkId) {
         `${cx - 1},${cy + 1}`, `${cx},${cy + 1}`, `${cx + 1},${cy + 1}`
     ];
 }
+
+// ==========================================================
+// 💥 SERVER-AUTHORITATIVE COMBAT ENGINE
+// ==========================================================
+let activeProjectiles = [];
+
+function applyDamageToPlayer(targetId, shooterId, weaponId) {
+    const shooter = players[shooterId];
+    const target = players[targetId];
+    if (!shooter || !target || target.isDead) return;
+
+    if (shooter.isSparring && target.isSparring && shooter.currentArena === target.currentArena) {
+        if (shooter.arenaTeam === target.arenaTeam) return;
+    }
+
+    const stats = WEAPONS[weaponId] || { damage: 10 };
+    const now = Date.now();
+
+    // 🛡️ 1. ANTI-METRALLETA DE DAÑO
+    const lastDamage = shooter.lastDamageTime || 0;
+    if (now - lastDamage < ((stats.fireRate || 300) - 50)) return;
+    shooter.lastDamageTime = now;
+
+    // 🥊 Squad protection bypassed during spar
+    const bothSparring = shooter.isSparring && target.isSparring && shooter.currentArena === target.currentArena;
+    if (!bothSparring && shooter.squad && target.squad && shooter.squad === target.squad) return;
+    if (isInSafeZone(shooter.worldX, shooter.worldY) || isInSafeZone(target.worldX, target.worldY)) return;
+    if (target.invulnerableUntil && now < target.invulnerableUntil) return;
+
+    // 🛡️ 3. DAÑO AUTORITATIVO REAL
+    const actualDamage = Number(stats.damage) || 10;
+    target.hp = (Number(target.hp) || 100) - actualDamage;
+    target.lastHitTime = Date.now();
+
+    // 💥 KNOCKBACK
+    let knockbackForce = 0;
+    if (stats.dirStats) {
+        const kbDir = stats.dirStats['0'] || stats.dirStats['1'] || stats.dirStats['2'] || stats.dirStats['3'] || {};
+        knockbackForce = Number(kbDir.kb) || 0;
+    }
+    if (knockbackForce > 0 && !target.isDead) {
+        const angle = Math.atan2(target.worldY - shooter.worldY, target.worldX - shooter.worldX);
+        let stepForce = knockbackForce / 5;
+        for (let i = 0; i < 5; i++) {
+            let nextX = target.worldX + (Math.cos(angle) * stepForce);
+            let nextY = target.worldY + (Math.sin(angle) * stepForce);
+            if (!serverCheckCollision(nextX, nextY)) {
+                target.worldX = nextX;
+                target.worldY = nextY;
+            } else break;
+        }
+        wss.clients.forEach(c => {
+            if (c.playerId === targetId && c.readyState === WebSocket.OPEN) {
+                c.send(encode({ type: 'force_position', x: target.worldX, y: target.worldY, reason: 'knockback' }));
+            }
+        });
+        broadcast({ type: 'update', id: targetId, player: target });
+    }
+
+    // --- SISTEMA DE MUERTE ---
+    if (target.hp <= 0) {
+        target.hp = 0;
+        target.isDead = true;
+        shooter.kills = (shooter.kills || 0) + 1;
+        target.losses = (target.losses || 0) + 1;
+
+        if (target.isSparring && shooter.isSparring && target.currentArena === shooter.currentArena) {
+            const arena = arenasRAM[target.currentArena];
+            if (arena) {
+                if (target.arenaTeam === 1) arena.aliveTeam1--;
+                if (target.arenaTeam === 2) arena.aliveTeam2--;
+
+                if (arena.aliveTeam1 <= 0 || arena.aliveTeam2 <= 0) {
+                    const winningTeam = arena.aliveTeam1 <= 0 ? 2 : 1;
+                    let maxWinnerHp = 0;
+                    if (arena.isRanked) {
+                        const winningPlayers = winningTeam === 1 ? arena.team1 : arena.team2;
+                        winningPlayers.forEach(pid => {
+                            if (players[pid] && !players[pid].isDead && players[pid].hp > maxWinnerHp) {
+                                maxWinnerHp = players[pid].hp;
+                            }
+                        });
+                    }
+                    let eloChange = 5;
+                    if (maxWinnerHp >= 90) eloChange = 10;
+                    else if (maxWinnerHp >= 75) eloChange = 8.5;
+                    else if (maxWinnerHp >= 50) eloChange = 7;
+
+                    [...arena.team1, ...arena.team2].forEach(pid => {
+                        let p = players[pid];
+                        if (p) {
+                            const isWinner = (winningTeam === 1 && arena.team1.includes(pid)) || (winningTeam === 2 && arena.team2.includes(pid));
+                            if (arena.isRanked) {
+                                if (isWinner) p.elo += eloChange; else p.elo -= eloChange;
+                                if (p.elo < 0) p.elo = 0;
+                                User.findByIdAndUpdate(p.accountId, { elo: p.elo }).catch(console.error);
+                            }
+                            p.isSparring = false;
+                            p.arenaTeam = null;
+                            p.currentArena = null;
+                            p.hp = 100;
+                            p.isDead = false;
+                            p.lastHitTime = Date.now();
+                            p.invulnerableUntil = Date.now() + 2000;
+                            p.worldX = p.preSparX;
+                            p.worldY = p.preSparY;
+
+                            let resultMsg = isWinner ? "¡VICTORIA! 🏆" : "DERROTA 💀";
+                            if (arena.isRanked) resultMsg += isWinner ? ` (+${eloChange} Elo)` : ` (-${eloChange} Elo)`;
+                            
+                            wss.clients.forEach(c => {
+                                if (c.playerId === pid && c.readyState === WebSocket.OPEN) {
+                                    c.send(encode({ type: 'match_finished', returnX: p.preSparX, returnY: p.preSparY, result: resultMsg, newElo: p.elo }));
+                                }
+                            });
+                        }
+                    });
+                    arena.isOccupied = false;
+                    arena.team1 = []; arena.team2 = [];
+                    arena.fighter1 = null; arena.fighter2 = null;
+                    broadcast({ type: 'refresh_arena_ui', arenaId: arena.arenaId });
+                } else {
+                    wss.clients.forEach(client => {
+                        if (client.readyState === WebSocket.OPEN) {
+                            client.send(encode({ type: 'hp_update', targetId: targetId, newHp: 0, damageDealt: actualDamage, isDead: true, shooterId: shooterId, shooterKills: shooter.kills, targetLosses: target.losses }));
+                        }
+                    });
+                }
+            }
+        } else {
+            const turfZone = safeZonesRAM.find(z => z.zoneType === 'turf' && z.spawnX != null && z.spawnY != null && target.worldX >= z.xMin && target.worldX <= z.xMax && target.worldY >= z.yMin && target.worldY <= z.yMax);
+            setTimeout(() => {
+                const p = players[targetId];
+                if (p) {
+                    p.hp = 100; p.isDead = false; p.lastHitTime = Date.now(); p.invulnerableUntil = Date.now() + 2000;
+                    let respawnX = null, respawnY = null;
+                    if (turfZone) { p.worldX = turfZone.spawnX; p.worldY = turfZone.spawnY; respawnX = turfZone.spawnX; respawnY = turfZone.spawnY; }
+                    wss.clients.forEach(client => {
+                        if (client.readyState === WebSocket.OPEN) {
+                            client.send(encode({ type: 'hp_update', targetId: targetId, newHp: 100, damageDealt: 0, isDead: false, respawnX, respawnY }));
+                        }
+                    });
+                }
+            }, 3000);
+            broadcastToZone({ type: 'hp_update', targetId: targetId, newHp: target.hp, damageDealt: actualDamage, isDead: true, shooterId: shooterId, shooterKills: shooter.kills, targetLosses: target.losses }, target.chunkId);
+        }
+    } else {
+        wss.clients.forEach(client => {
+            if (client.readyState === WebSocket.OPEN) {
+                client.send(encode({ type: 'hp_update', targetId: targetId, newHp: target.hp, damageDealt: actualDamage, isDead: false, shooterId: shooterId, shooterKills: shooter.kills, targetLosses: target.losses }));
+            }
+        });
+    }
+}
+
+// --- PROJECTILE PHYSICS LOOP ---
+setInterval(() => {
+    const dtScale = 33.3 / 16.666; // approx 2.0 frames per tick
+
+    for (let i = activeProjectiles.length - 1; i >= 0; i--) {
+        let p = activeProjectiles[i];
+        p.x += p.vx * dtScale;
+        p.y += p.vy * dtScale;
+        p.life -= dtScale;
+
+        if (p.life <= 0 || serverCheckCollision(p.x, p.y)) {
+            activeProjectiles.splice(i, 1);
+            continue;
+        }
+
+        let hitSomeone = false;
+        for (let targetId in players) {
+            let target = players[targetId];
+            if (targetId === p.owner || target.isDead || target.chunkId !== p.chunkId) continue;
+            
+            const HITBOX_RADIUS = 14;
+            if (Math.hypot(p.x - target.worldX, p.y - target.worldY) < HITBOX_RADIUS) {
+                hitSomeone = true;
+                applyDamageToPlayer(targetId, p.owner, p.weapon);
+                break;
+            }
+        }
+
+        if (hitSomeone) {
+            activeProjectiles.splice(i, 1);
+        }
+    }
+}, 33);
+// ==========================================================
 
 // The New Targeted Broadcast (AoI)
 function broadcastToZone(data, targetChunkId, excludeWs = null) {
@@ -1017,12 +1220,14 @@ wss.on('connection', async (ws) => {
                     query.l = data.layer;
                 }
 
-                const updateData = { hasCollision: data.hasCollision, l: data.layer };
+                const updateData = { hasCollision: data.hasCollision, isSit: data.isSit, l: data.layer };
 
                 // --- NUEVO: ACTUALIZAR LA RAM DEL SERVIDOR EN TIEMPO REAL ---
                 const key = `${data.x},${data.y},${data.layer}`;
                 if (!serverWorldMap[key]) serverWorldMap[key] = {};
                 serverWorldMap[key].hasCollision = data.hasCollision;
+                serverWorldMap[key].isSit = data.isSit;
+                serverWorldMap[key].l = data.layer;
 
                 if (data.triggerType) {
                     updateData.triggerType = data.triggerType;
@@ -1129,6 +1334,7 @@ wss.on('connection', async (ws) => {
                     arenasRAM[uniqueArenaId].p2Y = dbArena.p2Y;
                     arenasRAM[uniqueArenaId].doorX = data.x; // Donde está el letrero para salir
                     arenasRAM[uniqueArenaId].doorY = data.y;
+                    arenasRAM[uniqueArenaId].isRanked = dbArena.isRanked;
 
                     console.log(`🥊 Arena Guardada en vivo: ${dbArena.name}`);
                 } else if (data.triggerType !== undefined) {
@@ -1147,7 +1353,7 @@ wss.on('connection', async (ws) => {
                     if (client !== ws && client.readyState === WebSocket.OPEN) {
                         client.send(encode({
                             type: 'tile_meta_update',
-                            x: data.x, y: data.y, layer: data.layer, hasCollision: data.hasCollision,
+                            x: data.x, y: data.y, layer: data.layer, hasCollision: data.hasCollision, isSit: data.isSit,
                             triggerType: data.triggerType, destX: data.destX, destY: data.destY,
                             itemId: data.itemId,
                             requiresClick: data.requiresClick,
@@ -1232,7 +1438,10 @@ wss.on('connection', async (ws) => {
                     name: data.name,
                     zoneType: data.zoneType || 'safe',
                     xMin: data.xMin, xMax: data.xMax,
-                    yMin: data.yMin, yMax: data.yMax
+                    yMin: data.yMin, yMax: data.yMax,
+                    // 🏴 TURF: guardar el punto de spawn si lo manda el cliente
+                    spawnX: (data.spawnX != null) ? Number(data.spawnX) : null,
+                    spawnY: (data.spawnY != null) ? Number(data.spawnY) : null
                 });
                 await newZone.save();
 
@@ -1420,11 +1629,16 @@ wss.on('connection', async (ws) => {
             // EL FIX: Agregamos !isLegalTeleport para que no lo castigue si usó una puerta
             if (!isAdmin && !isLegalTeleport && (dist > MAX_ALLOWED_DIST || isColliding)) {
 
-                // 🚔 ¡HACKER DETECTADO! 
+                // Distinguir: ¿colisión limpia con pared o speedhack real?
+                // 'wall'     → el cliente se reposiciona silenciosamente, sin flash rojo
+                // 'antihack' → el cliente muestra flash rojo y resetea velocidad
+                const rejectReason = isColliding ? 'wall' : 'antihack';
+
                 ws.send(encode({
                     type: 'force_position',
                     x: p.worldX,
-                    y: p.worldY
+                    y: p.worldY,
+                    reason: rejectReason
                 }));
 
             } else {
@@ -1602,255 +1816,103 @@ wss.on('connection', async (ws) => {
             }
 
             // 🛑 EL FIX 4: Reenviar usando weaponId para que tu oponente dibuje la bala y escuche tu disparo
-            broadcastToZone({ type: 'shoot', id: id, x: data.x, y: data.y, angle: data.angle, weaponId: weaponId }, shooter.chunkId, ws);
-        }// 👇 NUEVO: Lógica para escopetas (Múltiples balas en 1 mensaje) 👇
+            broadcastToZone({ type: 'shoot', id: id, x: data.x, y: data.y, angle: data.angle, weaponId: weaponId, t: now }, shooter.chunkId, ws);
+            
+            if (stats && stats.type !== 'melee') {
+                activeProjectiles.push({
+                    x: data.x,
+                    y: data.y,
+                    vx: Math.cos(data.angle) * stats.speed,
+                    vy: Math.sin(data.angle) * stats.speed,
+                    life: stats.range,
+                    owner: id,
+                    weapon: weaponId,
+                    chunkId: shooter.chunkId
+                });
+            }
+        }
+        // 7b. DISPARAR (ESCOPETA)
         if (data.type === 'shoot_shotgun') {
             const p = players[id];
-            const stats = WEAPONS[data.weaponId];
-            if (!p || !stats || isInSafeZone(p.worldX, p.worldY)) return;
-
-            const now = Date.now();
-            // 🛡️ ANTI-HACK: Control de Spam
-            if (now - (p.lastShotTime || 0) < ((stats.fireRate || 300) - 50)) return;
-            p.lastShotTime = now;
-
-            // 🛡️ ANTI-HACK: Control de Balas Mágicas
-            if (stats.type === 'ranged') {
-                if (p.weaponAmmo[data.weaponId] === undefined) p.weaponAmmo[data.weaponId] = stats.magSize;
-                if (p.weaponAmmo[data.weaponId] <= 0) return;
-                p.weaponAmmo[data.weaponId]--;
-            }
-
-            broadcastToZone({
-                type: 'shoot_shotgun', id: id, x: data.x, y: data.y, angles: data.angles, weaponId: data.weaponId
-            }, p.chunkId, ws);
-        }
-        // 8. MANEJAR EL DAÑO Y LA VIDA (CON ESCUDO ANTI-CHEAT DEFINITIVO)
-        if (data.type === 'damage_player') {
-            const shooter = players[id];
-            const target = players[data.targetId];
-
-            if (shooter.isSparring && target.isSparring && shooter.currentArena === target.currentArena) {
-                if (shooter.arenaTeam === target.arenaTeam) return;
-            }
-
-            if (shooter && target && !target.isDead) {
-                const weaponId = data.weaponId || shooter.equippedWeapon || "none";
-                const stats = WEAPONS[weaponId];
-                if (!stats || weaponId === "none") return;
-
-                const now = Date.now();
-
-                // 🛡️ 1. ANTI-METRALLETA DE DAÑO
-                const lastDamage = shooter.lastDamageTime || 0;
-                if (now - lastDamage < ((stats.fireRate || 300) - 50)) return;
-                shooter.lastDamageTime = now;
-
-                // 🛡️ 2. RANGO ESTRICTO EN SERVIDOR (Cero disparos desde la base)
-                const dist = Math.hypot(shooter.worldX - target.worldX, shooter.worldY - target.worldY);
-                const maxDist = stats.type === 'melee' ? (stats.dirStats?.[0]?.hitLen || 60) * 2 : (stats.range * stats.speed) * 1.5;
-                if (dist > maxDist && stats.type !== 'melee') {
-                    console.warn(`[ANTI-HACK] ${shooter.username} atacó a ${target.username} fuera de rango.`);
-                    return; // 🛑 HACK DE RANGO DETECTADO
-                }
-
-                if (shooter.squad && target.squad && shooter.squad === target.squad) return;
-                if (isInSafeZone(shooter.worldX, shooter.worldY) || isInSafeZone(target.worldX, target.worldY)) return;
-                if (target.invulnerableUntil && now < target.invulnerableUntil) return;
-
-                // 🛡️ 3. DAÑO AUTORITATIVO REAL (El servidor hace la resta)
-                const actualDamage = Number(stats.damage) || 10;
-                target.hp = (Number(target.hp) || 100) - actualDamage;
-                target.lastHitTime = Date.now();
-
-                // 💥 SISTEMA DE EMPUJE (KNOCKBACK AL ENEMIGO CON COLISIONES) 💥
-                let knockbackForce = 0;
-                if (stats.dirStats) {
-                    const kbDir = stats.dirStats['0'] || stats.dirStats['1'] || stats.dirStats['2'] || stats.dirStats['3'] || {};
-                    knockbackForce = Number(kbDir.kb) || 0;
-                }
-
-                if (knockbackForce > 0 && !target.isDead) {
-                    const angle = Math.atan2(target.worldY - shooter.worldY, target.worldX - shooter.worldX);
-
-                    let stepForce = knockbackForce / 5;
-                    for (let i = 0; i < 5; i++) {
-                        let nextX = target.worldX + (Math.cos(angle) * stepForce);
-                        let nextY = target.worldY + (Math.sin(angle) * stepForce);
-
-                        if (!serverCheckCollision(nextX, nextY)) {
-                            target.worldX = nextX;
-                            target.worldY = nextY;
-                        } else {
-                            break;
-                        }
-                    }
-
-                    // Avisar a la cámara de la víctima
-                    wss.clients.forEach(c => {
-                        if (c.playerId === data.targetId && c.readyState === WebSocket.OPEN) {
-                            c.send(encode({
-                                type: 'force_position',
-                                x: target.worldX,
-                                y: target.worldY,
-                                reason: 'knockback'
-                            }));
-                        }
-                    });
-
-                    broadcast({ type: 'update', id: data.targetId, player: target });
-                }
-
-                // --- SISTEMA DE MUERTE (DERRIBADO) ---
-                if (target.hp <= 0) {
-                    target.hp = 0;
-                    target.isDead = true;
-
-                    shooter.kills = (shooter.kills || 0) + 1;
-                    target.losses = (target.losses || 0) + 1;
-
-                    // 🥊 LÓGICA DE ARENA: ¿Están peleando un Match de Sparring?
-                    if (target.isSparring && shooter.isSparring && target.currentArena === shooter.currentArena) {
-                        const arena = arenasRAM[target.currentArena];
-
-                        if (arena) {
-                            // Restar un vivo al equipo del que acaba de morir
-                            if (target.arenaTeam === 1) arena.aliveTeam1--;
-                            if (target.arenaTeam === 2) arena.aliveTeam2--;
-
-                            // ¿Se acabó la pelea? (Todo un equipo llegó a 0)
-                            if (arena.aliveTeam1 <= 0 || arena.aliveTeam2 <= 0) {
-                                const winningTeam = arena.aliveTeam1 <= 0 ? 2 : 1;
-
-                                // --- 🏆 MATEMÁTICAS DE ELO 🏆 ---
-                                // Buscar al "Carreador" (El jugador vivo con más HP del equipo ganador)
-                                let maxWinnerHp = 0;
-                                if (arena.isRanked) {
-                                    const winningPlayers = winningTeam === 1 ? arena.team1 : arena.team2;
-                                    winningPlayers.forEach(pid => {
-                                        if (players[pid] && !players[pid].isDead && players[pid].hp > maxWinnerHp) {
-                                            maxWinnerHp = players[pid].hp;
-                                        }
-                                    });
-                                }
-
-                                // Fórmula de Ganancia:
-                                let eloChange = 5;
-                                if (maxWinnerHp >= 90) eloChange = 10;
-                                else if (maxWinnerHp >= 75) eloChange = 8.5;
-                                else if (maxWinnerHp >= 50) eloChange = 7;
-
-                                // Procesar a TODOS los jugadores (los que jugaron este match)
-                                [...arena.team1, ...arena.team2].forEach(pid => {
-                                    let p = players[pid];
-                                    if (p) {
-                                        const isWinner = (winningTeam === 1 && arena.team1.includes(pid)) || (winningTeam === 2 && arena.team2.includes(pid));
-
-                                        // 🏆 Aplicar Elo si es Ranked
-                                        if (arena.isRanked) {
-                                            if (isWinner) p.elo += eloChange;
-                                            else p.elo -= eloChange;
-
-                                            if (p.elo < 0) p.elo = 0; // No bajar de 0
-
-                                        }
-
-                                        p.isSparring = false;
-                                        p.arenaTeam = null;
-                                        p.currentArena = null;
-                                        p.hp = 100; // Curarlos y revivirlos para el regreso
-                                        p.isDead = false;
-                                        p.lastHitTime = Date.now();
-                                        p.invulnerableUntil = Date.now() + 2000;
-                                        p.worldX = p.preSparX;
-                                        p.worldY = p.preSparY;
-
-                                        let resultMsg = isWinner ? "¡VICTORIA! 🏆" : "DERROTA 💀";
-                                        if (arena.isRanked) {
-                                            resultMsg += isWinner ? ` (+${eloChange} Elo)` : ` (-${eloChange} Elo)`;
-                                        }
-
-                                        // 🛫 MÁNDALOS DE VUELTA A DONDE TOCARON EL LETRERO
-                                        wss.clients.forEach(c => {
-                                            if (c.playerId === pid && c.readyState === WebSocket.OPEN) {
-                                                // 🛑 EL FIX: Enviamos también el nuevo Elo al cliente
-                                                c.send(encode({ type: 'match_finished', returnX: p.preSparX, returnY: p.preSparY, result: resultMsg, newElo: p.elo }));
-                                            }
-                                        });
-                                    }
-                                });
-
-                                // Liberar la arena para los siguientes en la fila
-                                arena.isOccupied = false;
-                                arena.team1 = [];
-                                arena.team2 = [];
-                                arena.fighter1 = null;
-                                arena.fighter2 = null;
-                                broadcast({ type: 'refresh_arena_ui', arenaId: arena.arenaId });
-                            } else {
-                                // Si es un 2v2 o 3v3 y solo murió uno, enviamos la actualización de muerte normal (se queda como fantasma hasta que acabe el round)
-                                wss.clients.forEach(client => {
-                                    if (client.readyState === WebSocket.OPEN) {
-                                        client.send(encode({
-                                            type: 'hp_update', targetId: data.targetId, newHp: 0, damageDealt: actualDamage, isDead: true,
-                                            shooterId: id, shooterKills: shooter.kills, targetLosses: target.losses
-                                        }));
-                                    }
-                                });
-                            }
-                        }
-                    } else {
-                        // 💀 MUERTE NORMAL EN EL MUNDO ABIERTO
-
-                        // Revivir al jugador después de 3 segundos
-                        setTimeout(() => {
-                            if (players[data.targetId]) {
-                                players[data.targetId].hp = 100;
-                                players[data.targetId].isDead = false;
-                                players[data.targetId].lastHitTime = Date.now();
-                                players[data.targetId].invulnerableUntil = Date.now() + 100;
-
-                                wss.clients.forEach(client => {
-                                    if (client.readyState === WebSocket.OPEN) {
-                                        client.send(encode({
-                                            type: 'hp_update', targetId: data.targetId,
-                                            newHp: 100, damageDealt: 0, isDead: false
-                                        }));
-                                    }
-                                });
-                            }
-                        }, 3000);
-
-                        // 🎯 SEND HP UPDATES ONLY TO OBSERVERS
-                        broadcastToZone({
-                            type: 'hp_update', targetId: data.targetId, newHp: target.hp, damageDealt: actualDamage, isDead: true,
-                            shooterId: id, shooterKills: shooter.kills, targetLosses: target.losses
-                        }, target.chunkId);
-                    }
-                } else {
-                    // SI NO MURIÓ, SOLO ENVIAMOS LA ACTUALIZACIÓN DE VIDA NORMAL A TODOS
-                    wss.clients.forEach(client => {
-                        if (client.readyState === WebSocket.OPEN) {
-                            client.send(encode({
-                                type: 'hp_update', targetId: data.targetId, newHp: target.hp, damageDealt: actualDamage, isDead: false,
-                                shooterId: id, shooterKills: shooter.kills, targetLosses: target.losses
-                            }));
-                        }
-                    });
-                }
-            }
-        }
-        // --- 1. SINCRONIZAR ANIMACIÓN MELEE ---
-        if (data.type === 'melee_swing') {
-            const p = players[id];
             if (!p) return;
+            const now = Date.now();
+            
+            broadcastToZone({
+                type: 'shoot_shotgun', id: id, x: data.x, y: data.y, angles: data.angles, weaponId: data.weaponId, t: now
+            }, p.chunkId, ws);
+
+            const stats = WEAPONS[data.weaponId];
+            if (stats && stats.type !== 'melee') {
+                for (let a of data.angles) {
+                    activeProjectiles.push({
+                        x: data.x,
+                        y: data.y,
+                        vx: Math.cos(a) * stats.speed,
+                        vy: Math.sin(a) * stats.speed,
+                        life: stats.range,
+                        owner: id,
+                        weapon: data.weaponId,
+                        chunkId: p.chunkId
+                    });
+                }
+            }
+        }
+        // --- 1. SINCRONIZAR ANIMACIÓN MELEE Y CALCULAR DAÑO ---
+        if (data.type === 'melee_swing') {
+            const shooter = players[id];
+            if (!shooter || shooter.isDead) return;
+
+            const weaponId = data.weaponId || "none";
+            const currentWeaponStats = WEAPONS[weaponId] || WEAPONS["none"] || { type: 'melee' };
+
+            // Anti-metralleta melee
+            const now = Date.now();
+            const lastDamage = shooter.lastDamageTime || 0;
+            if (now - lastDamage < ((currentWeaponStats.fireRate || 300) - 50)) return;
+            shooter.lastDamageTime = now;
 
             // 🎯 SEND SWING ANIMATION ONLY TO LOCAL CHUNK
             broadcastToZone({
-                type: 'player_swing',  // The client listens for 'player_swing', not 'shoot'
+                type: 'player_swing',
                 id: id,
-                weaponId: data.weaponId
-            }, p.chunkId, ws);
+                weaponId: weaponId
+            }, shooter.chunkId, ws);
+
+            // 💥 SERVER-AUTHORITATIVE MELEE HIT DETECTION 💥
+            const dir = shooter.frameY || 0;
+            let aimAngle = 0; let dirMult = 1;
+            if (dir === 0) aimAngle = Math.PI / 2;
+            else if (dir === 1) { aimAngle = Math.PI; dirMult = -1; }
+            else if (dir === 2) { aimAngle = 0; }
+            else if (dir === 3) { aimAngle = -Math.PI / 2; dirMult = -1; }
+
+            const d = currentWeaponStats.dirStats ? (currentWeaponStats.dirStats[dir] || {}) : {};
+            const hitRotRad = (d.hitRot || 0) * Math.PI / 180;
+            const trueHitAngle = aimAngle + (hitRotRad * dirMult);
+            const halfWidRad = ((d.hitWid || 60) / 2) * Math.PI / 180;
+            const hitRange = d.hitLen || 40;
+
+            const hitOriginX = shooter.worldX + (d.hitX || 0);
+            const hitOriginY = shooter.worldY + (d.hitY || 0);
+
+            for (let targetId in players) {
+                if (targetId === id) continue;
+                let enemy = players[targetId];
+                if (enemy.worldX !== undefined && !enemy.isDead && enemy.chunkId === shooter.chunkId) {
+                    const dist = Math.hypot(enemy.worldX - hitOriginX, enemy.worldY - hitOriginY);
+                    if (dist <= hitRange) {
+                        const angleToEnemy = Math.atan2(enemy.worldY - hitOriginY, enemy.worldX - hitOriginX);
+                        let angleDiff = angleToEnemy - trueHitAngle;
+
+                        while (angleDiff <= -Math.PI) angleDiff += Math.PI * 2;
+                        while (angleDiff > Math.PI) angleDiff -= Math.PI * 2;
+
+                        if (Math.abs(angleDiff) <= halfWidRad) {
+                            applyDamageToPlayer(targetId, id, weaponId);
+                        }
+                    }
+                }
+            }
         }
 
         // 9. ENVIAR MENSAJE PRIVADO
