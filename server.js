@@ -822,7 +822,7 @@ function applyDamageToPlayer(targetId, shooterId, weaponId) {
                     if (turfZone) { p.worldX = turfZone.spawnX; p.worldY = turfZone.spawnY; respawnX = turfZone.spawnX; respawnY = turfZone.spawnY; }
                     wss.clients.forEach(client => {
                         if (client.readyState === WebSocket.OPEN) {
-                            client.send(encode({ type: 'hp_update', targetId: targetId, newHp: 100, damageDealt: 0, isDead: false, respawnX, respawnY }));
+                            client.send(encode({ type: 'hp_update', targetId: targetId, newHp: 100, damageDealt: 0, isDead: false, respawnX, respawnY, shieldUntil: p.invulnerableUntil }));
                         }
                     });
                 }
@@ -856,7 +856,7 @@ setInterval(() => {
         let hitSomeone = false;
         for (let targetId in players) {
             let target = players[targetId];
-            if (targetId === p.owner || target.isDead || target.chunkId !== p.chunkId) continue;
+            if (targetId === p.owner || target.isDead) continue;
             
             const HITBOX_RADIUS = 14;
             if (Math.hypot(p.x - target.worldX, p.y - target.worldY) < HITBOX_RADIUS) {
@@ -1948,6 +1948,13 @@ wss.on('connection', async (ws) => {
                     if (players[pid].accountId === targetAccountId) targetWsId = pid;
                 }
 
+                // 🛡️ Convert Mongoose docs to plain objects before encoding (avoids 'Too deep' error)
+                const plainMessages = conv.messages.map(m => ({
+                    senderId: m.senderId ? m.senderId.toString() : '',
+                    text: m.text || '',
+                    _id: m._id ? m._id.toString() : ''
+                }));
+
                 if (targetWsId) {
                     wss.clients.forEach(client => {
                         if (client.playerId === targetWsId && client.readyState === WebSocket.OPEN) {
@@ -1955,13 +1962,14 @@ wss.on('connection', async (ws) => {
                                 type: 'receive_pm',
                                 senderAccountId: myAccountId,
                                 senderUsername: players[id].username,
-                                history: conv.messages
+                                history: plainMessages
                             }));
                         }
                     });
                 }
 
-                ws.send(encode({ type: 'pm_history', targetAccountId: targetAccountId, targetUsername: data.targetUsername, history: conv.messages }));
+                // Also confirm back to the sender so message shows immediately
+                ws.send(encode({ type: 'pm_history', targetAccountId: targetAccountId, targetUsername: data.targetUsername, history: plainMessages }));
             } catch (err) { console.error("Error en PM:", err); }
         }
 
