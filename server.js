@@ -701,11 +701,6 @@ function applyDamageToPlayer(targetId, shooterId, weaponId) {
     const stats = WEAPONS[weaponId] || { damage: 10 };
     const now = Date.now();
 
-    // 🛡️ 1. ANTI-METRALLETA DE DAÑO
-    const lastDamage = shooter.lastDamageTime || 0;
-    if (now - lastDamage < ((stats.fireRate || 300) - 50)) return;
-    shooter.lastDamageTime = now;
-
     // 🥊 Squad protection bypassed during spar
     const bothSparring = shooter.isSparring && target.isSparring && shooter.currentArena === target.currentArena;
     if (!bothSparring && shooter.squad && target.squad && shooter.squad === target.squad) return;
@@ -858,7 +853,9 @@ setInterval(() => {
             let target = players[targetId];
             if (targetId === p.owner || target.isDead) continue;
             
-            const HITBOX_RADIUS = 14;
+            // ⚡ THE FIX: Increased from 14 to 22. 
+            // Gives a margin of error for network latency so bullets that visually hit on client don't miss on server.
+            const HITBOX_RADIUS = 22;
             if (Math.hypot(p.x - target.worldX, p.y - target.worldY) < HITBOX_RADIUS) {
                 hitSomeone = true;
                 applyDamageToPlayer(targetId, p.owner, p.weapon);
@@ -1819,12 +1816,18 @@ wss.on('connection', async (ws) => {
             broadcastToZone({ type: 'shoot', id: id, x: data.x, y: data.y, angle: data.angle, weaponId: weaponId, t: now }, shooter.chunkId, ws);
             
             if (stats && stats.type !== 'melee') {
+                // ⚡ LAG COMPENSATION: Advance bullet by 50ms of travel time (1.5 server frames)
+                // This puts the server bullet exactly where the shooter's visual bullet is right now.
+                const latencyAdvance = 50 / 33.0; // 50ms average ping / 33ms per tick
+                const bVx = Math.cos(data.angle) * stats.speed;
+                const bVy = Math.sin(data.angle) * stats.speed;
+
                 activeProjectiles.push({
-                    x: data.x,
-                    y: data.y,
-                    vx: Math.cos(data.angle) * stats.speed,
-                    vy: Math.sin(data.angle) * stats.speed,
-                    life: stats.range,
+                    x: data.x + (bVx * latencyAdvance),
+                    y: data.y + (bVy * latencyAdvance),
+                    vx: bVx,
+                    vy: bVy,
+                    life: stats.range - latencyAdvance,
                     owner: id,
                     weapon: weaponId,
                     chunkId: shooter.chunkId
@@ -1843,13 +1846,16 @@ wss.on('connection', async (ws) => {
 
             const stats = WEAPONS[data.weaponId];
             if (stats && stats.type !== 'melee') {
+                const latencyAdvance = 50 / 33.0; // 50ms lag compensation
                 for (let a of data.angles) {
+                    const bVx = Math.cos(a) * stats.speed;
+                    const bVy = Math.sin(a) * stats.speed;
                     activeProjectiles.push({
-                        x: data.x,
-                        y: data.y,
-                        vx: Math.cos(a) * stats.speed,
-                        vy: Math.sin(a) * stats.speed,
-                        life: stats.range,
+                        x: data.x + (bVx * latencyAdvance),
+                        y: data.y + (bVy * latencyAdvance),
+                        vx: bVx,
+                        vy: bVy,
+                        life: stats.range - latencyAdvance,
                         owner: id,
                         weapon: data.weaponId,
                         chunkId: p.chunkId
@@ -1895,10 +1901,11 @@ wss.on('connection', async (ws) => {
             const hitOriginX = shooter.worldX + (d.hitX || 0);
             const hitOriginY = shooter.worldY + (d.hitY || 0);
 
+            const visibleChunks = getVisibleChunks(shooter.chunkId);
             for (let targetId in players) {
                 if (targetId === id) continue;
                 let enemy = players[targetId];
-                if (enemy.worldX !== undefined && !enemy.isDead && enemy.chunkId === shooter.chunkId) {
+                if (enemy.worldX !== undefined && !enemy.isDead && visibleChunks.includes(enemy.chunkId)) {
                     const dist = Math.hypot(enemy.worldX - hitOriginX, enemy.worldY - hitOriginY);
                     if (dist <= hitRange) {
                         const angleToEnemy = Math.atan2(enemy.worldY - hitOriginY, enemy.worldX - hitOriginX);
