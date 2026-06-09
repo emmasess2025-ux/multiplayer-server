@@ -33,6 +33,7 @@ mongoose.connect(MONGO_URI)
         // 🛑 EL FIX: Solo llamamos al Catálogo Maestro. 
         // Ya no cargamos Weapons ni Trash por separado.
         loadMasterCatalog();
+        loadTasksFromDB();
     })
     .catch(err => console.error('MongoDB Connection Error:', err));
 
@@ -287,6 +288,24 @@ async function loadPatchNotesFromDB() {
     }
 }
 
+// --- THE TASK (ACHIEVEMENTS) BLUEPRINT ---
+const taskSchema = new mongoose.Schema({
+    taskId: { type: String, required: true, unique: true }, // e.g., 'daily_login', 'squad_10_hours'
+    title: { type: String, required: true },
+    description: { type: String },
+    
+    category: { type: String, enum: ['daily', 'squad', 'milestone', 'event'], default: 'daily' },
+    requirementType: { type: String, enum: ['login', 'play_hours', 'kills', 'elo'], default: 'login' },
+    requirementValue: { type: Number, required: true },
+    
+    rewardType: { type: String, enum: ['coins', 'item'], default: 'coins' },
+    rewardValue: { type: mongoose.Schema.Types.Mixed, required: true },
+    
+    isRepeatable: { type: Boolean, default: false },
+    resetIntervalMs: { type: Number, default: 0 } // 86400000 for daily
+});
+const Task = mongoose.model('Task', taskSchema);
+
 // --- THE PLAYER BLUEPRINT (SCHEMA) ---
 const userSchema = new mongoose.Schema({
     email: { type: String, required: true, unique: true },
@@ -320,7 +339,11 @@ const userSchema = new mongoose.Schema({
     // --- NUEVO: SISTEMA DE ROLES ---
     role: { type: String, default: 'player' }, // Todos nacen como 'player' por defecto, pero podrías tener 'admin', 'moderator', etc. y manejar permisos en el futuro.
     // ... tus otros campos (coins, friends, etc)
-    squad: { type: mongoose.Schema.Types.ObjectId, ref: 'Squad', default: null } // <--- NUEVO
+    squad: { type: mongoose.Schema.Types.ObjectId, ref: 'Squad', default: null }, // <--- NUEVO
+    
+    // --- NUEVO: SISTEMA DE TAREAS Y LOGROS ---
+    taskProgress: { type: mongoose.Schema.Types.Mixed, default: {} },
+    claimedTasks: { type: mongoose.Schema.Types.Mixed, default: {} }
 });
 
 const User = mongoose.model('User', userSchema);
@@ -337,7 +360,8 @@ const squadMemberSchema = new mongoose.Schema({
     // Los permisos granulares que pediste
     canInvite: { type: Boolean, default: false },      // Puede contratar personal
     canKick: { type: Boolean, default: false },        // Puede sacar personal
-    canAssignRoles: { type: Boolean, default: false }  // Puede dar atributos a otros (Full Admin)
+    canAssignRoles: { type: Boolean, default: false },  // Puede dar atributos a otros (Full Admin)
+    joinedAt: { type: Date, default: Date.now }        // Anti-cheat para recompensas de clan
 }, { _id: false }); // _id: false evita que MongoDB le cree un ID extra a cada fila del arreglo
 
 // El esquema principal del Squad
@@ -360,7 +384,9 @@ const squadSchema = new mongoose.Schema({
     territoryTimeMinutes: { type: Number, default: 0 },
     // 👇 NUEVOS CAMPOS PARA LOS RANKINGS ROTATIVOS 👇
     dailyTimeMinutes: { type: Number, default: 0 },
-    weeklyTimeMinutes: { type: Number, default: 0 }
+    weeklyTimeMinutes: { type: Number, default: 0 },
+    // NUEVO: SEGUIMIENTO DE CUANDO SE ALCANZAN LAS METAS (ANTI-CHEAT)
+    milestonesAchieved: { type: Map, of: Date, default: {} }
 });
 
 const Squad = mongoose.model('Squad', squadSchema);
@@ -399,6 +425,88 @@ const itemSchema = new mongoose.Schema({
 });
 
 const Item = mongoose.model('Item', itemSchema);
+
+// --- 🌟 NUEVO: TAREAS Y LOGROS GLOBALES 🌟 ---
+let GLOBAL_TASKS = {};
+async function loadTasksFromDB() {
+    try {
+        const tasks = await Task.find({}).lean();
+        if (tasks.length === 0) {
+            // Inyectar tareas por defecto si la base de datos está vacía
+            const defaultTasks = [
+                {
+                    taskId: 'daily_login',
+                    title: 'Daily Login Bonus',
+                    description: 'Log in to the game to receive your daily coins.',
+                    category: 'daily',
+                    requirementType: 'login',
+                    requirementValue: 1,
+                    rewardType: 'coins',
+                    rewardValue: 500,
+                    isRepeatable: true,
+                    resetIntervalMs: 86400000 // 24 hours
+                },
+                {
+                    taskId: 'first_blood',
+                    title: 'First Blood',
+                    description: 'Get your first kill in the game.',
+                    category: 'milestone',
+                    requirementType: 'kills',
+                    requirementValue: 1,
+                    rewardType: 'item',
+                    rewardValue: 'head_default', // Example item reward
+                    isRepeatable: false,
+                    resetIntervalMs: 0
+                },
+                {
+                    taskId: 'squad_base_10h',
+                    title: 'Warlords of Argon',
+                    description: 'Your squad has held the Central Base for 10 accumulated hours.',
+                    category: 'squad',
+                    requirementType: 'squad_base_minutes',
+                    requirementValue: 600, // 600 minutes = 10 hours
+                    rewardType: 'coins',
+                    rewardValue: 5000,
+                    isRepeatable: false,
+                    resetIntervalMs: 0
+                }
+            ];
+            await Task.insertMany(defaultTasks);
+            defaultTasks.forEach(t => GLOBAL_TASKS[t.taskId] = t);
+            console.log("Injected default tasks.");
+        } else {
+            GLOBAL_TASKS = {};
+            tasks.forEach(t => GLOBAL_TASKS[t.taskId] = t);
+            console.log(`Loaded ${tasks.length} tasks from DB.`);
+        }
+        
+        // --- INICIALIZAR METAS LEGACY PARA SQUADS EXISTENTES ---
+        try {
+            const allSquads = await Squad.find({});
+            let modified = 0;
+            const now = Date.now();
+            for (let sq of allSquads) {
+                let changed = false;
+                if (!sq.milestonesAchieved) sq.milestonesAchieved = new Map();
+                for (let taskId in GLOBAL_TASKS) {
+                    const task = GLOBAL_TASKS[taskId];
+                    if (task.requirementType === 'squad_base_minutes') {
+                        if (sq.territoryTimeMinutes >= task.requirementValue && !sq.milestonesAchieved.has(taskId)) {
+                            sq.milestonesAchieved.set(taskId, now);
+                            changed = true;
+                        }
+                    }
+                }
+                if (changed) {
+                    await sq.save();
+                    modified++;
+                }
+            }
+            console.log(`Initialized legacy milestones for ${modified} squads.`);
+        } catch (err) { console.error("Error initializing legacy milestones:", err); }
+
+    } catch (err) { console.error("Error loading tasks:", err); }
+}
 
 let MASTER_CATALOG = {};
 let WEAPONS = {};
@@ -1018,6 +1126,22 @@ wss.on('connection', async (ws) => {
                 players[id].hp = user.hp !== undefined ? user.hp : 100;
                 players[id].isDead = user.isDead || false;
 
+                // --- 🌟 NUEVO: CARGAR TAREAS Y LOGROS A LA RAM 🌟 ---
+                players[id].taskProgress = {};
+                players[id].claimedTasks = {};
+                
+                const parseMongoMap = (source, target, isDate) => {
+                    if (!source) return;
+                    if (source instanceof Map) {
+                        source.forEach((v, k) => target[k] = isDate ? new Date(v).getTime() : Number(v));
+                    } else {
+                        Object.entries(source).forEach(([k, v]) => target[k] = isDate ? new Date(v).getTime() : Number(v));
+                    }
+                };
+                const rawUser = user.toObject();
+                parseMongoMap(rawUser.taskProgress, players[id].taskProgress, false);
+                parseMongoMap(rawUser.claimedTasks, players[id].claimedTasks, true);
+
                 // 🛑 EL FIX: REINICIAR EL TEMPORIZADOR DE COMBATE AL ENTRAR 🛑
                 // Esto evita que los que recargan la página se curen mágicamente
                 players[id].lastHitTime = Date.now();
@@ -1055,8 +1179,12 @@ wss.on('connection', async (ws) => {
                     type: 'login_success',
                     player: players[id],
                     token: newToken,
-                    friends: user.friends
+                    friends: user.friends,
+                    globalTasks: GLOBAL_TASKS,
+                    taskProgress: players[id].taskProgress,
+                    claimedTasks: players[id].claimedTasks
                 }));
+                console.log(`[LOGIN_SUCCESS] Sending claimedTasks for ${user.email}:`, players[id].claimedTasks);
 
                 // Move the closing bracket so 'ws' is the second argument!
                 broadcast({ type: 'update', id: id, player: players[id] }, ws);
@@ -1524,6 +1652,23 @@ wss.on('connection', async (ws) => {
                 players[id].hp = user.hp !== undefined ? user.hp : 100;
                 players[id].isDead = user.isDead || false;
 
+                // --- 🌟 NUEVO: CARGAR TAREAS Y LOGROS A LA RAM (AUTO LOGIN) 🌟 ---
+                players[id].taskProgress = {};
+                players[id].claimedTasks = {};
+                
+                const parseMongoMapAuto = (source, target, isDate) => {
+                    if (!source) return;
+                    if (source instanceof Map) {
+                        source.forEach((v, k) => target[k] = isDate ? new Date(v).getTime() : Number(v));
+                    } else {
+                        Object.entries(source).forEach(([k, v]) => target[k] = isDate ? new Date(v).getTime() : Number(v));
+                    }
+                };
+                const rawUser = user.toObject();
+                parseMongoMapAuto(rawUser.taskProgress, players[id].taskProgress, false);
+                parseMongoMapAuto(rawUser.claimedTasks, players[id].claimedTasks, true);
+                console.log(`[INIT] Loaded claimedTasks from DB for ${user.email}:`, players[id].claimedTasks);
+
                 // 🛑 EL FIX: REINICIAR EL TEMPORIZADOR DE COMBATE AL ENTRAR 🛑
                 // Esto evita que los que recargan la página se curen mágicamente
                 players[id].lastHitTime = Date.now();
@@ -1560,8 +1705,12 @@ wss.on('connection', async (ws) => {
                     type: 'login_success',
                     player: players[id],
                     token: user.token,
-                    friends: user.friends
+                    friends: user.friends,
+                    globalTasks: GLOBAL_TASKS,
+                    taskProgress: players[id].taskProgress,
+                    claimedTasks: players[id].claimedTasks
                 }));
+                console.log(`[LOGIN_SUCCESS] Sending claimedTasks for ${user.email}:`, players[id].claimedTasks);
 
                 // Tell everyone else you arrived (excluding yourself so no ghost clone appears!)
                 broadcast({ type: 'update', id: id, player: players[id] }, ws);
@@ -1671,6 +1820,7 @@ wss.on('connection', async (ws) => {
             p.frameY = data.player.frameY;
             p.isMoving = data.player.isMoving;
             p.isTyping = data.player.isTyping;
+            p.isSitting = data.player.isSitting;
 
             // 🛑 EL FIX 2: Sincronizar el arma para que los demás la vean en tu mano
             if (data.player.equippedWeapon !== undefined) {
@@ -2145,6 +2295,125 @@ wss.on('connection', async (ws) => {
                 console.error("Error buscando jugadores:", err);
             }
         }
+        
+        // 🌟 13. SISTEMA DE LOGROS Y TAREAS DIARIAS 🌟
+        if (data.type === 'claim_task' && isAuthenticated) {
+            const p = players[id];
+            if (!p) return;
+            
+            const taskId = data.taskId;
+            const task = GLOBAL_TASKS[taskId];
+            
+            if (!task) return ws.send(encode({ type: 'claim_error', message: 'Invalid task.' }));
+
+            // 1. Verificar si ya fue cobrada y si está en cooldown
+            const lastClaimed = p.claimedTasks[taskId];
+            const now = Date.now();
+            
+            if (lastClaimed) {
+                if (!task.isRepeatable) {
+                    return ws.send(encode({ type: 'claim_error', message: 'You already claimed this reward.' }));
+                }
+                const timeSinceClaim = now - new Date(lastClaimed).getTime();
+                if (timeSinceClaim < task.resetIntervalMs) {
+                    return ws.send(encode({ type: 'claim_error', message: 'You must wait before claiming this again.' }));
+                }
+            }
+
+            // 2. Verificar progreso (Engine Genérico)
+            let hasCompleted = false;
+            if (task.requirementType === 'login') {
+                hasCompleted = true; // Si está enviando el paquete, ya está logueado
+            } else if (task.requirementType === 'kills') {
+                hasCompleted = (p.kills >= task.requirementValue);
+            } else if (task.requirementType === 'elo') {
+                hasCompleted = (p.elo >= task.requirementValue);
+            } else if (task.requirementType === 'play_hours') {
+                const currentVal = p.taskProgress[taskId] || 0;
+                hasCompleted = (currentVal >= task.requirementValue);
+            } else if (task.requirementType === 'squad_base_minutes') {
+                if (p.squad) {
+                    const squadData = await Squad.findById(p.squad).lean();
+                    if (squadData && squadData.territoryTimeMinutes >= task.requirementValue) {
+                        // Anti-cheat: Check if player joined AFTER the milestone was achieved
+                        const isLeader = squadData.leader.toString() === p.accountId;
+                        let canClaim = isLeader; // Leader inherently has been there since start
+                        let errorMessage = 'You cannot claim this reward.';
+                        
+                        if (!isLeader) {
+                            const memberInfo = squadData.members.find(m => m.accountId.toString() === p.accountId);
+                            if (memberInfo) {
+                                let milestoneDate = null;
+                                if (squadData.milestonesAchieved && squadData.milestonesAchieved[taskId]) {
+                                    milestoneDate = new Date(squadData.milestonesAchieved[taskId]).getTime();
+                                }
+
+                                if (memberInfo.joinedAt) {
+                                    const joinedTime = new Date(memberInfo.joinedAt).getTime();
+                                    
+                                    if (milestoneDate && joinedTime > milestoneDate) {
+                                        // Player joined AFTER the milestone was achieved
+                                        canClaim = false;
+                                        errorMessage = 'This squad achieved this milestone before you joined.';
+                                    } else {
+                                        // Fallback 15-day rule
+                                        const daysInSquad = (Date.now() - joinedTime) / (1000 * 60 * 60 * 24);
+                                        if (daysInSquad >= 15 || milestoneDate) {
+                                            canClaim = true;
+                                        } else {
+                                            canClaim = false;
+                                            errorMessage = 'You must be in the Squad for 15 days to claim this reward.';
+                                        }
+                                    }
+                                } else {
+                                    // For existing veterans before joinedAt was added
+                                    canClaim = true;
+                                }
+                            }
+                        }
+
+                        if (canClaim) {
+                            hasCompleted = true;
+                        } else {
+                            return ws.send(encode({ type: 'claim_error', message: errorMessage }));
+                        }
+                    } else {
+                        hasCompleted = false;
+                    }
+                } else {
+                    hasCompleted = false;
+                }
+            }
+            if (!hasCompleted) {
+                return ws.send(encode({ type: 'claim_error', message: 'Requirement not met yet.' }));
+            }
+
+            // 3. Pagar Recompensa
+            p.claimedTasks[taskId] = now; // Guardar tiempo de cobro
+            
+            if (task.rewardType === 'coins') {
+                p.coins += task.rewardValue;
+                ws.send(encode({ type: 'coins_update', coins: p.coins }));
+            } else if (task.rewardType === 'item') {
+                if (!p.inventory.includes(task.rewardValue)) {
+                    p.inventory.push(task.rewardValue);
+                    ws.send(encode({ type: 'inventory_update', inventory: p.inventory }));
+                }
+            }
+
+                        // 4. Avisar al cliente que fue un éxito
+            p.claimedTasks[taskId] = now;
+            ws.send(encode({ type: 'task_claimed', taskId: taskId, claimedTasks: p.claimedTasks }));
+            
+            // EL FIX DEFINITIVO: Mongoose .updateOne() directo
+            const updateData = { $set: { coins: p.coins, inventory: p.inventory } };
+            updateData.$set[`claimedTasks.${taskId}`] = now;
+            
+            User.updateOne({ email: currentUser }, updateData).then((res) => {
+                console.log(`[CLAIM] Successfully saved claimedTasks to DB for ${currentUser}. Modified:`, res.modifiedCount);
+            }).catch(err => console.error("Error al guardar en MongoDB:", err));
+        }
+        
         // 13. SISTEMA DE COMPRAS SEGURAS (TIENDA)
         if (data.type === 'buy_item' && isAuthenticated) {
             const p = players[id];
@@ -2336,6 +2605,8 @@ wss.on('connection', async (ws) => {
                     id: squad._id.toString(),
                     name: squad.name,
                     logo: squad.logo,
+                    territoryTimeMinutes: squad.territoryTimeMinutes || 0,
+                    milestonesAchieved: squad.milestonesAchieved ? Object.fromEntries(squad.milestonesAchieved) : {},
                     leader: {
                         accountId: squad.leader._id.toString(), // Estandarizado a accountId
                         name: squad.leader.username,
@@ -2358,7 +2629,8 @@ wss.on('connection', async (ws) => {
                             title: m.customTitle,
                             canInvite: m.canInvite,
                             canKick: m.canKick,
-                            canAssignRoles: m.canAssignRoles
+                            canAssignRoles: m.canAssignRoles,
+                            joinedAt: m.joinedAt
                         };
                     }).filter(m => m !== null)
                 };
@@ -3154,25 +3426,30 @@ wss.on('connection', async (ws) => {
         // ONLY save if they logged in! We don't want to save Guest coordinates to the DB
         if (isAuthenticated && players[id]) {
             try {
-                await User.findOneAndUpdate(
-                    { email: currentUser },
-                    {
-                        worldX: players[id].worldX,
-                        worldY: players[id].worldY,
-                        equippedWeapon: players[id].equippedWeapon,
-                        hotbar: players[id].hotbar,
-                        quickSwaps: players[id].quickSwaps,
-                        coins: players[id].coins,
-                        hp: players[id].hp,
-                        isDead: players[id].isDead,
-                        kills: players[id].kills,
-                        losses: players[id].losses,
-                        elo: players[id].elo,
-                        // ⚡ ADD THESE TWO LINES:
-                        inventory: players[id].inventory,
-                        equipped: players[id].equipped
-                    }
-                );
+                const user = await User.findOne({ email: currentUser });
+                if (user) {
+                    user.worldX = players[id].worldX;
+                    user.worldY = players[id].worldY;
+                    user.equippedWeapon = players[id].equippedWeapon;
+                    user.hotbar = players[id].hotbar;
+                    user.quickSwaps = players[id].quickSwaps;
+                    user.coins = players[id].coins;
+                    user.hp = players[id].hp;
+                    user.isDead = players[id].isDead;
+                    user.kills = players[id].kills;
+                    user.losses = players[id].losses;
+                    user.elo = players[id].elo;
+                    user.inventory = players[id].inventory;
+                    user.equipped = players[id].equipped;
+                    
+                    // 🌟 Mongoose-safe way to save Mixed objects 🌟
+                    user.taskProgress = players[id].taskProgress || {};
+                    user.claimedTasks = players[id].claimedTasks || {};
+                    user.markModified('taskProgress');
+                    user.markModified('claimedTasks');
+                    
+                    await user.save();
+                }
             } catch (err) { console.error(err); }
         }
 
@@ -3182,6 +3459,7 @@ wss.on('connection', async (ws) => {
                 client.send(encode({ type: 'left', id: id }));
             }
         });
+        broadcast({ type: 'player_count', count: Object.keys(players).length });
     });
 
     // 2. FETCH WORLD DATA
@@ -3205,8 +3483,12 @@ wss.on('connection', async (ws) => {
         masterCatalog: MASTER_CATALOG, // 📦 EL FIX: Enviamos toda la ropa e ítems
         zoneConfig: ZONE_CONFIG, // <--- 👇 AÑADE ESTA LÍNEA 👇
         ranksDB: RANKS_CACHE,
-        patchNotes: PATCH_NOTES_CACHE // 📰 NUEVO: Enviamos las noticias
-
+        patchNotes: PATCH_NOTES_CACHE, // 📰 NUEVO: Enviamos las noticias
+        
+        // 🌟 TAREAS Y LOGROS GLOBALES 🌟
+        globalTasks: GLOBAL_TASKS,
+        taskProgress: {}, // Guests start with empty progress
+        claimedTasks: {}
     }));
 
     // 4. NOW TELL THE LOBBY A GUEST HAS ARRIVED
@@ -3216,6 +3498,7 @@ wss.on('connection', async (ws) => {
         }
     });
 
+    broadcast({ type: 'player_count', count: Object.keys(players).length });
 });
 
 // Global Broadcast (Only for things like server shutdown or global events)
@@ -3395,7 +3678,7 @@ setInterval(async () => {
             console.log(`🏰 [TURF WARS] El clan [${ownerSquad}] ha mantenido la base por otro minuto.`);
 
             // 2. GUARDAR EL TIEMPO EN MONGODB (Total, Diario y Semanal)
-            await Squad.findOneAndUpdate(
+            const updatedSquad = await Squad.findOneAndUpdate(
                 { name: ownerSquad },
                 {
                     $inc: {
@@ -3403,8 +3686,29 @@ setInterval(async () => {
                         dailyTimeMinutes: 1,
                         weeklyTimeMinutes: 1
                     }
-                }
+                },
+                { returnDocument: 'after' }
             );
+
+            // --- NUEVO: REVISAR METAS CUMPLIDAS EXACTAMENTE AHORA ---
+            if (updatedSquad) {
+                let changed = false;
+                if (!updatedSquad.milestonesAchieved) updatedSquad.milestonesAchieved = new Map();
+                for (let taskId in GLOBAL_TASKS) {
+                    const task = GLOBAL_TASKS[taskId];
+                    if (task.requirementType === 'squad_base_minutes') {
+                        // Si alcanzaron la meta y an no tiene fecha guardada
+                        if (updatedSquad.territoryTimeMinutes >= task.requirementValue && !updatedSquad.milestonesAchieved.has(taskId)) {
+                            updatedSquad.milestonesAchieved.set(taskId, Date.now());
+                            changed = true;
+                            console.log(`[LOGRO SQUAD] El clan [${ownerSquad}] alcanzo la meta: ${taskId}`);
+                        }
+                    }
+                }
+                if (changed) {
+                    await updatedSquad.save();
+                }
+            }
 
         } catch (err) {
             console.error("💥 Error en el cronómetro de la base:", err);
