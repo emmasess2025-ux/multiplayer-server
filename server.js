@@ -60,21 +60,28 @@ const tileSchema = new mongoose.Schema({
 
 const Tile = mongoose.model('Tile', tileSchema);
 
-// --- ESQUEMA DE ARENAS DE SPARRING (ESCALABLE) ---
+// --- ESQUEMA DE MINIJUEGOS Y ARENAS (ESCALABLE) ---
 const arenaSchema = new mongoose.Schema({
     arenaId: { type: String, required: true, unique: true },
-    name: { type: String, default: "Arena de Combate" },
-    p1X: { type: Number, required: true },
-    p1Y: { type: Number, required: true },
-    p2X: { type: Number, required: true },
-    p2Y: { type: Number, required: true },
-    // 👇 NUEVO: CAPACIDAD DE EQUIPOS 👇
+    name: { type: String, default: "Arena" },
+    gameType: { type: String, default: "spar" }, // 'spar', 'soccer', 'hide_seek', 'battle_royale'
+    
+    // Spawn points para juegos de 2 equipos (Spar, Soccer)
+    p1X: { type: Number },
+    p1Y: { type: Number },
+    p2X: { type: Number },
+    p2Y: { type: Number },
+    
+    // Configuraciones extra (Zonas de spawn aleatorias, props, tiempos)
+    config: { type: Object, default: {} },
+
     team1Size: { type: Number, default: 1 },
     team2Size: { type: Number, default: 1 },
-    isRanked: { type: Boolean, default: false } // <--- NUEVO
+    maxPlayers: { type: Number, default: 2 }, // Útil para Battle Royale o Hide & Seek
+    isRanked: { type: Boolean, default: false }
 });
 const Arena = mongoose.model('Arena', arenaSchema);
-// Memoria RAM ultra-rápida para manejar las colas y peleas en vivo
+// Memoria RAM ultra-rápida para manejar las colas y juegos en vivo
 let arenasRAM = {};
 
 const turfSchema = new mongoose.Schema({
@@ -690,18 +697,36 @@ async function loadArenasFromDB() {
             arenasRAM[a.arenaId] = {
                 arenaId: a.arenaId,
                 name: a.name,
-                p1X: a.p1X, p1Y: a.p1Y,
-                p2X: a.p2X, p2Y: a.p2Y,
-                // Si por error en el editor se guardó vacío, forzamos a que sea 1
+                gameType: a.gameType || "spar",
+                p1X: a.p1X || 0, p1Y: a.p1Y || 0,
+                p2X: a.p2X || 0, p2Y: a.p2Y || 0,
+                config: a.config || {},
                 team1Size: a.team1Size || 1,
                 team2Size: a.team2Size || 1,
+                maxPlayers: a.maxPlayers || 2,
                 queue: [], // Inician vacías al reiniciar el server
                 isOccupied: false,
                 team1: [],
                 team2: [],
                 isRanked: a.isRanked || false,
                 aliveTeam1: 0,
-                aliveTeam2: 0
+                aliveTeam2: 0,
+                ball: a.gameType === 'soccer' ? { 
+                    x: (a.config?.ballX || 0) * 16, 
+                    y: (a.config?.ballY || 0) * 16, 
+                    vx: 0, 
+                    vy: 0,
+                    spawnX: (a.config?.ballX || 0) * 16,
+                    spawnY: (a.config?.ballY || 0) * 16,
+                    goal1X1: (a.config?.goal1X1 || 0) * 16,
+                    goal1X2: (a.config?.goal1X2 || 0) * 16,
+                    goal1Y: (a.config?.goal1Y || 0) * 16,
+                    goal2X1: (a.config?.goal2X1 || 0) * 16,
+                    goal2X2: (a.config?.goal2X2 || 0) * 16,
+                    goal2Y: (a.config?.goal2Y || 0) * 16,
+                    score1: 0,
+                    score2: 0
+                } : null
             };
         });
         console.log(`🥊 Arenas cargadas en RAM: ${allArenas.length} arenas activas.`);
@@ -855,58 +880,34 @@ function applyDamageToPlayer(targetId, shooterId, weaponId) {
         if (target.isSparring && shooter.isSparring && target.currentArena === shooter.currentArena) {
             const arena = arenasRAM[target.currentArena];
             if (arena) {
+                // Si es minijuego de Soccer, simplemente reviven al instante en sus bases
+                if (arena.gameType === 'soccer') {
+                    target.hp = 100;
+                    target.isDead = false;
+                    target.worldX = (target.arenaTeam === 1) ? (arena.p1X * 16) + 8 : (arena.p2X * 16) + 8;
+                    target.worldY = (target.arenaTeam === 1) ? (arena.p1Y * 16) + 8 : (arena.p2Y * 16) + 8;
+                    target.invulnerableUntil = Date.now() + 2000;
+                    
+                    wss.clients.forEach(c => {
+                        if (c.playerId === targetId && c.readyState === WebSocket.OPEN) {
+                            c.send(encode({ type: 'force_position', x: target.worldX, y: target.worldY, reason: 'wall' }));
+                        }
+                    });
+                    
+                    wss.clients.forEach(client => {
+                        if (client.readyState === WebSocket.OPEN) {
+                            client.send(encode({ type: 'hp_update', targetId: targetId, newHp: 100, damageDealt: actualDamage, isDead: false, respawnX: target.worldX, respawnY: target.worldY, shieldUntil: target.invulnerableUntil }));
+                        }
+                    });
+                    return; // Terminamos aquí, no cerramos la arena ni contamos bajas
+                }
+
                 if (target.arenaTeam === 1) arena.aliveTeam1--;
                 if (target.arenaTeam === 2) arena.aliveTeam2--;
 
                 if (arena.aliveTeam1 <= 0 || arena.aliveTeam2 <= 0) {
                     const winningTeam = arena.aliveTeam1 <= 0 ? 2 : 1;
-                    let maxWinnerHp = 0;
-                    if (arena.isRanked) {
-                        const winningPlayers = winningTeam === 1 ? arena.team1 : arena.team2;
-                        winningPlayers.forEach(pid => {
-                            if (players[pid] && !players[pid].isDead && players[pid].hp > maxWinnerHp) {
-                                maxWinnerHp = players[pid].hp;
-                            }
-                        });
-                    }
-                    let eloChange = 5;
-                    if (maxWinnerHp >= 90) eloChange = 10;
-                    else if (maxWinnerHp >= 75) eloChange = 8.5;
-                    else if (maxWinnerHp >= 50) eloChange = 7;
-
-                    [...arena.team1, ...arena.team2].forEach(pid => {
-                        let p = players[pid];
-                        if (p) {
-                            const isWinner = (winningTeam === 1 && arena.team1.includes(pid)) || (winningTeam === 2 && arena.team2.includes(pid));
-                            if (arena.isRanked) {
-                                if (isWinner) p.elo += eloChange; else p.elo -= eloChange;
-                                if (p.elo < 0) p.elo = 0;
-                                User.findByIdAndUpdate(p.accountId, { elo: p.elo }).catch(console.error);
-                            }
-                            p.isSparring = false;
-                            p.arenaTeam = null;
-                            p.currentArena = null;
-                            p.hp = 100;
-                            p.isDead = false;
-                            p.lastHitTime = Date.now();
-                            p.invulnerableUntil = Date.now() + 2000;
-                            p.worldX = p.preSparX;
-                            p.worldY = p.preSparY;
-
-                            let resultMsg = isWinner ? "¡VICTORIA! 🏆" : "DERROTA 💀";
-                            if (arena.isRanked) resultMsg += isWinner ? ` (+${eloChange} Elo)` : ` (-${eloChange} Elo)`;
-                            
-                            wss.clients.forEach(c => {
-                                if (c.playerId === pid && c.readyState === WebSocket.OPEN) {
-                                    c.send(encode({ type: 'match_finished', returnX: p.preSparX, returnY: p.preSparY, result: resultMsg, newElo: p.elo }));
-                                }
-                            });
-                        }
-                    });
-                    arena.isOccupied = false;
-                    arena.team1 = []; arena.team2 = [];
-                    arena.fighter1 = null; arena.fighter2 = null;
-                    broadcast({ type: 'refresh_arena_ui', arenaId: arena.arenaId });
+                    endArenaMatch(arena, winningTeam);
                 } else {
                     wss.clients.forEach(client => {
                         if (client.readyState === WebSocket.OPEN) {
@@ -1431,11 +1432,20 @@ wss.on('connection', async (ws) => {
                         { arenaId: uniqueArenaId },
                         {
                             name: data.arenaName || "Coliseo",
+                            gameType: data.gameType || "spar",
+                            maxPlayers: data.maxPlayers || 2,
+                            team1Size: data.team1Size || 1,
+                            team2Size: data.team2Size || 1,
+                            isRanked: data.isRanked || false,
                             p1X: data.arenaP1X, p1Y: data.arenaP1Y,
                             p2X: data.arenaP2X, p2Y: data.arenaP2Y,
-                            team1Size: data.team1Size || 1, // <--- GUARDAR
-                            team2Size: data.team2Size || 1,  // <--- GUARDAR
-                            isRanked: data.isRanked || false
+                            config: {
+                                ballX: data.ballX, ballY: data.ballY,
+                                goal1X1: data.goal1X1, goal1X2: data.goal1X2, goal1Y: data.goal1Y,
+                                goal2X1: data.goal2X1, goal2X2: data.goal2X2, goal2Y: data.goal2Y,
+                                brMinX: data.brMinX, brMaxX: data.brMaxX,
+                                brMinY: data.brMinY, brMaxY: data.brMaxY
+                            }
                         },
                         { upsert: true, returnDocument: 'after' } // <--- EL FIX
                     );
@@ -1450,18 +1460,42 @@ wss.on('connection', async (ws) => {
                         };
                     }
 
-                    // Actualizar solo las coordenadas físicas
+                    // Actualizar memoria RAM
                     arenasRAM[uniqueArenaId].arenaId = uniqueArenaId;
                     arenasRAM[uniqueArenaId].name = dbArena.name;
-                    arenasRAM[uniqueArenaId].p1X = dbArena.p1X;
-                    arenasRAM[uniqueArenaId].p1Y = dbArena.p1Y;
-                    arenasRAM[uniqueArenaId].p2X = dbArena.p2X;
-                    arenasRAM[uniqueArenaId].p2Y = dbArena.p2Y;
+                    arenasRAM[uniqueArenaId].gameType = dbArena.gameType;
+                    arenasRAM[uniqueArenaId].maxPlayers = dbArena.maxPlayers;
+                    arenasRAM[uniqueArenaId].team1Size = dbArena.team1Size;
+                    arenasRAM[uniqueArenaId].team2Size = dbArena.team2Size;
+                    arenasRAM[uniqueArenaId].isRanked = dbArena.isRanked;
+                    arenasRAM[uniqueArenaId].config = dbArena.config || {};
+                    
+                    // Maintain backward compatibility for Spar
+                    arenasRAM[uniqueArenaId].p1X = dbArena.p1X || dbArena.config?.p1X || 0;
+                    arenasRAM[uniqueArenaId].p1Y = dbArena.p1Y || dbArena.config?.p1Y || 0;
+                    arenasRAM[uniqueArenaId].p2X = dbArena.p2X || dbArena.config?.p2X || 0;
+                    arenasRAM[uniqueArenaId].p2Y = dbArena.p2Y || dbArena.config?.p2Y || 0;
+                    
+                    if (dbArena.gameType === 'soccer') {
+                        if (!arenasRAM[uniqueArenaId].ball) {
+                            arenasRAM[uniqueArenaId].ball = { vx: 0, vy: 0, score1: 0, score2: 0 };
+                        }
+                        arenasRAM[uniqueArenaId].ball.x = (dbArena.config?.ballX || 0) * 16;
+                        arenasRAM[uniqueArenaId].ball.y = (dbArena.config?.ballY || 0) * 16;
+                        arenasRAM[uniqueArenaId].ball.spawnX = (dbArena.config?.ballX || 0) * 16;
+                        arenasRAM[uniqueArenaId].ball.spawnY = (dbArena.config?.ballY || 0) * 16;
+                        arenasRAM[uniqueArenaId].ball.goal1X1 = (dbArena.config?.goal1X1 || 0) * 16;
+                        arenasRAM[uniqueArenaId].ball.goal1X2 = (dbArena.config?.goal1X2 || 0) * 16;
+                        arenasRAM[uniqueArenaId].ball.goal1Y = (dbArena.config?.goal1Y || 0) * 16;
+                        arenasRAM[uniqueArenaId].ball.goal2X1 = (dbArena.config?.goal2X1 || 0) * 16;
+                        arenasRAM[uniqueArenaId].ball.goal2X2 = (dbArena.config?.goal2X2 || 0) * 16;
+                        arenasRAM[uniqueArenaId].ball.goal2Y = (dbArena.config?.goal2Y || 0) * 16;
+                    }
+                    
                     arenasRAM[uniqueArenaId].doorX = data.x; // Donde está el letrero para salir
                     arenasRAM[uniqueArenaId].doorY = data.y;
-                    arenasRAM[uniqueArenaId].isRanked = dbArena.isRanked;
 
-                    console.log(`🥊 Arena Guardada en vivo: ${dbArena.name}`);
+                    console.log(`🎮 Minigame Guardado en vivo: ${dbArena.name} (${dbArena.gameType})`);
                 } else if (data.triggerType !== undefined) {
                     // Si cambias el bloque a "Normal" estando en la Capa 15, DESTRUIMOS LA BASE
                     if (centralBase && centralBase.gridX === data.x && centralBase.gridY === data.y && data.layer === 15) {
@@ -1812,6 +1846,21 @@ wss.on('connection', async (ws) => {
                                 }
                             }
                         });
+                    }
+                }
+
+                // --- ⚽ SOCCER KICK LOGIC ---
+                if (p.currentArena && arenasRAM[p.currentArena] && arenasRAM[p.currentArena].gameType === 'soccer') {
+                    const arena = arenasRAM[p.currentArena];
+                    if (arena.ball) {
+                        const dx = p.worldX - arena.ball.x;
+                        const dy = p.worldY - arena.ball.y;
+                        const distToBall = Math.hypot(dx, dy);
+                        if (distToBall < 24) { // Kick distance threshold
+                            const kickStrength = 15; // Max velocity
+                            arena.ball.vx = (dx / distToBall) * -kickStrength;
+                            arena.ball.vy = (dy / distToBall) * -kickStrength;
+                        }
                     }
                 }
             }
@@ -3795,5 +3844,182 @@ setInterval(async () => {
         }
     }
 }, 60000); // 60,000 ms = 1 minute
+
+// --- ⚽ SOCCER PHYSICS LOOP (30 FPS) ---
+setInterval(() => {
+    let anyUpdates = false;
+
+    for (const arenaId in arenasRAM) {
+        const arena = arenasRAM[arenaId];
+        if (arena.gameType === 'soccer' && arena.ball) {
+            const ball = arena.ball;
+            
+            // Apply friction
+            ball.vx *= 0.95;
+            ball.vy *= 0.95;
+            
+            // Stop ball if very slow
+            if (Math.abs(ball.vx) < 0.1) ball.vx = 0;
+            if (Math.abs(ball.vy) < 0.1) ball.vy = 0;
+
+            if (ball.vx !== 0 || ball.vy !== 0) {
+                // Separated Axis Collision Check for robust wall bouncing
+                let nextX = ball.x + ball.vx;
+                let gridX = Math.floor(nextX / 16);
+                let gridY = Math.floor(ball.y / 16);
+                let hitX = false;
+                for (let l = 0; l <= 15; l++) {
+                    if (serverWorldMap[`${gridX},${gridY},${l}`] && serverWorldMap[`${gridX},${gridY},${l}`].hasCollision) {
+                        hitX = true; break;
+                    }
+                }
+
+                if (hitX) {
+                    ball.vx *= -0.8;
+                } else {
+                    ball.x = nextX;
+                }
+
+                let nextY = ball.y + ball.vy;
+                gridX = Math.floor(ball.x / 16);
+                gridY = Math.floor(nextY / 16);
+                let hitY = false;
+                for (let l = 0; l <= 15; l++) {
+                    if (serverWorldMap[`${gridX},${gridY},${l}`] && serverWorldMap[`${gridX},${gridY},${l}`].hasCollision) {
+                        hitY = true; break;
+                    }
+                }
+
+                if (hitY) {
+                    ball.vy *= -0.8;
+                } else {
+                    ball.y = nextY;
+                }
+
+                // Goal Detection (Top-Down Horizontal Lines)
+                let minX1 = Math.min(ball.goal1X1, ball.goal1X2);
+                let maxX1 = Math.max(ball.goal1X1, ball.goal1X2);
+                // Blue Goal (Goal 1)
+                if (Math.abs(ball.y - ball.goal1Y) < 16 && ball.x >= minX1 && ball.x <= maxX1) {
+                    ball.score2++; // Red scores in Blue Goal
+                    if (ball.score2 >= 3) {
+                        endArenaMatch(arena, 2);
+                    } else {
+                        resetBall(ball);
+                    }
+                }
+
+                let minX2 = Math.min(ball.goal2X1, ball.goal2X2);
+                let maxX2 = Math.max(ball.goal2X1, ball.goal2X2);
+                // Red Goal (Goal 2)
+                if (Math.abs(ball.y - ball.goal2Y) < 16 && ball.x >= minX2 && ball.x <= maxX2) {
+                    ball.score1++; // Blue scores in Red Goal
+                    if (ball.score1 >= 3) {
+                        endArenaMatch(arena, 1);
+                    } else {
+                        resetBall(ball);
+                    }
+                }
+
+                anyUpdates = true;
+            }
+
+            // Mover el broadcast fuera del check de movimiento para que envíe la posición inicial aunque no se mueva
+            const updatePayload = encode({
+                type: 'soccer_update',
+                arenaId: arena.arenaId,
+                bx: Math.floor(ball.x),
+                by: Math.floor(ball.y),
+                s1: ball.score1,
+                s2: ball.score2
+            });
+
+            wss.clients.forEach(client => {
+                if (client.readyState === WebSocket.OPEN && client.playerId) {
+                    const p = players[client.playerId];
+                    if (p) {
+                        if (p.currentArena === arena.arenaId) {
+                            client.send(updatePayload);
+                        } else {
+                            // Proximity check for spectators (within 800 pixels)
+                            const dist = Math.hypot(p.worldX - ball.spawnX, p.worldY - ball.spawnY);
+                            if (dist < 800) {
+                                client.send(updatePayload);
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    }
+}, 1000 / 30); // 30 FPS
+
+function resetBall(ball) {
+    ball.x = ball.spawnX;
+    ball.y = ball.spawnY;
+    ball.vx = 0;
+    ball.vy = 0;
+}
+
+function endArenaMatch(arena, winningTeam) {
+    let maxWinnerHp = 0;
+    if (arena.isRanked) {
+        const winningPlayers = winningTeam === 1 ? arena.team1 : arena.team2;
+        winningPlayers.forEach(pid => {
+            if (players[pid] && !players[pid].isDead && players[pid].hp > maxWinnerHp) {
+                maxWinnerHp = players[pid].hp;
+            }
+        });
+    }
+    let eloChange = 5;
+    if (maxWinnerHp >= 90) eloChange = 10;
+    else if (maxWinnerHp >= 75) eloChange = 8.5;
+    else if (maxWinnerHp >= 50) eloChange = 7;
+
+    [...arena.team1, ...arena.team2].forEach(pid => {
+        let p = players[pid];
+        if (p) {
+            const isWinner = (winningTeam === 1 && arena.team1.includes(pid)) || (winningTeam === 2 && arena.team2.includes(pid));
+            if (arena.isRanked) {
+                if (isWinner) p.elo += eloChange; else p.elo -= eloChange;
+                if (p.elo < 0) p.elo = 0;
+                User.findByIdAndUpdate(p.accountId, { elo: p.elo }).catch(console.error);
+            }
+            p.isSparring = false;
+            p.arenaTeam = null;
+            p.currentArena = null;
+            p.hp = 100;
+            p.isDead = false;
+            p.lastHitTime = Date.now();
+            p.invulnerableUntil = Date.now() + 2000;
+            p.worldX = p.preSparX;
+            p.worldY = p.preSparY;
+
+            let resultMsg = isWinner ? "¡VICTORIA! 🏆" : "DERROTA 💀";
+            if (arena.gameType === 'soccer') {
+                resultMsg += ` (${arena.ball.score1} - ${arena.ball.score2})`;
+            }
+            if (arena.isRanked) resultMsg += isWinner ? ` (+${eloChange} Elo)` : ` (-${eloChange} Elo)`;
+            
+            wss.clients.forEach(c => {
+                if (c.playerId === pid && c.readyState === WebSocket.OPEN) {
+                    c.send(encode({ type: 'match_finished', returnX: p.preSparX, returnY: p.preSparY, result: resultMsg, newElo: p.elo }));
+                }
+            });
+        }
+    });
+    
+    arena.isOccupied = false;
+    arena.team1 = []; arena.team2 = [];
+    arena.fighter1 = null; arena.fighter2 = null;
+    
+    if (arena.ball) {
+        arena.ball.score1 = 0;
+        arena.ball.score2 = 0;
+        resetBall(arena.ball);
+    }
+    
+    broadcast({ type: 'refresh_arena_ui', arenaId: arena.arenaId });
+}
 
 console.log(`WebSocket server running on port ${PORT}`);
