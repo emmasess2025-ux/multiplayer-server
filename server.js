@@ -60,18 +60,31 @@ const tileSchema = new mongoose.Schema({
 
 const Tile = mongoose.model('Tile', tileSchema);
 
+const blueprintSchema = new mongoose.Schema({
+    name: { type: String, required: true },
+    w: { type: Number, required: true },
+    h: { type: Number, required: true },
+    isMultiLayer: { type: Boolean, default: true },
+    multiTiles: [{
+        x: Number, y: Number, l: Number, tileId: Number,
+        hasCollision: Boolean, isSit: Boolean, triggerType: String,
+        destX: Number, destY: Number, itemId: Number, rotation: Number
+    }]
+});
+const Blueprint = mongoose.model('Blueprint', blueprintSchema);
+
 // --- ESQUEMA DE MINIJUEGOS Y ARENAS (ESCALABLE) ---
 const arenaSchema = new mongoose.Schema({
     arenaId: { type: String, required: true, unique: true },
     name: { type: String, default: "Arena" },
     gameType: { type: String, default: "spar" }, // 'spar', 'soccer', 'hide_seek', 'battle_royale'
-    
+
     // Spawn points para juegos de 2 equipos (Spar, Soccer)
     p1X: { type: Number },
     p1Y: { type: Number },
     p2X: { type: Number },
     p2Y: { type: Number },
-    
+
     // Configuraciones extra (Zonas de spawn aleatorias, props, tiempos)
     config: { type: Object, default: {} },
 
@@ -300,14 +313,14 @@ const taskSchema = new mongoose.Schema({
     taskId: { type: String, required: true, unique: true }, // e.g., 'daily_login', 'squad_10_hours'
     title: { type: String, required: true },
     description: { type: String },
-    
+
     category: { type: String, enum: ['daily', 'squad', 'milestone', 'event'], default: 'daily' },
     requirementType: { type: String, enum: ['login', 'play_hours', 'kills', 'elo'], default: 'login' },
     requirementValue: { type: Number, required: true },
-    
+
     rewardType: { type: String, enum: ['coins', 'item'], default: 'coins' },
     rewardValue: { type: mongoose.Schema.Types.Mixed, required: true },
-    
+
     isRepeatable: { type: Boolean, default: false },
     resetIntervalMs: { type: Number, default: 0 } // 86400000 for daily
 });
@@ -347,7 +360,7 @@ const userSchema = new mongoose.Schema({
     role: { type: String, default: 'player' }, // Todos nacen como 'player' por defecto, pero podrías tener 'admin', 'moderator', etc. y manejar permisos en el futuro.
     // ... tus otros campos (coins, friends, etc)
     squad: { type: mongoose.Schema.Types.ObjectId, ref: 'Squad', default: null }, // <--- NUEVO
-    
+
     // --- NUEVO: SISTEMA DE TAREAS Y LOGROS ---
     taskProgress: { type: mongoose.Schema.Types.Mixed, default: {} },
     claimedTasks: { type: mongoose.Schema.Types.Mixed, default: {} }
@@ -486,7 +499,7 @@ async function loadTasksFromDB() {
             tasks.forEach(t => GLOBAL_TASKS[t.taskId] = t);
             console.log(`Loaded ${tasks.length} tasks from DB.`);
         }
-        
+
         // --- INICIALIZAR METAS LEGACY PARA SQUADS EXISTENTES ---
         try {
             const allSquads = await Squad.find({});
@@ -711,10 +724,10 @@ async function loadArenasFromDB() {
                 isRanked: a.isRanked || false,
                 aliveTeam1: 0,
                 aliveTeam2: 0,
-                ball: a.gameType === 'soccer' ? { 
-                    x: (a.config?.ballX || 0) * 16, 
-                    y: (a.config?.ballY || 0) * 16, 
-                    vx: 0, 
+                ball: a.gameType === 'soccer' ? {
+                    x: (a.config?.ballX || 0) * 16,
+                    y: (a.config?.ballY || 0) * 16,
+                    vx: 0,
                     vy: 0,
                     spawnX: (a.config?.ballX || 0) * 16,
                     spawnY: (a.config?.ballY || 0) * 16,
@@ -887,13 +900,13 @@ function applyDamageToPlayer(targetId, shooterId, weaponId) {
                     target.worldX = (target.arenaTeam === 1) ? (arena.p1X * 16) + 8 : (arena.p2X * 16) + 8;
                     target.worldY = (target.arenaTeam === 1) ? (arena.p1Y * 16) + 8 : (arena.p2Y * 16) + 8;
                     target.invulnerableUntil = Date.now() + 2000;
-                    
+
                     wss.clients.forEach(c => {
                         if (c.playerId === targetId && c.readyState === WebSocket.OPEN) {
                             c.send(encode({ type: 'force_position', x: target.worldX, y: target.worldY, reason: 'wall' }));
                         }
                     });
-                    
+
                     wss.clients.forEach(client => {
                         if (client.readyState === WebSocket.OPEN) {
                             client.send(encode({ type: 'hp_update', targetId: targetId, newHp: 100, damageDealt: actualDamage, isDead: false, respawnX: target.worldX, respawnY: target.worldY, shieldUntil: target.invulnerableUntil }));
@@ -961,7 +974,7 @@ setInterval(() => {
         for (let targetId in players) {
             let target = players[targetId];
             if (targetId === p.owner || target.isDead) continue;
-            
+
             // ⚡ THE FIX: Increased from 14 to 22. 
             // Gives a margin of error for network latency so bullets that visually hit on client don't miss on server.
             const HITBOX_RADIUS = 22;
@@ -1130,7 +1143,7 @@ wss.on('connection', async (ws) => {
                 // --- 🌟 NUEVO: CARGAR TAREAS Y LOGROS A LA RAM 🌟 ---
                 players[id].taskProgress = {};
                 players[id].claimedTasks = {};
-                
+
                 const parseMongoMap = (source, target, isDate) => {
                     if (!source) return;
                     if (source instanceof Map) {
@@ -1255,6 +1268,10 @@ wss.on('connection', async (ws) => {
                     // 🗑 ERASER: Wipe ALL ghost tiles and duplicates at this coordinate
                     await Tile.deleteMany(query);
 
+                    // LIMPIEZA EN RAM!
+                    const key = `${data.x},${data.y},${data.l}`;
+                    delete serverWorldMap[key];
+
                     // 👇 EL FIX: Si pasamos el borrador por encima de la base, la destruimos
                     // 👇 EL FIX: Solo destruimos la base si borramos en la Capa 15 (Lógica)
                     if (centralBase && centralBase.gridX === data.x && centralBase.gridY === data.y && data.l === 15) {
@@ -1269,6 +1286,10 @@ wss.on('connection', async (ws) => {
                     // 🎨 PAINT: Destroy old corrupted tiles first, then insert the clean new one
                     await Tile.deleteMany(query);
                     await Tile.create({ x: data.x, y: data.y, l: data.l, tileId: data.tileId });
+                    
+                    // RAM UPDATE
+                    const key = `${data.x},${data.y},${data.l}`;
+                    serverWorldMap[key] = { tileId: data.tileId, l: data.l };
                 }
 
                 // EN LA SECCIÓN 5 (place_tile):
@@ -1284,6 +1305,29 @@ wss.on('connection', async (ws) => {
         }
 
         // 5.5 HANDLE BULK BUILDING (SÚPER GUARDADO MULTI-CAPA ANTI-LAG)
+        if (data.type === 'save_blueprint') {
+            if (!players[id] || players[id].role !== 'admin') return;
+            const bp = new Blueprint(data.blueprint);
+            bp.save().then(() => {
+                ws.send(encode({ type: 'server_msg', msg: 'Prefab guardado con éxito: ' + data.blueprint.name, color: '#2ecc71' }));
+                Blueprint.find().lean().then(bps => {
+                    wss.clients.forEach(client => {
+                        const pid = client.playerId;
+                        if (client.readyState === WebSocket.OPEN && players[pid] && players[pid].role === 'admin') {
+                            client.send(encode({ type: 'blueprint_list', blueprints: bps }));
+                        }
+                    });
+                });
+            }).catch(err => console.error(err));
+        }
+
+        if (data.type === 'load_blueprints') {
+            if (!players[id] || players[id].role !== 'admin') return;
+            Blueprint.find().lean().then(bps => {
+                ws.send(encode({ type: 'blueprint_list', blueprints: bps }));
+            }).catch(err => console.error(err));
+        }
+
         if (data.type === 'place_tiles_bulk') {
             // --- EL CANDADO DE SEGURIDAD ABSOLUTA ---
             if (!players[id] || players[id].role !== 'admin') return;
@@ -1294,6 +1338,10 @@ wss.on('connection', async (ws) => {
                     if (t.tileId === -1) {
                         // BORRADOR: Solo borramos el bloque específico en su capa
                         bulkOps.push({ deleteMany: { filter: { x: t.x, y: t.y, l: t.l } } });
+                        
+                        // LIMPIEZA EN RAM!
+                        const key = `${t.x},${t.y},${t.l}`;
+                        delete serverWorldMap[key];
 
                         // 👇 EL FIX: Si borramos la base con el borrador de arrastre masivo
                         // 👇 EL FIX: Solo si borramos con arrastre masivo en la Capa 15
@@ -1305,11 +1353,29 @@ wss.on('connection', async (ws) => {
                             });
                         }
                     } else {
+                        let updateObj = { tileId: t.tileId, rotation: t.rotation || 0 };
+                        if (t.hasCollision !== undefined) updateObj.hasCollision = t.hasCollision;
+                        if (t.isSit !== undefined) updateObj.isSit = t.isSit;
+                        if (t.triggerType !== undefined) updateObj.triggerType = t.triggerType;
+                        if (t.destX !== undefined) updateObj.destX = t.destX;
+                        if (t.destY !== undefined) updateObj.destY = t.destY;
+                        if (t.itemId !== undefined) updateObj.itemId = t.itemId;
+                        if (t.requiresClick !== undefined) updateObj.requiresClick = t.requiresClick;
+                        if (t.npcMessage !== undefined) updateObj.npcMessage = t.npcMessage;
+                        if (t.itemRow !== undefined) updateObj.itemRow = t.itemRow;
+                        if (t.shelfX !== undefined) updateObj.shelfX = t.shelfX;
+                        if (t.shelfY !== undefined) updateObj.shelfY = t.shelfY;
+
+                        // RAM UPDATE
+                        const key = `${t.x},${t.y},${t.l}`;
+                        if (!serverWorldMap[key]) serverWorldMap[key] = { l: t.l };
+                        Object.assign(serverWorldMap[key], updateObj);
+
                         // UPSERT: Si existe, lo sobrescribe. Si no existe, lo crea. ¡1 sola operación!
                         bulkOps.push({
                             updateOne: {
                                 filter: { x: t.x, y: t.y, l: t.l },
-                                update: { $set: { tileId: t.tileId, rotation: t.rotation || 0 } }, // <--- EL FIX
+                                update: { $set: updateObj },
                                 upsert: true
                             }
                         });
@@ -1469,13 +1535,13 @@ wss.on('connection', async (ws) => {
                     arenasRAM[uniqueArenaId].team2Size = dbArena.team2Size;
                     arenasRAM[uniqueArenaId].isRanked = dbArena.isRanked;
                     arenasRAM[uniqueArenaId].config = dbArena.config || {};
-                    
+
                     // Maintain backward compatibility for Spar
                     arenasRAM[uniqueArenaId].p1X = dbArena.p1X || dbArena.config?.p1X || 0;
                     arenasRAM[uniqueArenaId].p1Y = dbArena.p1Y || dbArena.config?.p1Y || 0;
                     arenasRAM[uniqueArenaId].p2X = dbArena.p2X || dbArena.config?.p2X || 0;
                     arenasRAM[uniqueArenaId].p2Y = dbArena.p2Y || dbArena.config?.p2Y || 0;
-                    
+
                     if (dbArena.gameType === 'soccer') {
                         if (!arenasRAM[uniqueArenaId].ball) {
                             arenasRAM[uniqueArenaId].ball = { vx: 0, vy: 0, score1: 0, score2: 0 };
@@ -1491,7 +1557,7 @@ wss.on('connection', async (ws) => {
                         arenasRAM[uniqueArenaId].ball.goal2X2 = (dbArena.config?.goal2X2 || 0) * 16;
                         arenasRAM[uniqueArenaId].ball.goal2Y = (dbArena.config?.goal2Y || 0) * 16;
                     }
-                    
+
                     arenasRAM[uniqueArenaId].doorX = data.x; // Donde está el letrero para salir
                     arenasRAM[uniqueArenaId].doorY = data.y;
 
@@ -1689,7 +1755,7 @@ wss.on('connection', async (ws) => {
                 // --- 🌟 NUEVO: CARGAR TAREAS Y LOGROS A LA RAM (AUTO LOGIN) 🌟 ---
                 players[id].taskProgress = {};
                 players[id].claimedTasks = {};
-                
+
                 const parseMongoMapAuto = (source, target, isDate) => {
                     if (!source) return;
                     if (source instanceof Map) {
@@ -2013,7 +2079,7 @@ wss.on('connection', async (ws) => {
 
             // 🛑 EL FIX 4: Reenviar usando weaponId para que tu oponente dibuje la bala y escuche tu disparo
             broadcastToZone({ type: 'shoot', id: id, x: data.x, y: data.y, angle: data.angle, weaponId: weaponId, t: now }, shooter.chunkId, ws);
-            
+
             if (stats && stats.type !== 'melee') {
                 // ⚡ LAG COMPENSATION: Advance bullet by 50ms of travel time (1.5 server frames)
                 // This puts the server bullet exactly where the shooter's visual bullet is right now.
@@ -2038,7 +2104,7 @@ wss.on('connection', async (ws) => {
             const p = players[id];
             if (!p) return;
             const now = Date.now();
-            
+
             broadcastToZone({
                 type: 'shoot_shotgun', id: id, x: data.x, y: data.y, angles: data.angles, weaponId: data.weaponId, t: now
             }, p.chunkId, ws);
@@ -2344,21 +2410,21 @@ wss.on('connection', async (ws) => {
                 console.error("Error buscando jugadores:", err);
             }
         }
-        
+
         // 🌟 13. SISTEMA DE LOGROS Y TAREAS DIARIAS 🌟
         if (data.type === 'claim_task' && isAuthenticated) {
             const p = players[id];
             if (!p) return;
-            
+
             const taskId = data.taskId;
             const task = GLOBAL_TASKS[taskId];
-            
+
             if (!task) return ws.send(encode({ type: 'claim_error', message: 'Invalid task.' }));
 
             // 1. Verificar si ya fue cobrada y si está en cooldown
             const lastClaimed = p.claimedTasks[taskId];
             const now = Date.now();
-            
+
             if (lastClaimed) {
                 if (!task.isRepeatable) {
                     return ws.send(encode({ type: 'claim_error', message: 'You already claimed this reward.' }));
@@ -2388,7 +2454,7 @@ wss.on('connection', async (ws) => {
                         const isLeader = squadData.leader.toString() === p.accountId;
                         let canClaim = isLeader; // Leader inherently has been there since start
                         let errorMessage = 'You cannot claim this reward.';
-                        
+
                         if (!isLeader) {
                             const memberInfo = squadData.members.find(m => m.accountId.toString() === p.accountId);
                             if (memberInfo) {
@@ -2399,7 +2465,7 @@ wss.on('connection', async (ws) => {
 
                                 if (memberInfo.joinedAt) {
                                     const joinedTime = new Date(memberInfo.joinedAt).getTime();
-                                    
+
                                     if (milestoneDate && joinedTime > milestoneDate) {
                                         // Player joined AFTER the milestone was achieved
                                         canClaim = false;
@@ -2439,7 +2505,7 @@ wss.on('connection', async (ws) => {
 
             // 3. Pagar Recompensa
             p.claimedTasks[taskId] = now; // Guardar tiempo de cobro
-            
+
             if (task.rewardType === 'coins') {
                 p.coins += task.rewardValue;
                 ws.send(encode({ type: 'coins_update', coins: p.coins }));
@@ -2450,19 +2516,19 @@ wss.on('connection', async (ws) => {
                 }
             }
 
-                        // 4. Avisar al cliente que fue un éxito
+            // 4. Avisar al cliente que fue un éxito
             p.claimedTasks[taskId] = now;
             ws.send(encode({ type: 'task_claimed', taskId: taskId, claimedTasks: p.claimedTasks }));
-            
+
             // EL FIX DEFINITIVO: Mongoose .updateOne() directo
             const updateData = { $set: { coins: p.coins, inventory: p.inventory } };
             updateData.$set[`claimedTasks.${taskId}`] = now;
-            
+
             User.updateOne({ email: currentUser }, updateData).then((res) => {
                 console.log(`[CLAIM] Successfully saved claimedTasks to DB for ${currentUser}. Modified:`, res.modifiedCount);
             }).catch(err => console.error("Error al guardar en MongoDB:", err));
         }
-        
+
         // 13. SISTEMA DE COMPRAS SEGURAS (TIENDA)
         if (data.type === 'buy_item' && isAuthenticated) {
             const p = players[id];
@@ -3490,13 +3556,13 @@ wss.on('connection', async (ws) => {
                     user.elo = players[id].elo;
                     user.inventory = players[id].inventory;
                     user.equipped = players[id].equipped;
-                    
+
                     // 🌟 Mongoose-safe way to save Mixed objects 🌟
                     user.taskProgress = players[id].taskProgress || {};
                     user.claimedTasks = players[id].claimedTasks || {};
                     user.markModified('taskProgress');
                     user.markModified('claimedTasks');
-                    
+
                     await user.save();
                 }
             } catch (err) { console.error(err); }
@@ -3533,7 +3599,7 @@ wss.on('connection', async (ws) => {
         zoneConfig: ZONE_CONFIG, // <--- 👇 AÑADE ESTA LÍNEA 👇
         ranksDB: RANKS_CACHE,
         patchNotes: PATCH_NOTES_CACHE, // 📰 NUEVO: Enviamos las noticias
-        
+
         // 🌟 TAREAS Y LOGROS GLOBALES 🌟
         globalTasks: GLOBAL_TASKS,
         taskProgress: {}, // Guests start with empty progress
@@ -3853,11 +3919,11 @@ setInterval(() => {
         const arena = arenasRAM[arenaId];
         if (arena.gameType === 'soccer' && arena.ball) {
             const ball = arena.ball;
-            
+
             // Apply friction
             ball.vx *= 0.95;
             ball.vy *= 0.95;
-            
+
             // Stop ball if very slow
             if (Math.abs(ball.vx) < 0.1) ball.vx = 0;
             if (Math.abs(ball.vy) < 0.1) ball.vy = 0;
@@ -4000,7 +4066,7 @@ function endArenaMatch(arena, winningTeam) {
                 resultMsg += ` (${arena.ball.score1} - ${arena.ball.score2})`;
             }
             if (arena.isRanked) resultMsg += isWinner ? ` (+${eloChange} Elo)` : ` (-${eloChange} Elo)`;
-            
+
             wss.clients.forEach(c => {
                 if (c.playerId === pid && c.readyState === WebSocket.OPEN) {
                     c.send(encode({ type: 'match_finished', returnX: p.preSparX, returnY: p.preSparY, result: resultMsg, newElo: p.elo }));
@@ -4008,17 +4074,17 @@ function endArenaMatch(arena, winningTeam) {
             });
         }
     });
-    
+
     arena.isOccupied = false;
     arena.team1 = []; arena.team2 = [];
     arena.fighter1 = null; arena.fighter2 = null;
-    
+
     if (arena.ball) {
         arena.ball.score1 = 0;
         arena.ball.score2 = 0;
         resetBall(arena.ball);
     }
-    
+
     broadcast({ type: 'refresh_arena_ui', arenaId: arena.arenaId });
 }
 
