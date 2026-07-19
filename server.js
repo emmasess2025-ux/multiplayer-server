@@ -3,13 +3,16 @@ const mongoose = require('mongoose');
 const bcrypt = require('bcryptjs');
 const { encode, decode } = require('@msgpack/msgpack'); // <--- ADD THIS
 require('dotenv').config(); // <--- ADD THIS LINE TO READ THE .ENV FILE
+const express = require('express');
+const http = require('http');
+const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 
 // Global RAM for Squad Chats (Ultra-fast, ephemeral)
 const SQUAD_CHATS_RAM = {};
 // --- DATABASE CONNECTION ---
 const MONGO_URI = process.env.MONGO_URI;
 
-mongoose.connect(MONGO_URI)
+mongoose.connect(MONGO_URI, { family: 4 })
     .then(async () => {
         console.log('🔥 Connected to MongoDB!');
 
@@ -34,6 +37,7 @@ mongoose.connect(MONGO_URI)
         // Ya no cargamos Weapons ni Trash por separado.
         loadMasterCatalog();
         loadTasksFromDB();
+        loadArgemPackagesFromDB();
     })
     .catch(err => console.error('MongoDB Connection Error:', err));
 
@@ -349,6 +353,7 @@ const userSchema = new mongoose.Schema({
 
     // --- NUEVO: SISTEMA DE ECONOMÍA ---
     coins: { type: Number, default: 0 },
+    gems: { type: Number, default: 0 }, // Argems Premium Currency
     // 👇 NUEVO: ESTADÍSTICAS DE COMBATE 👇
     elo: { type: Number, default: 1000 },
     kills: { type: Number, default: 0 },
@@ -358,6 +363,10 @@ const userSchema = new mongoose.Schema({
     isDead: { type: Boolean, default: false },
     // --- NUEVO: SISTEMA DE ROLES ---
     role: { type: String, default: 'player' }, // Todos nacen como 'player' por defecto, pero podrías tener 'admin', 'moderator', etc. y manejar permisos en el futuro.
+    // --- NUEVO: IDENTIFICADOR ÚNICO (EJ: A1000) ---
+    gameId: { type: String, unique: true },
+    // --- NUEVO: TUTORIAL ---
+    hasSeenTutorial: { type: Boolean, default: false },
     // ... tus otros campos (coins, friends, etc)
     squad: { type: mongoose.Schema.Types.ObjectId, ref: 'Squad', default: null }, // <--- NUEVO
 
@@ -367,6 +376,23 @@ const userSchema = new mongoose.Schema({
 });
 
 const User = mongoose.model('User', userSchema);
+
+// --- NUEVO: CONTADOR GLOBAL PARA IDs ÚNICOS (EJ: A1000) ---
+const counterSchema = new mongoose.Schema({
+    id: { type: String, required: true },
+    seq: { type: Number, default: 1000 }
+});
+const Counter = mongoose.model('Counter', counterSchema);
+
+// --- NUEVO: SISTEMA DE FEEDBACK ---
+const feedbackSchema = new mongoose.Schema({
+    gameId: { type: String, required: true },
+    category: { type: String, default: 'Ideas' }, // 'Ideas', 'Bugs & Errors', 'Help'
+    message: { type: String, required: true },
+    timestamp: { type: Date, default: Date.now },
+    status: { type: String, default: 'pending' } // 'pending', 'reviewed', 'rewarded'
+});
+const Feedback = mongoose.model('Feedback', feedbackSchema);
 
 
 
@@ -447,6 +473,41 @@ const itemSchema = new mongoose.Schema({
 const Item = mongoose.model('Item', itemSchema);
 
 // --- 🌟 NUEVO: TAREAS Y LOGROS GLOBALES 🌟 ---
+// --- NUEVO: ARGEMS PREMIUM PACKAGES ---
+const argemPackageSchema = new mongoose.Schema({
+    id: { type: String, required: true, unique: true },
+    title: { type: String, required: true },
+    gemsAmount: { type: Number, required: true },
+    priceString: { type: String, required: true },
+    priceCents: { type: Number, required: true },
+    badge: { type: String, default: "" },
+    color: { type: String, default: "#9b59b6" }
+});
+const ArgemPackage = mongoose.model('ArgemPackage', argemPackageSchema);
+
+let ARGEM_PACKAGES = []; // Cached in RAM
+
+async function loadArgemPackagesFromDB() {
+    try {
+        const packages = await ArgemPackage.find({}).sort({ priceCents: 1 }).lean();
+        if (packages.length === 0) {
+            const defaultPackages = [
+                { id: 'argems_500', title: 'Handful of Argems', gemsAmount: 500, priceString: '$4.99', priceCents: 499, color: '#3498db' },
+                { id: 'argems_1200', title: 'Pouch of Argems', gemsAmount: 1200, priceString: '$9.99', priceCents: 999, badge: 'Best Value!', color: '#9b59b6' },
+                { id: 'argems_2500', title: 'Chest of Argems', gemsAmount: 2500, priceString: '$19.99', priceCents: 1999, color: '#e67e22' },
+                { id: 'argems_6500', title: 'Vault of Argems', gemsAmount: 6500, priceString: '$49.99', priceCents: 4999, badge: 'Mega Vault!', color: '#f1c40f' }
+            ];
+            await ArgemPackage.insertMany(defaultPackages);
+            ARGEM_PACKAGES = defaultPackages;
+            console.log('💎 Argem Packages seeded into MongoDB.');
+        } else {
+            ARGEM_PACKAGES = packages;
+        }
+    } catch (e) {
+        console.error("Error loading Argem packages:", e);
+    }
+}
+
 let GLOBAL_TASKS = {};
 async function loadTasksFromDB() {
     try {
@@ -724,6 +785,8 @@ async function loadArenasFromDB() {
                 isRanked: a.isRanked || false,
                 aliveTeam1: 0,
                 aliveTeam2: 0,
+                doorX: parseInt(a.arenaId.split('_')[1]) || 0,
+                doorY: parseInt(a.arenaId.split('_')[2]) || 0,
                 ball: a.gameType === 'soccer' ? {
                     x: (a.config?.ballX || 0) * 16,
                     y: (a.config?.ballY || 0) * 16,
@@ -802,8 +865,68 @@ const PM = mongoose.model('PM', pmSchema);
 
 // Use the port Render gives us, or default to 8080 for local testing
 const PORT = process.env.PORT || 8080;
-const wss = new WebSocket.Server({ port: PORT });
+const app = express();
 
+// Stripe Webhook MUST use express.raw to preserve the raw body for signature verification
+app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+    const sig = req.headers['stripe-signature'];
+    const endpointSecret = process.env.STRIPE_WEBHOOK_SECRET;
+
+    let event;
+    try {
+        event = stripe.webhooks.constructEvent(req.body, sig, endpointSecret);
+    } catch (err) {
+        console.error("⚠️ Stripe Webhook Error:", err.message);
+        return res.status(400).send(`Webhook Error: ${err.message}`);
+    }
+
+    // Handle the checkout session completed event
+    if (event.type === 'checkout.session.completed') {
+        const session = event.data.object;
+        const accountId = session.metadata.accountId;
+        const packageId = session.metadata.packageId;
+        const gemsToAdd = parseInt(session.metadata.gemsAmount, 10);
+
+        try {
+            // Give gems to the user in the database
+            const user = await User.findOneAndUpdate(
+                { accountId: accountId },
+                { $inc: { gems: gemsToAdd } },
+                { new: true }
+            );
+
+            console.log(`💰 Stripe Webhook: Granted ${gemsToAdd} gems to ${accountId}`);
+
+            // Find if the player is currently online to instantly update their game!
+            for (let id in players) {
+                if (players[id].accountId === accountId) {
+                    players[id].gems = user.gems;
+                    // Find their specific WebSocket connection
+                    wss.clients.forEach(client => {
+                        if (client.playerId === id && client.readyState === WebSocket.OPEN) {
+                            client.send(encode({ 
+                                type: 'gems_purchase_success', 
+                                newGems: user.gems,
+                                message: `Payment Success! +${gemsToAdd} Argems!`
+                            }));
+                        }
+                    });
+                    break;
+                }
+            }
+        } catch (e) {
+            console.error("Error updating user gems from webhook:", e);
+        }
+    }
+
+    res.json({ received: true });
+});
+
+// Serve frontend static files
+app.use(express.static(__dirname));
+
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ server });
 // This object acts as the server's memory. It holds every player's current state.
 const players = {};
 
@@ -995,6 +1118,7 @@ setInterval(() => {
 // The New Targeted Broadcast (AoI)
 function broadcastToZone(data, targetChunkId, excludeWs = null) {
     if (!targetChunkId) return;
+    if (data && data.player && data.player.invisibleEnabled) return; // Completely hide from zone broadcasts
 
     // ⚡ ENCODE ONCE, SEND TO MANY
     const payload = encode(data);
@@ -1077,10 +1201,22 @@ wss.on('connection', async (ws) => {
                 if (existingUser) return ws.send(encode({ type: 'auth_error', message: 'Email already registered' }));
 
                 const hashedPassword = await bcrypt.hash(data.password, 10);
+
+                // --- NUEVO: GENERAR GAME ID ---
+                const counter = await Counter.findOneAndUpdate(
+                    { id: 'userId' },
+                    { $inc: { seq: 1 } },
+                    { new: true, upsert: true }
+                );
+                // Offset de 999 para que el primer jugador empiece en A1000
+                const seqNumber = counter.seq + 999;
+                const newGameId = "A" + seqNumber;
+
                 const newUser = new User({
                     email: data.email,
                     username: data.username, // Give them a default display name
-                    password: hashedPassword
+                    password: hashedPassword,
+                    gameId: newGameId
                 });
                 await newUser.save();
 
@@ -1105,6 +1241,18 @@ wss.on('connection', async (ws) => {
                     await user.save();
                 }
 
+                // --- NUEVO: RETROACTIVELY GIVE EXISTING PLAYERS A GAME ID ---
+                if (!user.gameId) {
+                    const counter = await Counter.findOneAndUpdate(
+                        { id: 'userId' },
+                        { $inc: { seq: 1 } },
+                        { new: true, upsert: true }
+                    );
+                    const seqNumber = counter.seq + 999;
+                    user.gameId = "A" + seqNumber;
+                    await user.save();
+                }
+
                 const newToken = Math.random().toString(36).substring(2) + Math.random().toString(36).substring(2);
                 user.token = newToken;
                 await user.save();
@@ -1115,6 +1263,8 @@ wss.on('connection', async (ws) => {
                 // Pass their data to the lobby memory
                 players[id].email = user.email; // Hidden from other players
                 players[id].username = user.username;
+                players[id].gameId = user.gameId; // <--- NUEVO
+                players[id].role = user.role; // <--- ADMIN ROLE
                 players[id].worldX = user.worldX;
                 players[id].worldY = user.worldY;
                 players[id].friends = user.friends;
@@ -1131,6 +1281,7 @@ wss.on('connection', async (ws) => {
 
                 // --- NUEVO: CARGAR MONEDAS A LA RAM ---
                 players[id].coins = user.coins || 0;
+                players[id].gems = user.gems || 0; // Cargar Argems
 
                 // 👇 NUEVO: CARGAR KILLS Y LOSSES 👇
                 players[id].kills = user.kills || 0;
@@ -1196,13 +1347,171 @@ wss.on('connection', async (ws) => {
                     friends: user.friends,
                     globalTasks: GLOBAL_TASKS,
                     taskProgress: players[id].taskProgress,
-                    claimedTasks: players[id].claimedTasks
+                    claimedTasks: players[id].claimedTasks,
+                    hasSeenTutorial: user.hasSeenTutorial
                 }));
                 console.log(`[LOGIN_SUCCESS] Sending claimedTasks for ${user.email}:`, players[id].claimedTasks);
 
                 // Move the closing bracket so 'ws' is the second argument!
                 broadcast({ type: 'update', id: id, player: players[id] }, ws);
+
+                // --- NUEVO: TRIGGER TUTORIAL IF NEEDED ---
+                if (!user.hasSeenTutorial) {
+                    ws.send(encode({ type: 'trigger_tutorial' }));
+                }
             } catch (err) { console.error(err); }
+        }
+
+        // --- NUEVO: HANDLE FEEDBACK ---
+        if (data.type === 'submit_feedback' && isAuthenticated) {
+            try {
+                const newFeedback = new Feedback({
+                    gameId: players[id].gameId,
+                    category: data.category || 'Ideas',
+                    message: data.message
+                });
+                await newFeedback.save();
+                ws.send(encode({ type: 'feedback_success', message: 'Thanks for your feedback! If reviewed and useful we will reward you with an item or something' }));
+            } catch (err) {
+                console.error(err);
+                ws.send(encode({ type: 'system_message', text: 'Error submitting feedback.' }));
+            }
+        }
+
+        // --- NUEVO: TUTORIAL COMPLETED ---
+        if (data.type === 'tutorial_completed' && isAuthenticated) {
+            try {
+                await User.findOneAndUpdate({ email: currentUser }, { hasSeenTutorial: true });
+            } catch (err) { console.error(err); }
+        }
+
+        // --- NUEVO: ADMIN TOOLS ---
+        if (['admin_teleport', 'admin_summon', 'admin_kick', 'admin_respawn', 'admin_invisible', 'admin_noclip'].includes(data.type) && isAuthenticated) {
+            if ((players[id].role || '').toLowerCase() !== 'admin') {
+                ws.send(encode({ type: 'system_message', text: 'You do not have permission to use admin tools.', isAlert: true }));
+                return;
+            }
+
+            // Find target player by gameId
+            let targetWs = null;
+            let targetId = null;
+            for (const client of wss.clients) {
+                if (client.readyState === WebSocket.OPEN && client.playerId && players[client.playerId] && players[client.playerId].gameId === data.targetGameId) {
+                    targetWs = client;
+                    targetId = client.playerId;
+                    break;
+                }
+            }
+
+            if (!targetWs && data.type !== 'admin_invisible' && data.type !== 'admin_noclip') {
+                if (data.type === 'admin_teleport') {
+                    try {
+                        const offlineUser = await User.findOne({ gameId: data.targetGameId });
+                        if (!offlineUser) {
+                            ws.send(encode({ type: 'system_message', text: `Player ${data.targetGameId} does not exist in database.`, isAlert: true }));
+                            return;
+                        }
+                        players[id].worldX = offlineUser.worldX || 0;
+                        players[id].worldY = offlineUser.worldY || 0;
+                        ws.send(encode({ type: 'force_position', x: players[id].worldX, y: players[id].worldY, reason: 'teleport' }));
+                        broadcast({ type: 'update', id: id, player: players[id] }, ws);
+                        ws.send(encode({ type: 'system_message', text: `Teleported to offline player ${data.targetGameId}.` }));
+                        return;
+                    } catch (e) {
+                        console.error("Offline teleport error", e);
+                        ws.send(encode({ type: 'system_message', text: 'Database error looking up player.', isAlert: true }));
+                        return;
+                    }
+                } else {
+                    const onlineIds = Array.from(wss.clients).map(c => {
+                        let p = players[c.playerId];
+                        if (!p) return 'Null';
+                        return `${p.email || 'Guest'}[${p.gameId || 'None'}]`;
+                    }).join(', ');
+                    ws.send(encode({ type: 'system_message', text: `Player ${data.targetGameId} not found. Online: ${onlineIds}`, isAlert: true }));
+                    return;
+                }
+            }
+
+            if (data.type === 'admin_teleport') {
+                players[id].worldX = players[targetId].worldX;
+                players[id].worldY = players[targetId].worldY;
+                ws.send(encode({ type: 'force_position', x: players[id].worldX, y: players[id].worldY, reason: 'teleport' }));
+                broadcast({ type: 'update', id: id, player: players[id] }, ws);
+                ws.send(encode({ type: 'system_message', text: `Teleported to ${data.targetGameId}.` }));
+            }
+            else if (data.type === 'admin_summon') {
+                players[targetId].worldX = players[id].worldX;
+                players[targetId].worldY = players[id].worldY;
+                targetWs.send(encode({ type: 'force_position', x: players[id].worldX, y: players[id].worldY, reason: 'teleport' }));
+                broadcast({ type: 'update', id: targetId, player: players[targetId] }, targetWs);
+                ws.send(encode({ type: 'system_message', text: `Summoned ${data.targetGameId} to your location.` }));
+            }
+            else if (data.type === 'admin_kick') {
+                targetWs.send(encode({ type: 'auth_error', message: 'You have been kicked by an administrator.' }));
+                targetWs.close();
+                ws.send(encode({ type: 'system_message', text: `Kicked ${data.targetGameId}.` }));
+            }
+            else if (data.type === 'admin_respawn') {
+                players[targetId].worldX = 0;
+                players[targetId].worldY = 0;
+                targetWs.send(encode({ type: 'force_position', x: 0, y: 0, reason: 'teleport' }));
+                broadcast({ type: 'update', id: targetId, player: players[targetId] }, targetWs);
+                ws.send(encode({ type: 'system_message', text: `Sent ${data.targetGameId} to spawn.` }));
+            }
+            else if (data.type === 'admin_invisible') {
+                players[id].invisibleEnabled = data.enabled;
+                if (data.enabled) {
+                    broadcast({ type: 'left', id: id });
+                } else {
+                    broadcast({ type: 'update', id: id, player: players[id] });
+                }
+                ws.send(encode({ type: 'system_message', text: `Invisible mode: ${data.enabled ? 'ON' : 'OFF'}`, color: '#38ef7d' }));
+            }
+            else if (data.type === 'admin_noclip') {
+                ws.send(encode({ type: 'system_message', text: `Noclip mode: ${data.enabled ? 'ON' : 'OFF'}`, color: '#38ef7d' }));
+            }
+        }
+
+        if (data.type === 'admin_clearenas' && isAuthenticated) {
+            if ((players[id].role || '').toLowerCase() !== 'admin') {
+                ws.send(encode({ type: 'system_message', text: 'You do not have permission.', isAlert: true }));
+                return;
+            }
+            try {
+                const count = Object.keys(arenasRAM).length;
+                for (const arenaId in arenasRAM) {
+                    delete arenasRAM[arenaId];
+                    wss.clients.forEach(c => {
+                        if (c.readyState === WebSocket.OPEN) {
+                            c.send(encode({ type: 'delete_minigame', arenaId: arenaId }));
+                        }
+                    });
+                }
+                await Arena.deleteMany({});
+                ws.send(encode({ type: 'system_message', text: `Cleared ${count} minigame arenas successfully!`, color: '#38ef7d' }));
+                console.log(`🧹 ADMIN NUKE: Cleared ${count} arenas.`);
+            } catch (e) {
+                console.error("Error clearing arenas:", e);
+                ws.send(encode({ type: 'system_message', text: 'Error clearing arenas from database.', isAlert: true }));
+            }
+        }
+
+        if (data.type === 'admin_announce' && isAuthenticated) {
+            if ((players[id].role || '').toLowerCase() !== 'admin') {
+                ws.send(encode({ type: 'system_message', text: 'You do not have permission to use admin tools.', isAlert: true }));
+                return;
+            }
+            if (data.message) {
+                const msgPacket = encode({ type: 'global_announcement', message: data.message });
+                wss.clients.forEach(client => {
+                    if (client.readyState === WebSocket.OPEN) {
+                        client.send(msgPacket);
+                    }
+                });
+                console.log(`[GLOBAL ANNOUNCEMENT] ${data.message}`);
+                ws.send(encode({ type: 'system_message', text: 'Announcement sent successfully.' }));
+            }
         }
 
         // 3. HANDLE PROFILE EDITS (Ahora es limpio gracias a los IDs)
@@ -1272,6 +1581,21 @@ wss.on('connection', async (ws) => {
                     const key = `${data.x},${data.y},${data.l}`;
                     delete serverWorldMap[key];
 
+                    // BORRAR MINIJUEGOS SI EXISTEN EN ESTA COORDENADA
+                    const uniqueArenaId = `arena_${data.x}_${data.y}`;
+                    if (arenasRAM[uniqueArenaId]) {
+                        await Arena.deleteOne({ arenaId: uniqueArenaId });
+                        delete arenasRAM[uniqueArenaId];
+
+                        // Avisar a todos los clientes para que escondan el marcador y borren el balon
+                        wss.clients.forEach(c => {
+                            if (c.readyState === WebSocket.OPEN) {
+                                c.send(encode({ type: 'delete_minigame', arenaId: uniqueArenaId }));
+                            }
+                        });
+                        console.log(`🗑️ Minigame eliminado con el Borrador: ${uniqueArenaId}`);
+                    }
+
                     // 👇 EL FIX: Si pasamos el borrador por encima de la base, la destruimos
                     // 👇 EL FIX: Solo destruimos la base si borramos en la Capa 15 (Lógica)
                     if (centralBase && centralBase.gridX === data.x && centralBase.gridY === data.y && data.l === 15) {
@@ -1286,7 +1610,7 @@ wss.on('connection', async (ws) => {
                     // 🎨 PAINT: Destroy old corrupted tiles first, then insert the clean new one
                     await Tile.deleteMany(query);
                     await Tile.create({ x: data.x, y: data.y, l: data.l, tileId: data.tileId });
-                    
+
                     // RAM UPDATE
                     const key = `${data.x},${data.y},${data.l}`;
                     serverWorldMap[key] = { tileId: data.tileId, l: data.l };
@@ -1338,7 +1662,7 @@ wss.on('connection', async (ws) => {
                     if (t.tileId === -1) {
                         // BORRADOR: Solo borramos el bloque específico en su capa
                         bulkOps.push({ deleteMany: { filter: { x: t.x, y: t.y, l: t.l } } });
-                        
+
                         // LIMPIEZA EN RAM!
                         const key = `${t.x},${t.y},${t.l}`;
                         delete serverWorldMap[key];
@@ -1563,6 +1887,23 @@ wss.on('connection', async (ws) => {
 
                     console.log(`🎮 Minigame Guardado en vivo: ${dbArena.name} (${dbArena.gameType})`);
                 } else if (data.triggerType !== undefined) {
+                    // Si cambias el bloque para quitar el minijuego, lo destruimos
+                    if (data.triggerType !== 'arena') {
+                        const uniqueArenaId = `arena_${data.x}_${data.y}`;
+                        if (arenasRAM[uniqueArenaId]) {
+                            await Arena.deleteOne({ arenaId: uniqueArenaId });
+                            delete arenasRAM[uniqueArenaId];
+
+                            // Avisar a todos los clientes para que escondan el marcador y borren el balon
+                            wss.clients.forEach(c => {
+                                if (c.readyState === WebSocket.OPEN) {
+                                    c.send(encode({ type: 'delete_minigame', arenaId: uniqueArenaId }));
+                                }
+                            });
+                            console.log(`🗑️ Minigame eliminado mediante el Inspector: ${uniqueArenaId}`);
+                        }
+                    }
+
                     // Si cambias el bloque a "Normal" estando en la Capa 15, DESTRUIMOS LA BASE
                     if (centralBase && centralBase.gridX === data.x && centralBase.gridY === data.y && data.layer === 15) {
                         await Turf.deleteOne({ turfId: centralBase.turfId });
@@ -1724,12 +2065,26 @@ wss.on('connection', async (ws) => {
                     await user.save();
                 }
 
+                // --- NUEVO: RETROACTIVELY GIVE EXISTING PLAYERS A GAME ID ---
+                if (!user.gameId) {
+                    const counter = await Counter.findOneAndUpdate(
+                        { id: 'userId' },
+                        { $inc: { seq: 1 } },
+                        { new: true, upsert: true }
+                    );
+                    const seqNumber = counter.seq + 999;
+                    user.gameId = "A" + seqNumber;
+                    await user.save();
+                }
+
                 isAuthenticated = true;
                 currentUser = user.email; // We track the session by email now!
 
                 // Pass their data to the lobby memory
                 players[id].email = user.email;
                 players[id].username = user.username;
+                players[id].gameId = user.gameId; // <--- NUEVO
+                players[id].role = user.role; // <--- ADMIN ROLE
                 players[id].worldX = user.worldX;
                 players[id].worldY = user.worldY;
                 players[id].friends = user.friends; // Don't forget the friends list!
@@ -1743,6 +2098,7 @@ wss.on('connection', async (ws) => {
 
                 // --- NUEVO: CARGAR MONEDAS A LA RAM ---
                 players[id].coins = user.coins || 0;
+                players[id].gems = user.gems || 0; // Cargar Argems
 
                 // 👇 NUEVO: CARGAR KILLS Y LOSSES 👇
                 players[id].kills = user.kills || 0;
@@ -1808,12 +2164,18 @@ wss.on('connection', async (ws) => {
                     friends: user.friends,
                     globalTasks: GLOBAL_TASKS,
                     taskProgress: players[id].taskProgress,
-                    claimedTasks: players[id].claimedTasks
+                    claimedTasks: players[id].claimedTasks,
+                    hasSeenTutorial: user.hasSeenTutorial
                 }));
                 console.log(`[LOGIN_SUCCESS] Sending claimedTasks for ${user.email}:`, players[id].claimedTasks);
 
                 // Tell everyone else you arrived (excluding yourself so no ghost clone appears!)
                 broadcast({ type: 'update', id: id, player: players[id] }, ws);
+
+                // --- NUEVO: TRIGGER TUTORIAL IF NEEDED ---
+                if (!user.hasSeenTutorial) {
+                    ws.send(encode({ type: 'trigger_tutorial' }));
+                }
             } catch (err) { console.error(err); }
         }
 
@@ -2529,6 +2891,56 @@ wss.on('connection', async (ws) => {
             }).catch(err => console.error("Error al guardar en MongoDB:", err));
         }
 
+        // --- NUEVO: SISTEMA DE ARGEMS (TIENDA PREMIUM) ---
+        if (data.type === 'get_argem_packages' && isAuthenticated) {
+            ws.send(encode({ type: 'argem_packages_data', packages: ARGEM_PACKAGES }));
+        }
+
+        if (data.type === 'request_purchase_gems' && isAuthenticated) {
+            const p = players[id];
+            if (!p) return;
+
+            const pkg = ARGEM_PACKAGES.find(pkg => pkg.id === data.packageId);
+            if (!pkg) {
+                return ws.send(encode({ type: 'system_message', text: "Error: Paquete no encontrado.", color: '#e74c3c' }));
+            }
+
+            try {
+                // Generate a real Stripe Checkout Session
+                stripe.checkout.sessions.create({
+                    payment_method_types: ['card'],
+                    line_items: [{
+                        price_data: {
+                            currency: 'usd',
+                            product_data: {
+                                name: pkg.title,
+                                description: pkg.gemsAmount + " Argems for your account"
+                            },
+                            unit_amount: pkg.priceCents,
+                        },
+                        quantity: 1,
+                    }],
+                    mode: 'payment',
+                    success_url: `${process.env.CLIENT_URL || 'http://localhost:8080'}/demo.html?payment=success`, 
+                    cancel_url: `${process.env.CLIENT_URL || 'http://localhost:8080'}/demo.html?payment=cancel`,
+                    metadata: {
+                        accountId: p.accountId,
+                        packageId: pkg.id,
+                        gemsAmount: pkg.gemsAmount
+                    }
+                }).then(session => {
+                    // Send the secure checkout URL back to the client
+                    ws.send(encode({ type: 'stripe_checkout_url', url: session.url }));
+                }).catch(err => {
+                    console.error("Stripe Error:", err);
+                    ws.send(encode({ type: 'system_message', text: "Payment system unavailable.", color: '#e74c3c' }));
+                });
+            } catch (err) {
+                console.error("Stripe Error:", err);
+                ws.send(encode({ type: 'system_message', text: "Payment system unavailable.", color: '#e74c3c' }));
+            }
+        }
+
         // 13. SISTEMA DE COMPRAS SEGURAS (TIENDA)
         if (data.type === 'buy_item' && isAuthenticated) {
             const p = players[id];
@@ -2621,6 +3033,7 @@ wss.on('connection', async (ws) => {
                 // 3. Actualizar la memoria RAM del servidor
                 if (players[id]) {
                     players[id].coins = myUser.coins;
+                    players[id].gems = myUser.gems;
                     players[id].squad = newSquad._id.toString();
                     players[id].squadName = newSquad.name;
                     players[id].squadLogo = newSquad.logo;
@@ -3549,6 +3962,7 @@ wss.on('connection', async (ws) => {
                     user.hotbar = players[id].hotbar;
                     user.quickSwaps = players[id].quickSwaps;
                     user.coins = players[id].coins;
+                    user.gems = players[id].gems;
                     user.hp = players[id].hp;
                     user.isDead = players[id].isDead;
                     user.kills = players[id].kills;
@@ -3586,7 +4000,7 @@ wss.on('connection', async (ws) => {
         type: 'init',
         id: id,
         playlist: GLOBAL_BGM_PLAYLIST, // 🛑 LA SOLUCIÓN: Le decimos qué canción debe poner apenas entre
-        players: players,
+        players: Object.fromEntries(Object.entries(players).filter(([k, v]) => !v.invisibleEnabled || k === id)),
         worldMap: allTiles,
         weaponsDB: WEAPONS,
         tilesetsDB: TILESETS,
@@ -3618,6 +4032,7 @@ wss.on('connection', async (ws) => {
 
 // Global Broadcast (Only for things like server shutdown or global events)
 function broadcast(data, excludeWs = null) {
+    if (data && data.player && data.player.invisibleEnabled) return; // Completely hide from global broadcasts
     const payload = encode(data);
     wss.clients.forEach((client) => {
         if (client !== excludeWs && client.readyState === WebSocket.OPEN) {
@@ -3886,6 +4301,7 @@ setInterval(async () => {
                             hotbar: p.hotbar,
                             quickSwaps: p.quickSwaps,
                             coins: p.coins,
+                            gems: p.gems,
                             hp: p.hp,
                             isDead: p.isDead,
                             kills: p.kills,
@@ -3927,6 +4343,27 @@ setInterval(() => {
             // Stop ball if very slow
             if (Math.abs(ball.vx) < 0.1) ball.vx = 0;
             if (Math.abs(ball.vy) < 0.1) ball.vy = 0;
+
+            // Player Collision (bounce off stationary or moving players)
+            const allPlayers = [...(arena.team1 || []), ...(arena.team2 || [])];
+            allPlayers.forEach(pid => {
+                let p = players[pid];
+                if (p) {
+                    const dx = ball.x - p.worldX;
+                    const dy = ball.y - p.worldY;
+                    const dist = Math.hypot(dx, dy);
+                    if (dist > 0 && dist < 24) { // 24px radius collision
+                        const overlap = 24 - dist;
+                        const nx = dx / dist;
+                        const ny = dy / dist;
+
+                        // Instead of pushing coordinates (which breaks wall collision), 
+                        // we aggressively apply velocity so it bounces off the player naturally.
+                        ball.vx += nx * 5;
+                        ball.vy += ny * 5;
+                    }
+                }
+            });
 
             if (ball.vx !== 0 || ball.vy !== 0) {
                 // Separated Axis Collision Check for robust wall bouncing
@@ -3971,7 +4408,7 @@ setInterval(() => {
                     if (ball.score2 >= 3) {
                         endArenaMatch(arena, 2);
                     } else {
-                        resetBall(ball);
+                        resetRound(arena);
                     }
                 }
 
@@ -3983,7 +4420,7 @@ setInterval(() => {
                     if (ball.score1 >= 3) {
                         endArenaMatch(arena, 1);
                     } else {
-                        resetBall(ball);
+                        resetRound(arena);
                     }
                 }
 
@@ -4007,9 +4444,9 @@ setInterval(() => {
                         if (p.currentArena === arena.arenaId) {
                             client.send(updatePayload);
                         } else {
-                            // Proximity check for spectators (within 800 pixels)
+                            // Proximity check for spectators (within 320 pixels instead of 800)
                             const dist = Math.hypot(p.worldX - ball.spawnX, p.worldY - ball.spawnY);
-                            if (dist < 800) {
+                            if (dist < 320) {
                                 client.send(updatePayload);
                             }
                         }
@@ -4020,11 +4457,48 @@ setInterval(() => {
     }
 }, 1000 / 30); // 30 FPS
 
-function resetBall(ball) {
-    ball.x = ball.spawnX;
-    ball.y = ball.spawnY;
-    ball.vx = 0;
-    ball.vy = 0;
+function resetRound(arena) {
+    if (arena.ball) {
+        arena.ball.x = arena.ball.spawnX;
+        arena.ball.y = arena.ball.spawnY;
+        arena.ball.vx = 0;
+        arena.ball.vy = 0;
+    }
+
+    // Teletransportar jugadores a sus spawns originales
+    arena.team1.forEach((pid, index) => {
+        let p = players[pid];
+        if (p) {
+            const t1Needed = parseInt(arena.team1Size) || 1;
+            const spawnOffset = (index * 32) - (((t1Needed - 1) * 32) / 2);
+            p.worldX = (arena.p1X * 16) + 8 + spawnOffset;
+            p.worldY = (arena.p1Y * 16) + 8;
+            p.vx = 0;
+            p.vy = 0;
+            wss.clients.forEach(c => {
+                if (c.playerId === pid && c.readyState === WebSocket.OPEN) {
+                    c.send(encode({ type: 'force_position', x: p.worldX, y: p.worldY, reason: 'round_reset' }));
+                }
+            });
+        }
+    });
+
+    arena.team2.forEach((pid, index) => {
+        let p = players[pid];
+        if (p) {
+            const t2Needed = parseInt(arena.team2Size) || 1;
+            const spawnOffset = (index * 32) - (((t2Needed - 1) * 32) / 2);
+            p.worldX = (arena.p2X * 16) + 8 + spawnOffset;
+            p.worldY = (arena.p2Y * 16) + 8;
+            p.vx = 0;
+            p.vy = 0;
+            wss.clients.forEach(c => {
+                if (c.playerId === pid && c.readyState === WebSocket.OPEN) {
+                    c.send(encode({ type: 'force_position', x: p.worldX, y: p.worldY, reason: 'round_reset' }));
+                }
+            });
+        }
+    });
 }
 
 function endArenaMatch(arena, winningTeam) {
@@ -4058,8 +4532,9 @@ function endArenaMatch(arena, winningTeam) {
             p.isDead = false;
             p.lastHitTime = Date.now();
             p.invulnerableUntil = Date.now() + 2000;
-            p.worldX = p.preSparX;
-            p.worldY = p.preSparY;
+
+            p.worldX = p.preSparX || 0;
+            p.worldY = p.preSparY || 0;
 
             let resultMsg = isWinner ? "¡VICTORIA! 🏆" : "DERROTA 💀";
             if (arena.gameType === 'soccer') {
@@ -4069,7 +4544,7 @@ function endArenaMatch(arena, winningTeam) {
 
             wss.clients.forEach(c => {
                 if (c.playerId === pid && c.readyState === WebSocket.OPEN) {
-                    c.send(encode({ type: 'match_finished', returnX: p.preSparX, returnY: p.preSparY, result: resultMsg, newElo: p.elo }));
+                    c.send(encode({ type: 'match_finished', returnX: p.worldX, returnY: p.worldY, result: resultMsg, newElo: p.elo }));
                 }
             });
         }
@@ -4082,10 +4557,12 @@ function endArenaMatch(arena, winningTeam) {
     if (arena.ball) {
         arena.ball.score1 = 0;
         arena.ball.score2 = 0;
-        resetBall(arena.ball);
+        resetRound(arena);
     }
 
     broadcast({ type: 'refresh_arena_ui', arenaId: arena.arenaId });
 }
 
-console.log(`WebSocket server running on port ${PORT}`);
+server.listen(PORT, () => {
+    console.log(`HTTP/WebSocket server running on port ${PORT}`);
+});
