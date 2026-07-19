@@ -904,8 +904,8 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
                     // Find their specific WebSocket connection
                     wss.clients.forEach(client => {
                         if (client.playerId === id && client.readyState === WebSocket.OPEN) {
-                            client.send(encode({ 
-                                type: 'gems_purchase_success', 
+                            client.send(encode({
+                                type: 'gems_purchase_success',
                                 newGems: user.gems,
                                 message: `Payment Success! +${gemsToAdd} Argems!`
                             }));
@@ -2921,8 +2921,8 @@ wss.on('connection', async (ws) => {
                         quantity: 1,
                     }],
                     mode: 'payment',
-                    success_url: `${process.env.CLIENT_URL || 'http://localhost:8080'}/demo.html?payment=success`, 
-                    cancel_url: `${process.env.CLIENT_URL || 'http://localhost:8080'}/demo.html?payment=cancel`,
+                    success_url: `${process.env.CLIENT_URL || 'http://localhost:8080'}/payment_success.html`,
+                    cancel_url: `${process.env.CLIENT_URL || 'http://localhost:8080'}/payment_cancel.html`,
                     metadata: {
                         email: currentUser,
                         packageId: pkg.id,
