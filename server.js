@@ -883,23 +883,23 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
     // Handle the checkout session completed event
     if (event.type === 'checkout.session.completed') {
         const session = event.data.object;
-        const accountId = session.metadata.accountId;
+        const email = session.metadata.email;
         const packageId = session.metadata.packageId;
         const gemsToAdd = parseInt(session.metadata.gemsAmount, 10);
 
         try {
             // Give gems to the user in the database
             const user = await User.findOneAndUpdate(
-                { accountId: accountId },
+                { email: email },
                 { $inc: { gems: gemsToAdd } },
                 { new: true }
             );
 
-            console.log(`💰 Stripe Webhook: Granted ${gemsToAdd} gems to ${accountId}`);
+            console.log(`💰 Stripe Webhook: Granted ${gemsToAdd} gems to ${email}`);
 
             // Find if the player is currently online to instantly update their game!
             for (let id in players) {
-                if (players[id].accountId === accountId) {
+                if (players[id].username === user.username) {
                     players[id].gems = user.gems;
                     // Find their specific WebSocket connection
                     wss.clients.forEach(client => {
@@ -2924,7 +2924,7 @@ wss.on('connection', async (ws) => {
                     success_url: `${process.env.CLIENT_URL || 'http://localhost:8080'}/demo.html?payment=success`, 
                     cancel_url: `${process.env.CLIENT_URL || 'http://localhost:8080'}/demo.html?payment=cancel`,
                     metadata: {
-                        accountId: p.accountId,
+                        email: currentUser,
                         packageId: pkg.id,
                         gemsAmount: pkg.gemsAmount
                     }
