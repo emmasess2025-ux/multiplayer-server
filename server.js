@@ -318,17 +318,33 @@ const taskSchema = new mongoose.Schema({
     title: { type: String, required: true },
     description: { type: String },
 
-    category: { type: String, enum: ['daily', 'squad', 'milestone', 'event'], default: 'daily' },
+    category: { type: String, enum: ['daily', 'squad', 'milestone', 'event', 'battle_pass'], default: 'daily' },
     requirementType: { type: String, enum: ['login', 'play_hours', 'kills', 'elo'], default: 'login' },
     requirementValue: { type: Number, required: true },
 
     rewardType: { type: String, enum: ['coins', 'item'], default: 'coins' },
-    rewardValue: { type: mongoose.Schema.Types.Mixed, required: true },
+        rewardValue: { type: mongoose.Schema.Types.Mixed, required: true },
+    bpXpReward: { type: Number, default: 100 }, // NUEVO: Premio de Pase de Batalla
 
     isRepeatable: { type: Boolean, default: false },
     resetIntervalMs: { type: Number, default: 0 } // 86400000 for daily
 });
 const Task = mongoose.model('Task', taskSchema);
+
+// --- NUEVO: BATTLE PASS SEASON (LIVEOPS) ---
+const seasonSchema = new mongoose.Schema({
+    seasonId: { type: String, required: true, unique: true }, // ej: 'season_1'
+    name: { type: String, required: true }, // ej: 'Neon Origins'
+    isActive: { type: Boolean, default: false },
+    startDate: { type: Date, required: true },
+    endDate: { type: Date, required: true },
+    costArgems: { type: Number, default: 500 },
+    rewards: { type: [mongoose.Schema.Types.Mixed], default: [] } 
+    /* Formato esperado en rewards:
+       [{ level: 1, xpRequired: 1000, free: { type: 'item', id: 'hat_cap' }, premium: { type: 'argems', amount: 50 } }, ...]
+    */
+});
+const Season = mongoose.model('Season', seasonSchema);
 
 // --- THE PLAYER BLUEPRINT (SCHEMA) ---
 const userSchema = new mongoose.Schema({
@@ -350,6 +366,13 @@ const userSchema = new mongoose.Schema({
         hat: { type: String, default: 'none' } // 🎩 NUEVO: Espacio para sombreros
     },
     friends: { type: Array, default: [] },
+
+    // --- NUEVO: BATTLE PASS TRACKING ---
+    bpSeasonId: { type: String, default: "" }, // La temporada actual del jugador
+    bpXP: { type: Number, default: 0 },        // Experiencia ganada en la temporada actual
+    bpPremium: { type: Boolean, default: false }, // ¿Compró el pase premium?
+    bpClaimedFree: { type: [Number], default: [] }, // Niveles reclamados gratis
+    bpClaimedPremium: { type: [Number], default: [] }, // Niveles reclamados premium
 
     // --- NUEVO: SISTEMA DE ECONOMÍA ---
     coins: { type: Number, default: 0 },
@@ -508,6 +531,41 @@ async function loadArgemPackagesFromDB() {
     }
 }
 
+// --- NUEVO: BATTLE PASS XP SYSTEM ---
+async function add_bp_xp(email, amount, ws, p) {
+    if (!ACTIVE_SEASON) return;
+    try {
+        const user = await User.findOne({ email: email });
+        if (!user) return;
+        
+        // Si no est� en la temporada correcta, reset
+        if (user.bpSeasonId !== ACTIVE_SEASON.seasonId) {
+            user.bpSeasonId = ACTIVE_SEASON.seasonId;
+            user.bpXP = 0;
+            user.bpPremium = false;
+            user.bpClaimedFree = [];
+            user.bpClaimedPremium = [];
+        }
+
+        user.bpXP += amount;
+        await user.save();
+
+        if (p) {
+            p.bpSeasonId = user.bpSeasonId;
+            p.bpXP = user.bpXP;
+        }
+
+        if (ws) {
+            ws.send(encode({
+                type: 'bp_xp_added',
+                amount: amount,
+                totalXP: user.bpXP
+            }));
+        }
+    } catch(e) {
+        console.error("Error adding BP XP", e);
+    }
+}
 let GLOBAL_TASKS = {};
 async function loadTasksFromDB() {
     try {
@@ -1287,6 +1345,22 @@ wss.on('connection', async (ws) => {
                 players[id].kills = user.kills || 0;
                 players[id].losses = user.losses || 0;
                 players[id].elo = user.elo || 1000;
+                // --- NUEVO: BATTLE PASS VALIDATION ---
+                if (ACTIVE_SEASON) {
+                    if (user.bpSeasonId !== ACTIVE_SEASON.seasonId) {
+                        user.bpSeasonId = ACTIVE_SEASON.seasonId;
+                        user.bpXP = 0;
+                        user.bpPremium = false;
+                        user.bpClaimedFree = [];
+                        user.bpClaimedPremium = [];
+                        await user.save();
+                    }
+                }
+                players[id].bpSeasonId = user.bpSeasonId || "";
+                players[id].bpXP = user.bpXP || 0;
+                players[id].bpPremium = user.bpPremium || false;
+                players[id].bpClaimedFree = user.bpClaimedFree || [];
+                players[id].bpClaimedPremium = user.bpClaimedPremium || [];
                 // 👇 NUEVO: CARGAR SALUD A LA RAM 👇
                 players[id].hp = user.hp !== undefined ? user.hp : 100;
                 players[id].isDead = user.isDead || false;
@@ -1340,7 +1414,7 @@ wss.on('connection', async (ws) => {
                     }
                 }
                 // Send success and include their friends list!
-                ws.send(encode({
+                                ws.send(encode({
                     type: 'login_success',
                     player: players[id],
                     token: newToken,
@@ -1348,7 +1422,8 @@ wss.on('connection', async (ws) => {
                     globalTasks: GLOBAL_TASKS,
                     taskProgress: players[id].taskProgress,
                     claimedTasks: players[id].claimedTasks,
-                    hasSeenTutorial: user.hasSeenTutorial
+                    hasSeenTutorial: user.hasSeenTutorial,
+                    activeSeason: ACTIVE_SEASON
                 }));
                 console.log(`[LOGIN_SUCCESS] Sending claimedTasks for ${user.email}:`, players[id].claimedTasks);
 
@@ -1511,6 +1586,28 @@ wss.on('connection', async (ws) => {
                 });
                 console.log(`[GLOBAL ANNOUNCEMENT] ${data.message}`);
                 ws.send(encode({ type: 'system_message', text: 'Announcement sent successfully.' }));
+            }
+        }
+
+        // --- ADMIN VOICE CHAT (MEGAPHONE) ---
+        if ((data.type === 'admin_voice_chunk' || data.type === 'admin_voice_status') && isAuthenticated) {
+            if ((players[id].role || '').toLowerCase() !== 'admin') return;
+
+            let packet;
+            if (data.type === 'admin_voice_status') {
+                packet = encode({ type: 'admin_voice_status', isSpeaking: data.isSpeaking, playerId: id });
+            } else if (data.type === 'admin_voice_chunk' && data.audio) {
+                // data.audio is a Uint8Array, MessagePack handles it natively
+                packet = encode({ type: 'admin_voice_chunk', audio: data.audio, adminX: players[id].worldX, adminY: players[id].worldY });
+            }
+
+            if (packet) {
+                wss.clients.forEach(client => {
+                    // Send to everyone except the admin who is speaking
+                    if (client.readyState === WebSocket.OPEN && client.playerId !== id) {
+                        client.send(packet);
+                    }
+                });
             }
         }
 
@@ -2103,7 +2200,23 @@ wss.on('connection', async (ws) => {
                 // 👇 NUEVO: CARGAR KILLS Y LOSSES 👇
                 players[id].kills = user.kills || 0;
                 players[id].losses = user.losses || 0;
-                players[id].elo = user.elo || 1000; // <--- AÑADIR ESTO
+                players[id].elo = user.elo || 1000;
+                // --- NUEVO: BATTLE PASS VALIDATION ---
+                if (ACTIVE_SEASON) {
+                    if (user.bpSeasonId !== ACTIVE_SEASON.seasonId) {
+                        user.bpSeasonId = ACTIVE_SEASON.seasonId;
+                        user.bpXP = 0;
+                        user.bpPremium = false;
+                        user.bpClaimedFree = [];
+                        user.bpClaimedPremium = [];
+                        await user.save();
+                    }
+                }
+                players[id].bpSeasonId = user.bpSeasonId || "";
+                players[id].bpXP = user.bpXP || 0;
+                players[id].bpPremium = user.bpPremium || false;
+                players[id].bpClaimedFree = user.bpClaimedFree || [];
+                players[id].bpClaimedPremium = user.bpClaimedPremium || []; // <--- AÑADIR ESTO
                 // 👇 NUEVO: CARGAR SALUD A LA RAM 👇
                 players[id].hp = user.hp !== undefined ? user.hp : 100;
                 players[id].isDead = user.isDead || false;
@@ -2157,15 +2270,16 @@ wss.on('connection', async (ws) => {
                 }
 
                 // Send success back to the browser
-                ws.send(encode({
+                                ws.send(encode({
                     type: 'login_success',
                     player: players[id],
-                    token: user.token,
+                    token: data.token,
                     friends: user.friends,
                     globalTasks: GLOBAL_TASKS,
                     taskProgress: players[id].taskProgress,
                     claimedTasks: players[id].claimedTasks,
-                    hasSeenTutorial: user.hasSeenTutorial
+                    hasSeenTutorial: user.hasSeenTutorial,
+                    activeSeason: ACTIVE_SEASON
                 }));
                 console.log(`[LOGIN_SUCCESS] Sending claimedTasks for ${user.email}:`, players[id].claimedTasks);
 
@@ -2880,7 +2994,11 @@ wss.on('connection', async (ws) => {
 
             // 4. Avisar al cliente que fue un éxito
             p.claimedTasks[taskId] = now;
-            ws.send(encode({ type: 'task_claimed', taskId: taskId, claimedTasks: p.claimedTasks }));
+                        ws.send(encode({ type: 'task_claimed', taskId: taskId, claimedTasks: p.claimedTasks }));
+
+            // --- NUEVO: RECOMPENSA DE BATTLE PASS ---
+            const bpXp = task.bpXpReward || 100;
+            add_bp_xp(p.email, bpXp, ws, p);
 
             // EL FIX DEFINITIVO: Mongoose .updateOne() directo
             const updateData = { $set: { coins: p.coins, inventory: p.inventory } };
@@ -2942,6 +3060,94 @@ wss.on('connection', async (ws) => {
         }
 
         // 13. SISTEMA DE COMPRAS SEGURAS (TIENDA)
+                // --- NUEVO: BATTLE PASS PACKETS ---
+        if (data.type === 'buy_premium_bp' && isAuthenticated) {
+            const p = players[id];
+            if (!p || !ACTIVE_SEASON) return;
+            if (p.bpPremium) return ws.send(encode({ type: 'bp_error', message: 'You already own the Premium Pass.' }));
+
+            if (p.gems < ACTIVE_SEASON.costArgems) {
+                return ws.send(encode({ type: 'bp_error', message: 'Not enough Argems.' }));
+            }
+
+            p.gems -= ACTIVE_SEASON.costArgems;
+            p.bpPremium = true;
+            
+            ws.send(encode({ type: 'gems_update', gems: p.gems }));
+            ws.send(encode({ type: 'bp_premium_unlocked' }));
+
+            // Guardar as�ncronamente
+            User.updateOne({ email: p.email }, { $set: { gems: p.gems, bpPremium: true } }).catch(console.error);
+        }
+
+        if (data.type === 'claim_bp_reward' && isAuthenticated) {
+            const p = players[id];
+            if (!p || !ACTIVE_SEASON) return;
+
+            const level = data.level;
+            const track = data.track; // 'free' o 'premium'
+
+            // Validar que el nivel exista en la config
+            const rewardData = ACTIVE_SEASON.rewards.find(r => r.level === level);
+            if (!rewardData) return ws.send(encode({ type: 'bp_error', message: 'Invalid level.' }));
+
+            // Validar que tenga el XP necesario
+            if (p.bpXP < rewardData.xpRequired) {
+                return ws.send(encode({ type: 'bp_error', message: 'Not enough XP for this level.' }));
+            }
+
+            // Validar track
+            let rewardToGive = null;
+            if (track === 'free') {
+                if (p.bpClaimedFree.includes(level)) return ws.send(encode({ type: 'bp_error', message: 'Already claimed.' }));
+                rewardToGive = rewardData.free;
+                p.bpClaimedFree.push(level);
+            } else if (track === 'premium') {
+                if (!p.bpPremium) return ws.send(encode({ type: 'bp_error', message: 'You need the Premium Pass.' }));
+                if (p.bpClaimedPremium.includes(level)) return ws.send(encode({ type: 'bp_error', message: 'Already claimed.' }));
+                rewardToGive = rewardData.premium;
+                p.bpClaimedPremium.push(level);
+            }
+
+            if (!rewardToGive) {
+                // Si el premio es null (ejemplo: nivel sin premio gratis), remover el nivel del array para evitar bugs
+                if (track === 'free') p.bpClaimedFree.pop();
+                if (track === 'premium') p.bpClaimedPremium.pop();
+                return ws.send(encode({ type: 'bp_error', message: 'No reward available here.' }));
+            }
+
+            // Otorgar el premio
+            let updatePayload = { bpClaimedFree: p.bpClaimedFree, bpClaimedPremium: p.bpClaimedPremium };
+
+            if (rewardToGive.type === 'coins') {
+                p.coins += rewardToGive.amount;
+                updatePayload.coins = p.coins;
+                ws.send(encode({ type: 'coins_update', coins: p.coins }));
+            } else if (rewardToGive.type === 'argems') {
+                p.gems += rewardToGive.amount;
+                updatePayload.gems = p.gems;
+                ws.send(encode({ type: 'gems_update', gems: p.gems }));
+            } else if (rewardToGive.type === 'item') {
+                if (!p.inventory.includes(rewardToGive.id)) {
+                    p.inventory.push(rewardToGive.id);
+                    updatePayload.inventory = p.inventory;
+                    ws.send(encode({ type: 'inventory_update', inventory: p.inventory }));
+                }
+            }
+
+            // Informar �xito
+            ws.send(encode({ 
+                type: 'bp_reward_claimed', 
+                level: level, 
+                track: track, 
+                reward: rewardToGive,
+                bpClaimedFree: p.bpClaimedFree,
+                bpClaimedPremium: p.bpClaimedPremium
+            }));
+
+            // Guardar as�ncronamente
+            User.updateOne({ email: p.email }, { $set: updatePayload }).catch(console.error);
+        }
         if (data.type === 'buy_item' && isAuthenticated) {
             const p = players[id];
             if (!p) return;
@@ -3120,7 +3326,7 @@ wss.on('connection', async (ws) => {
         }
 
         // 17. OBTENER DETALLES DE UN SQUAD ESPECÍFICO (Con Logo y Stats)
-        if (data.type === 'get_squad_details' && isAuthenticated) {
+        if ((data.type === 'get_squad_details' || data.type === 'get_squad_details_silent') && isAuthenticated) {
             try {
                 const squad = await Squad.findById(data.squadId)
                     // 🛑 EL FIX: Pedir explícitamente los stats de combate y economía
@@ -3163,7 +3369,11 @@ wss.on('connection', async (ws) => {
                     }).filter(m => m !== null)
                 };
 
-                ws.send(encode({ type: 'my_squad_data', squad: squadData }));
+                if (data.type === 'get_squad_details_silent') {
+                    ws.send(encode({ type: 'my_squad_data_silent', squad: squadData }));
+                } else {
+                    ws.send(encode({ type: 'my_squad_data', squad: squadData }));
+                }
             } catch (err) { console.error(err); }
         }
         // 26. SOLICITAR EL LEADERBOARD (PUNTAJES DE SQUADS Y BASES EN VIVO)
@@ -4566,3 +4776,73 @@ function endArenaMatch(arena, winningTeam) {
 server.listen(PORT, () => {
     console.log(`HTTP/WebSocket server running on port ${PORT}`);
 });
+let ACTIVE_SEASON = null;
+async function loadActiveSeason() {
+    try {
+        const now = new Date();
+        // Buscar la primera temporada activa que est� dentro del rango de fechas
+        const active = await Season.findOne({
+            isActive: true,
+            startDate: { $lte: now },
+            endDate: { $gte: now }
+        }, { _id: 0, __v: 0, "rewards._id": 0 }).lean();
+
+        if (active) {
+            ACTIVE_SEASON = active;
+            console.log(`BATTLE PASS: Temporada activa cargada -> ${active.name}`);
+        } else {
+            console.log('BATTLE PASS: No hay temporada activa actualmente.');
+            ACTIVE_SEASON = null;
+
+            // --- AUTO-CREACI�N DE TEMPORADA 1 (SOLO PARA PRUEBAS) ---
+            const count = await Season.countDocuments();
+            if (count === 0) {
+                console.log('BATTLE PASS: Creando Temporada 1 de prueba en MongoDB...');
+                
+                // Funci�n auxiliar para calcular XP exponencial
+                const calcXpForLevel = (level) => {
+                    // Nivel 1 a 2 = 1000. Nivel 49 a 50 = ~15000.
+                    return Math.floor(1000 * Math.pow(1.057, level - 1));
+                };
+
+                const defaultRewards = [];
+                for(let i = 1; i <= 50; i++) {
+                    const isMilestone = (i % 5 === 0);
+                    defaultRewards.push({
+                        level: i,
+                        xpRequired: calcXpForLevel(i),
+                        free: isMilestone ? { type: 'coins', amount: 500 } : null,
+                        premium: isMilestone ? { type: 'item', id: 'hat_cap' } : { type: 'argems', amount: 20 }
+                    });
+                }
+
+                const s1 = new Season({
+                    seasonId: 'season_1',
+                    name: 'Season 1: Neon Origins',
+                    isActive: true,
+                    startDate: new Date(now.getTime() - 86400000), // Empez� ayer
+                    endDate: new Date(now.getTime() + (86400000 * 30)), // Termina en 30 d�as
+                    costArgems: 500,
+                    rewards: defaultRewards
+                });
+                await s1.save();
+                ACTIVE_SEASON = s1;
+                console.log('BATTLE PASS: Temporada 1 creada y activada.');
+            }
+        }
+    } catch (e) {
+        console.error("Error cargando Temporada del Battle Pass:", e);
+    }
+}
+
+
+
+
+
+
+
+
+
+
+loadActiveSeason();
+
