@@ -1,0 +1,22 @@
+module.exports = {
+    SQUAD_CHATS_RAM: {},
+    arenasRAM: {},
+    safeZonesRAM: [],
+    RANKS_CACHE: [],
+    ZONE_CONFIG: {},
+    skeletonRAM: {},
+    PATCH_NOTES_CACHE: [],
+    GLOBAL_BGM_PLAYLIST: [],
+    ARGEM_PACKAGES: [],
+    GLOBAL_TASKS: {},
+    MASTER_CATALOG: {},
+    WEAPONS: {},
+    TRASH_CATALOG: [],
+    METALS_CATALOG: [],
+    TILESETS: [],
+    serverWorldMap: {},
+    players: {},
+    activeProjectiles: [],
+    groundItems: {},
+    centralBase: null
+};
