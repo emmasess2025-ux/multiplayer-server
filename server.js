@@ -3,6 +3,13 @@ const mongoose = require('mongoose');
 const bcrypt = require('bcryptjs');
 const { encode, decode } = require('@msgpack/msgpack'); // <--- ADD THIS
 require('dotenv').config(); // <--- ADD THIS LINE TO READ THE .ENV FILE
+
+process.on('uncaughtException', (err) => {
+    console.error('CRITICAL SERVER CRASH PREVENTED (Uncaught):', err);
+});
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('CRITICAL SERVER CRASH PREVENTED (Unhandled Rejection):', reason);
+});
 const express = require('express');
 const http = require('http');
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
