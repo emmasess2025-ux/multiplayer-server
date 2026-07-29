@@ -267,6 +267,7 @@ setInterval(() => {
             // 4. Preparar y Teletransportar al EQUIPO 1 (Azul)
             arena.team1.forEach((pid, index) => {
                 let p = players[pid];
+                if (!p) return;
                 p.isSparring = true;
                 p.arenaTeam = 1;
                 p.hp = 100;
@@ -289,6 +290,7 @@ setInterval(() => {
             // 5. Preparar y Teletransportar al EQUIPO 2 (Rojo)
             arena.team2.forEach((pid, index) => {
                 let p = players[pid];
+                if (!p) return;
                 p.isSparring = true;
                 p.arenaTeam = 2;
                 p.hp = 100;
@@ -472,6 +474,7 @@ setInterval(async () => {
 
     for (let id in players) {
         const p = players[id];
+        if (!p) continue;
         // Only save registered users with a database ID
         if (p.accountId) {
             bulkOps.push({
