@@ -12,9 +12,15 @@ const turfSchema = new mongoose.Schema({
     spriteOffsetY: { type: Number, default: 0 },
     hitboxOffsetX: { type: Number, default: 0 },
     hitboxOffsetY: { type: Number, default: 0 },
-    // 👇 NUEVO: ANCHO Y ALTO DEL CUADRADO FÍSICO 👇
     hitboxW: { type: Number, default: 32 },
-    hitboxH: { type: Number, default: 32 }
+    hitboxH: { type: Number, default: 32 },
+    // 👇 CONFIGURACIÓN DE SPRITE Y ANIMACIÓN 👇
+    frameWidth: { type: Number, default: 0 },   // 0 = Auto-detect
+    frameHeight: { type: Number, default: 0 },  // 0 = Auto-detect
+    frameCount: { type: Number, default: 0 },   // 0 = Auto-detect
+    animSpeed: { type: Number, default: 0 },    // 0 = Default (150ms)
+    renderScale: { type: Number, default: 1.0 },
+    isHover: { type: Boolean, default: true }   // true = Flotación arriba/abajo activada
 });
 const Turf = mongoose.model('Turf', turfSchema);
 

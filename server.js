@@ -1,4 +1,4 @@
-const WebSocket = require('ws');
+﻿const WebSocket = require('ws');
 const mongoose = require('mongoose');
 const bcrypt = require('bcryptjs');
 const { encode, decode } = require('@msgpack/msgpack'); // <--- ADD THIS
@@ -22,9 +22,9 @@ const MONGO_URI = process.env.MONGO_URI;
 
 mongoose.connect(MONGO_URI, { family: 4 })
     .then(async () => {
-        console.log('🔥 Connected to MongoDB!');
+        console.log('ðŸ”¥ Connected to MongoDB!');
 
-        // 🛑 EL FIX: Cargar la Playlist de MongoDB a la RAM
+        // ðŸ›‘ EL FIX: Cargar la Playlist de MongoDB a la RAM
         let config = await ServerConfig.findOne();
         if (!config) {
             // Si es la primera vez que prendes el server, crea el documento base
@@ -41,7 +41,7 @@ mongoose.connect(MONGO_URI, { family: 4 })
         loadArenasFromDB();
         loadRanksFromDB();
         loadPatchNotesFromDB();
-        // 🛑 EL FIX: Solo llamamos al Catálogo Maestro. 
+        // ðŸ›‘ EL FIX: Solo llamamos al CatÃ¡logo Maestro. 
         // Ya no cargamos Weapons ni Trash por separado.
         loadMasterCatalog();
         loadTasksFromDB();
@@ -55,7 +55,7 @@ const Blueprint = require('./src/models/Blueprint');
 
 // --- ESQUEMA DE MINIJUEGOS Y ARENAS (ESCALABLE) ---
 const Arena = require('./src/models/Arena');
-// Memoria RAM ultra-rápida para manejar las colas y juegos en vivo
+// Memoria RAM ultra-rÃ¡pida para manejar las colas y juegos en vivo
 
 const Turf = require('./src/models/Turf');
 
@@ -66,17 +66,17 @@ const SafeZone = require('./src/models/SafeZone');
 async function loadSafeZonesFromDB() {
     try {
         const rawZones = await SafeZone.find({}).lean();
-        // ⚡ Convert the complex ObjectId into a pure String for MessagePack
+        // âš¡ Convert the complex ObjectId into a pure String for MessagePack
         safeZonesRAM.length = 0; safeZonesRAM.push(...rawZones.map(z => ({ ...z, _id: z._id.toString() })));
-        console.log(`🗺️ Zonas Universales cargadas en RAM (${safeZonesRAM.length} zonas).`);
+        console.log(`ðŸ—ºï¸ Zonas Universales cargadas en RAM (${safeZonesRAM.length} zonas).`);
     } catch (err) { console.error("Error cargando Zonas:", err); }
 }
 
-// --- ESCÁNER MATEMÁTICO: ¿ESTOY EN UNA ZONA SEGURA? ---
+// --- ESCÃNER MATEMÃTICO: Â¿ESTOY EN UNA ZONA SEGURA? ---
 function isInSafeZone(px, py) {
     for (let i = 0; i < safeZonesRAM.length; i++) {
         let z = safeZonesRAM[i];
-        // 🛑 EL FIX: Solo nos protege si la zona es específicamente de tipo 'safe'
+        // ðŸ›‘ EL FIX: Solo nos protege si la zona es especÃ­ficamente de tipo 'safe'
         if ((z.zoneType === 'safe' || !z.zoneType) && px >= z.xMin && px <= z.xMax && py >= z.yMin && py <= z.yMax) {
             return true;
         }
@@ -85,7 +85,7 @@ function isInSafeZone(px, py) {
 }
 
 // ==========================================
-// 🏆 ESQUEMA DE RANGOS ELO (MONGODB)
+// ðŸ† ESQUEMA DE RANGOS ELO (MONGODB)
 // ==========================================
 const Rank = require('./src/models/Rank');
 
@@ -95,7 +95,7 @@ async function loadRanksFromDB() {
         let ranks = await Rank.find({}, { _id: 0, __v: 0 }).sort({ minElo: -1 }).lean();
 
         if (ranks.length === 0) {
-            console.log("🏆 Inicializando Rangos por defecto en MongoDB...");
+            console.log("ðŸ† Inicializando Rangos por defecto en MongoDB...");
             const defaultRanks = [
                 { name: "Elite", minElo: 2500, src: "items/ranks/elite.png" },
                 { name: "Profesional", minElo: 1800, src: "items/ranks/profesional.png" },
@@ -107,46 +107,46 @@ async function loadRanksFromDB() {
             ranks = await Rank.find({}, { _id: 0, __v: 0 }).sort({ minElo: -1 }).lean();
         }
         RANKS_CACHE.length = 0; RANKS_CACHE.push(...ranks);
-        console.log(`🏆 Rangos cargados: ${RANKS_CACHE.length} divisiones activas.`);
+        console.log(`ðŸ† Rangos cargados: ${RANKS_CACHE.length} divisiones activas.`);
     } catch (err) { console.error("Error cargando Rangos:", err); }
 }
 
 // ==========================================
-// 🗺️ ESQUEMA DE CONFIGURACIÓN DE ZONAS (MONGODB)
+// ðŸ—ºï¸ ESQUEMA DE CONFIGURACIÃ“N DE ZONAS (MONGODB)
 // ==========================================
 const ZoneConfig = require('./src/models/ZoneConfig');
 
-// Memoria RAM para consultas ultrarrápidas
+// Memoria RAM para consultas ultrarrÃ¡pidas
 
-// Función para cargar desde la Base de Datos al iniciar el servidor
+// FunciÃ³n para cargar desde la Base de Datos al iniciar el servidor
 async function loadZoneConfigsFromDB() {
     try {
         let configs = await ZoneConfig.find({}, { _id: 0, __v: 0 }).lean();
 
-        // Si la tabla está vacía, inyectamos los básicos
+        // Si la tabla estÃ¡ vacÃ­a, inyectamos los bÃ¡sicos
         if (configs.length === 0) {
-            console.log("🛠️ Inicializando Tipos de Zona por defecto en MongoDB...");
+            console.log("ðŸ› ï¸ Inicializando Tipos de Zona por defecto en MongoDB...");
             const defaultZones = [
-                { id: "safe", name: "Zona Segura", icon: "🛡️", colorBorder: "rgba(46, 204, 113, 0.8)", colorFill: "rgba(46, 204, 113, 0.2)" },
-                { id: "trash", name: "Basurero", icon: "🗑️", colorBorder: "rgba(230, 126, 34, 0.8)", colorFill: "rgba(230, 126, 34, 0.2)" },
-                { id: "npc", name: "Zona NPC", icon: "🤖", colorBorder: "rgba(155, 89, 182, 0.8)", colorFill: "rgba(155, 89, 182, 0.2)" },
-                { id: "dig", name: "Zona de Excavación", icon: "⛏️", colorBorder: "rgba(139, 69, 19, 0.8)", colorFill: "rgba(139, 69, 19, 0.2)" }
+                { id: "safe", name: "Zona Segura", icon: "ðŸ›¡ï¸", colorBorder: "rgba(46, 204, 113, 0.8)", colorFill: "rgba(46, 204, 113, 0.2)" },
+                { id: "trash", name: "Basurero", icon: "ðŸ—‘ï¸", colorBorder: "rgba(230, 126, 34, 0.8)", colorFill: "rgba(230, 126, 34, 0.2)" },
+                { id: "npc", name: "Zona NPC", icon: "ðŸ¤–", colorBorder: "rgba(155, 89, 182, 0.8)", colorFill: "rgba(155, 89, 182, 0.2)" },
+                { id: "dig", name: "Zona de ExcavaciÃ³n", icon: "â›ï¸", colorBorder: "rgba(139, 69, 19, 0.8)", colorFill: "rgba(139, 69, 19, 0.2)" }
             ];
             await ZoneConfig.insertMany(defaultZones);
             configs = await ZoneConfig.find({}, { _id: 0, __v: 0 }).lean();
         }
 
-        // 🛑 EL FIX: Si tu base de datos ya existía pero no tenía la zona "indoor", la inyectamos a la fuerza
+        // ðŸ›‘ EL FIX: Si tu base de datos ya existÃ­a pero no tenÃ­a la zona "indoor", la inyectamos a la fuerza
         if (!configs.find(c => c.id === 'indoor')) {
-            console.log("🏠 Añadiendo nueva zona de Techos a la base de datos...");
-            await ZoneConfig.create({ id: "indoor", name: "Interior (Sin Lluvia)", icon: "🏠", colorBorder: "rgba(52, 152, 219, 0.8)", colorFill: "rgba(52, 152, 219, 0.2)" });
+            console.log("ðŸ  AÃ±adiendo nueva zona de Techos a la base de datos...");
+            await ZoneConfig.create({ id: "indoor", name: "Interior (Sin Lluvia)", icon: "ðŸ ", colorBorder: "rgba(52, 152, 219, 0.8)", colorFill: "rgba(52, 152, 219, 0.2)" });
             configs = await ZoneConfig.find({}, { _id: 0, __v: 0 }).lean();
         }
 
-        // 🏴 Inyectar zona Turf si no existe
+        // ðŸ´ Inyectar zona Turf si no existe
         if (!configs.find(c => c.id === 'turf')) {
-            console.log("🏴 Añadiendo zona Turf (Respawn personalizado) a la base de datos...");
-            await ZoneConfig.create({ id: "turf", name: "Turf (Respawn)", icon: "🏴", colorBorder: "rgba(231, 76, 60, 0.9)", colorFill: "rgba(231, 76, 60, 0.15)" });
+            console.log("ðŸ´ AÃ±adiendo zona Turf (Respawn personalizado) a la base de datos...");
+            await ZoneConfig.create({ id: "turf", name: "Turf (Respawn)", icon: "ðŸ´", colorBorder: "rgba(231, 76, 60, 0.9)", colorFill: "rgba(231, 76, 60, 0.15)" });
             configs = await ZoneConfig.find({}, { _id: 0, __v: 0 }).lean();
         }
 
@@ -156,13 +156,13 @@ async function loadZoneConfigsFromDB() {
             ZONE_CONFIG[c.id] = { name: c.name, icon: c.icon, colorBorder: c.colorBorder, colorFill: c.colorFill };
         });
 
-        console.log(`🎨 Tipos de Zona cargados en RAM (${Object.keys(ZONE_CONFIG).length} tipos).`);
+        console.log(`ðŸŽ¨ Tipos de Zona cargados en RAM (${Object.keys(ZONE_CONFIG).length} tipos).`);
     } catch (err) {
-        console.error("❌ Error cargando Configuración de Zonas:", err);
+        console.error("âŒ Error cargando ConfiguraciÃ³n de Zonas:", err);
     }
 }
 
-// --- HERRAMIENTA: ESCÁNER DE ZONAS SEGURAS ---
+// --- HERRAMIENTA: ESCÃNER DE ZONAS SEGURAS ---
 const SERVER_TILE_SIZE = 16;
 
 // --- MODELO DEL ESQUELETO (GANI) ---
@@ -178,36 +178,36 @@ async function loadSkeletonFromDB() {
         const skel = await Skeleton.findOne({}, { _id: 0, __v: 0 }).lean();
         if (skel && skel.anchors) {
             for (let k in skeletonRAM) delete skeletonRAM[k]; Object.assign(skeletonRAM, skel.anchors);
-            console.log("✅ Animaciones Gani cargadas correctamente desde MongoDB!");
+            console.log("âœ… Animaciones Gani cargadas correctamente desde MongoDB!");
         } else {
-            console.log("🦴 No hay animaciones previas, iniciando Gani en blanco.");
+            console.log("ðŸ¦´ No hay animaciones previas, iniciando Gani en blanco.");
             for (let k in skeletonRAM) delete skeletonRAM[k];
         }
     } catch (err) {
-        console.error("❌ Error al cargar las animaciones Gani:", err);
+        console.error("âŒ Error al cargar las animaciones Gani:", err);
     }
 }
 
 // --- ESQUEMA DE ACTUALIZACIONES (PATCH NOTES) ---
 const PatchNote = require('./src/models/PatchNote');
 
-// Memoria RAM para enviarlo rápido a los jugadores al conectar
+// Memoria RAM para enviarlo rÃ¡pido a los jugadores al conectar
 
 async function loadPatchNotesFromDB() {
     try {
-        // Traemos las últimas 10 actualizaciones ordenadas de la más nueva a la más vieja
+        // Traemos las Ãºltimas 10 actualizaciones ordenadas de la mÃ¡s nueva a la mÃ¡s vieja
         const __pn = await PatchNote.find({}, { _id: 0, __v: 0 }).sort({ date: -1 }).limit(10).lean(); PATCH_NOTES_CACHE.length = 0; PATCH_NOTES_CACHE.push(...__pn);
-        // Si está vacía, creamos una de bienvenida automáticamente
+        // Si estÃ¡ vacÃ­a, creamos una de bienvenida automÃ¡ticamente
         if (PATCH_NOTES_CACHE.length === 0) {
             const welcomeNote = new PatchNote({
-                title: "¡Bienvenidos a MMOARGON!",
-                description: "El servidor alfa está oficialmente en línea. Explora el mapa, únete a un clan y domina la ciudad.",
+                title: "Â¡Bienvenidos a MMOARGON!",
+                description: "El servidor alfa estÃ¡ oficialmente en lÃ­nea. Explora el mapa, Ãºnete a un clan y domina la ciudad.",
                 version: "1.0.0"
             });
             await welcomeNote.save();
             PATCH_NOTES_CACHE.length = 0; PATCH_NOTES_CACHE.push(welcomeNote);
         }
-        console.log(`📰 Noticias cargadas: ${PATCH_NOTES_CACHE.length} parches encontrados.`);
+        console.log(`ðŸ“° Noticias cargadas: ${PATCH_NOTES_CACHE.length} parches encontrados.`);
     } catch (err) {
         console.error("Error cargando Patch Notes:", err);
     }
@@ -222,7 +222,7 @@ const Season = require('./src/models/Season');
 // --- THE PLAYER BLUEPRINT (SCHEMA) ---
 const User = require('./src/models/User');
 
-// --- NUEVO: CONTADOR GLOBAL PARA IDs ÚNICOS (EJ: A1000) ---
+// --- NUEVO: CONTADOR GLOBAL PARA IDs ÃšNICOS (EJ: A1000) ---
 const Counter = require('./src/models/Counter');
 
 // --- NUEVO: SISTEMA DE FEEDBACK ---
@@ -232,21 +232,21 @@ const Feedback = require('./src/models/Feedback');
 
 // --- ESQUEMA DE LOS SQUADS (CLANES) ---
 
-// Sub-esquema para definir qué puede hacer cada miembro
+// Sub-esquema para definir quÃ© puede hacer cada miembro
 const Squad = require('./src/models/Squad');
 
 // ==========================================
-// CONFIGURACIÓN GLOBAL DEL SERVIDOR (MUSIC, ETC)
+// CONFIGURACIÃ“N GLOBAL DEL SERVIDOR (MUSIC, ETC)
 // ==========================================
 const ServerConfig = require('./src/models/ServerConfig');
 
 
 // ==========================================
-// 📦 TABLA MAESTRA DE ÍTEMS (MASTER CATALOG)
+// ðŸ“¦ TABLA MAESTRA DE ÃTEMS (MASTER CATALOG)
 // ==========================================
 const Item = require('./src/models/Item');
 
-// --- 🌟 NUEVO: TAREAS Y LOGROS GLOBALES 🌟 ---
+// --- ðŸŒŸ NUEVO: TAREAS Y LOGROS GLOBALES ðŸŒŸ ---
 // --- NUEVO: ARGEMS PREMIUM PACKAGES ---
 const ArgemPackage = require('./src/models/ArgemPackage');
 
@@ -263,7 +263,7 @@ async function loadArgemPackagesFromDB() {
             ];
             await ArgemPackage.insertMany(defaultPackages);
             ARGEM_PACKAGES.length = 0; ARGEM_PACKAGES.push(...defaultPackages);
-            console.log('💎 Argem Packages seeded into MongoDB.');
+            console.log('ðŸ’Ž Argem Packages seeded into MongoDB.');
         } else {
             ARGEM_PACKAGES.length = 0; ARGEM_PACKAGES.push(...packages);
         }
@@ -279,7 +279,7 @@ async function add_bp_xp(email, amount, ws, p) {
         const user = await User.findOne({ email: email });
         if (!user) return;
 
-        // Si no est� en la temporada correcta, reset
+        // Si no estï¿½ en la temporada correcta, reset
         if (user.bpSeasonId !== state.ACTIVE_SEASON.seasonId) {
             user.bpSeasonId = state.ACTIVE_SEASON.seasonId;
             user.bpXP = 0;
@@ -311,7 +311,7 @@ async function loadTasksFromDB() {
     try {
         const tasks = await Task.find({}).lean();
         if (tasks.length === 0) {
-            // Inyectar tareas por defecto si la base de datos está vacía
+            // Inyectar tareas por defecto si la base de datos estÃ¡ vacÃ­a
             const defaultTasks = [
                 {
                     taskId: 'daily_login',
@@ -392,7 +392,7 @@ async function loadTasksFromDB() {
 
 async function loadMasterCatalog() {
     try {
-        console.log("📦 Cargando Catálogo Maestro...");
+        console.log("ðŸ“¦ Cargando CatÃ¡logo Maestro...");
 
         // 1. Solo deja activos los que sean "Esenciales" o nuevos.
         // Si ya ajustaste la Katana en Compass, puedes comentar su 'findOneAndUpdate' 
@@ -401,7 +401,7 @@ async function loadMasterCatalog() {
         /* await Item.findOneAndUpdate({ id: "katana_azulado" }, { ... }, { upsert: true }); 
         */
 
-        // ⚡ ADD { _id: 0, __v: 0 } PROJECTION:
+        // âš¡ ADD { _id: 0, __v: 0 } PROJECTION:
         const items = await Item.find({}, { _id: 0, __v: 0 }).lean();
 
         for (let k in MASTER_CATALOG) delete MASTER_CATALOG[k];
@@ -411,7 +411,7 @@ async function loadMasterCatalog() {
 
         items.forEach(i => {
             MASTER_CATALOG[i.id] = i;
-            // ⚡ REMOVE the .toObject() calls because .lean() already made them raw objects!
+            // âš¡ REMOVE the .toObject() calls because .lean() already made them raw objects!
             if (i.category === 'weapon') {
                 WEAPONS[i.id] = { ...i, ...i.stats };
             } else if (i.category === 'junk') {
@@ -424,9 +424,9 @@ async function loadMasterCatalog() {
         // Failsafe para evitar crashes
         if (!WEAPONS["none"]) WEAPONS["none"] = { damage: 0, type: "none", pivotX: 0, pivotY: 0 };
 
-        console.log(`✅ Catálogo cargado: ${Object.keys(MASTER_CATALOG).length} ítems listos.`);
+        console.log(`âœ… CatÃ¡logo cargado: ${Object.keys(MASTER_CATALOG).length} Ã­tems listos.`);
     } catch (err) {
-        console.error("💥 Error cargando el Catálogo:", err);
+        console.error("ðŸ’¥ Error cargando el CatÃ¡logo:", err);
     }
 }
 
@@ -439,34 +439,37 @@ async function loadTilesetsFromDB() {
         const dbTilesets = await Tileset.find({}, { _id: 0, __v: 0 }).sort({ startId: 1 }).lean();
 
         if (dbTilesets.length === 0) {
-            console.log('📦 Migrando TILESET_CONFIG a MongoDB por primera vez...');
+            console.log('ðŸ“¦ Migrando TILESET_CONFIG a MongoDB por primera vez...');
 
             // --- 0. MULTI-TILESET SYSTEM (GLOBAL IDs) ---
             const defaultTilesets = [];
 
             await Tileset.insertMany(defaultTilesets);
             const __ts = await Tileset.find({}, { _id: 0, __v: 0 }).sort({ startId: 1 }).lean(); TILESETS.length = 0; TILESETS.push(...__ts);
-            console.log('✅ ¡60 Tilesets migrados a MongoDB exitosamente!');
+            console.log('âœ… Â¡60 Tilesets migrados a MongoDB exitosamente!');
         } else {
             TILESETS.length = 0; TILESETS.push(...dbTilesets);
-            console.log(`✅ Base de datos de Tilesets cargada en RAM (${TILESETS.length} tilesets)`);
+            console.log(`âœ… Base de datos de Tilesets cargada en RAM (${TILESETS.length} tilesets)`);
         }
     } catch (err) { console.error("Error cargando tilesets:", err); }
 }
 
-// --- LA NUEVA MEMORIA FÍSICA DEL SERVIDOR ---
+// --- LA NUEVA MEMORIA FÃSICA DEL SERVIDOR ---
 
-// 💥 NUEVO: EL CEREBRO DE LA BASE CENTRAL 💥
+// ðŸ’¥ NUEVO: EL CEREBRO DE LA BASE CENTRAL ðŸ’¥
 
 
 async function loadWorldMapFromDB() {
     try {
         // 2. FETCH WORLD DATA
         const allTiles = await Tile.find({}, { _id: 0, __v: 0 }).lean();
+        state.WORLD_TILES_CACHE = allTiles;
 
-        // Reiniciamos la base por si acaso recargamos el mapa
+        // Reiniciamos las bases por si acaso recargamos el mapa
+        state.turfBases = {};
         state.centralBase = null;
 
+        const baseTiles = [];
         allTiles.forEach(t => {
             const l = t.l || 0;
             serverWorldMap[`${t.x},${t.y},${l}`] = {
@@ -477,71 +480,99 @@ async function loadWorldMapFromDB() {
                 destX: t.destX,
                 destY: t.destY,
                 itemId: t.itemId,
-                itemRow: t.itemRow || 0, // <--- AÑADE ESTO
+                itemRow: t.itemRow || 0,
                 shelfX: t.shelfX || 0,
                 shelfY: t.shelfY || 0
             };
 
-            // 🛑 EL FIX: Detectar la Base y conectarla con su persistencia
-            if (t.triggerType === 'base') {
-                // Creamos un ID único basado en dónde pusiste el bloque
-                const uniqueTurfId = `base_${t.x}_${t.y}`;
-
-                // Buscamos si ya existe en la base de datos (await se usa dentro de una función asíncrona, 
-                // así que cambiaremos el forEach por un for...of o manejaremos la promesa).
-
-                // Como allTiles.forEach no maneja bien await, lo guardamos temporalmente
-                // y lo inicializamos justo después del forEach.
-                state.centralBase = {
-                    turfId: uniqueTurfId,
-                    gridX: t.x, gridY: t.y,
-                    worldX: (t.x * 16) + 8, worldY: (t.y * 16) + 8,
-                    hp: 5000, maxHp: 5000,
-                    currentOwnerSquadId: null,
-                    damageTracker: {}
-                };
+                        if (t.triggerType === 'base') {
+                baseTiles.push(t);
+            }
+            if (t.triggerType === 'jail_spawn') {
+                state.jailSpawnPos = { x: (t.x * 16) + 8, y: (t.y * 16) + 8, l: l };
             }
         });
-        // --- RECUPERAR DATOS DE LA BASE DESDE MONGODB ---
-        // --- RECUPERAR DATOS DE LA BASE DESDE MONGODB ---
-        if (state.centralBase) {
-            let dbTurf = await Turf.findOne({ turfId: state.centralBase.turfId });
 
-            // Si es la primera vez que ponemos la base, la creamos en MongoDB
+        // --- RECUPERAR TODAS LAS BASES DESDE MONGODB ---
+        for (const t of baseTiles) {
+            const uniqueTurfId = `base_${t.x}_${t.y}`;
+            let dbTurf = await Turf.findOne({ turfId: uniqueTurfId });
+
             if (!dbTurf) {
                 dbTurf = await Turf.create({
-                    turfId: state.centralBase.turfId,
+                    turfId: uniqueTurfId,
                     name: "Base Central",
-                    hp: 5000, maxHp: 5000,
-                    // Valores por defecto para una base nueva
+                    hp: 5000,
+                    maxHp: 5000,
                     hitboxW: 32,
                     hitboxH: 32
                 });
             }
 
-            // Inyectamos los datos persistentes a la memoria RAM
-            state.centralBase.name = dbTurf.name;
-            state.centralBase.hp = dbTurf.hp;
-            state.centralBase.maxHp = dbTurf.maxHp;
-            state.centralBase.currentOwnerSquadId = dbTurf.ownerSquadName;
-            state.centralBase.srcIdle = dbTurf.srcIdle || "";
-            state.centralBase.srcHit = dbTurf.srcHit || "";
-            state.centralBase.spriteOffsetX = dbTurf.spriteOffsetX || 0;
-            state.centralBase.spriteOffsetY = dbTurf.spriteOffsetY || 0;
-            state.centralBase.hitboxOffsetX = dbTurf.hitboxOffsetX || 0;
-            state.centralBase.hitboxOffsetY = dbTurf.hitboxOffsetY || 0;
-
-            // 👇 NUEVO: CARGAMOS EL ANCHO Y ALTO DEL HITBOX A LA RAM 👇
-            state.centralBase.hitboxW = dbTurf.hitboxW || 32;
-            state.centralBase.hitboxH = dbTurf.hitboxH || 32;
-
-            state.centralBase.lastHitTime = state.centralBase.lastHitTime || 0;
-            // Mantenemos el damageTracker vacío al reiniciar el servidor
-            state.centralBase.damageTracker = {};
-
-            console.log(`🏰 [${state.centralBase.name}] cargada en RAM. Dueño actual: ${state.centralBase.currentOwnerSquadId || 'Nadie'}. Hitbox: ${state.centralBase.hitboxW}x${state.centralBase.hitboxH}`);
+            state.turfBases[uniqueTurfId] = {
+                turfId: uniqueTurfId,
+                gridX: t.x, gridY: t.y,
+                worldX: (t.x * 16) + 8, worldY: (t.y * 16) + 8,
+                name: dbTurf.name || "Base Central",
+                hp: dbTurf.hp || dbTurf.maxHp || 5000,
+                maxHp: dbTurf.maxHp || 5000,
+                currentOwnerSquadId: dbTurf.ownerSquadName || null,
+                srcIdle: dbTurf.srcIdle || "",
+                srcHit: dbTurf.srcHit || "",
+                spriteOffsetX: dbTurf.spriteOffsetX || 0,
+                spriteOffsetY: dbTurf.spriteOffsetY || 0,
+                hitboxOffsetX: dbTurf.hitboxOffsetX || 0,
+                hitboxOffsetY: dbTurf.hitboxOffsetY || 0,
+                hitboxW: dbTurf.hitboxW || 32,
+                hitboxH: dbTurf.hitboxH || 32,
+                frameWidth: dbTurf.frameWidth || 0,
+                frameHeight: dbTurf.frameHeight || 0,
+                frameCount: dbTurf.frameCount || 0,
+                animSpeed: dbTurf.animSpeed || 0,
+                renderScale: dbTurf.renderScale || 1.0,
+                isHover: dbTurf.isHover !== undefined ? dbTurf.isHover : true,
+                lastHitTime: 0,
+                damageTracker: {}
+            };
+            console.log(`ðŸ° Base [${dbTurf.name}] (${uniqueTurfId}) cargada en RAM. DueÃ±o: ${dbTurf.ownerSquadName || 'Nadie'}`);
         }
-        console.log(`🌍 Mapa Físico cargado en RAM del servidor (${allTiles.length} bloques).`);
+        // TambiÃ©n cargar cualquier base Turf adicional en la colecciÃ³n Turf
+        const allDbTurfs = await Turf.find({}).lean();
+        for (const dbTurf of allDbTurfs) {
+            if (dbTurf.turfId && !state.turfBases[dbTurf.turfId]) {
+                const parts = dbTurf.turfId.split('_');
+                const gx = parseInt(parts[1]) || 0;
+                const gy = parseInt(parts[2]) || 0;
+                state.turfBases[dbTurf.turfId] = {
+                    turfId: dbTurf.turfId,
+                    gridX: gx, gridY: gy,
+                    worldX: (gx * 16) + 8, worldY: (gy * 16) + 8,
+                    hp: dbTurf.hp || dbTurf.maxHp || 5000,
+                    maxHp: dbTurf.maxHp || 5000,
+                    currentOwnerSquadId: dbTurf.ownerSquadName || null,
+                    name: dbTurf.name,
+                    srcIdle: dbTurf.srcIdle || "",
+                    srcHit: dbTurf.srcHit || "",
+                    spriteOffsetX: dbTurf.spriteOffsetX || 0,
+                    spriteOffsetY: dbTurf.spriteOffsetY || 0,
+                    hitboxOffsetX: dbTurf.hitboxOffsetX || 0,
+                    hitboxOffsetY: dbTurf.hitboxOffsetY || 0,
+                    hitboxW: dbTurf.hitboxW || 32,
+                    hitboxH: dbTurf.hitboxH || 32,
+                    frameWidth: dbTurf.frameWidth || 0,
+                    frameHeight: dbTurf.frameHeight || 0,
+                    frameCount: dbTurf.frameCount || 0,
+                    animSpeed: dbTurf.animSpeed || 0,
+                    renderScale: dbTurf.renderScale || 1.0,
+                    isHover: dbTurf.isHover !== undefined ? dbTurf.isHover : true,
+                    lastHitTime: 0,
+                    damageTracker: {}
+                };
+                console.log(`ðŸ° Base [${dbTurf.name}] (${dbTurf.turfId}) cargada desde colecciÃ³n Turf.`);
+            }
+        }
+        state.centralBase = Object.values(state.turfBases)[0] || null;
+        console.log(`ðŸŒ Mapa FÃ­sico cargado en RAM del servidor (${allTiles.length} bloques, ${Object.keys(state.turfBases).length} bases Turf activas).`);
     } catch (err) {
         console.error("Error cargando el mapa:", err);
     }
@@ -564,7 +595,7 @@ async function loadArenasFromDB() {
                 team1Size: a.team1Size || 1,
                 team2Size: a.team2Size || 1,
                 maxPlayers: a.maxPlayers || 2,
-                queue: [], // Inician vacías al reiniciar el server
+                queue: [], // Inician vacÃ­as al reiniciar el server
                 isOccupied: false,
                 team1: [],
                 team2: [],
@@ -591,15 +622,15 @@ async function loadArenasFromDB() {
                 } : null
             };
         });
-        console.log(`🥊 Arenas cargadas en RAM: ${allArenas.length} arenas activas.`);
+        console.log(`ðŸ¥Š Arenas cargadas en RAM: ${allArenas.length} arenas activas.`);
     } catch (err) {
         console.error("Error cargando Arenas:", err);
     }
 }
 
-// Función que usaremos para detectar hackers traspasando paredes
+// FunciÃ³n que usaremos para detectar hackers traspasando paredes
 const TILE_SIZE = 16;
-// 👆 HASTA AQUÍ 👆
+// ðŸ‘† HASTA AQUÃ ðŸ‘†
 
 // --- ESQUEMA DE MENSAJES PRIVADOS (AHORA POR ID) ---
 const PM = require('./src/models/PM');
@@ -617,7 +648,7 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
     try {
         event = stripe.webhooks.constructEvent(req.body, sig, endpointSecret);
     } catch (err) {
-        console.error("⚠️ Stripe Webhook Error:", err.message);
+        console.error("âš ï¸ Stripe Webhook Error:", err.message);
         return res.status(400).send(`Webhook Error: ${err.message}`);
     }
 
@@ -636,7 +667,7 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
                 { new: true }
             );
 
-            console.log(`💰 Stripe Webhook: Granted ${gemsToAdd} gems to ${email}`);
+            console.log(`ðŸ’° Stripe Webhook: Granted ${gemsToAdd} gems to ${email}`);
 
             // Find if the player is currently online to instantly update their game!
             for (let id in players) {
@@ -671,12 +702,12 @@ const wss = new WebSocket.Server({ server });
 // This object acts as the server's memory. It holds every player's current state.
 
 // ==========================================
-// 🗺️ SPATIAL PARTITIONING ENGINE (ANTI-LAG)
+// ðŸ—ºï¸ SPATIAL PARTITIONING ENGINE (ANTI-LAG)
 // ==========================================
 // A chunk of 512x512 pixels (32x32 tiles) is perfect for a 2D MMO.
 
 // ==========================================================
-// 💥 GAME ENGINE INITIALIZATION
+// ðŸ’¥ GAME ENGINE INITIALIZATION
 // ==========================================================
 const initGameEngine = require('./src/game/engine');
 const gameEngine = initGameEngine({
@@ -695,7 +726,7 @@ function broadcastToZone(data, targetChunkId, excludeWs = null) {
     if (!targetChunkId) return;
     if (data && data.player && data.player.invisibleEnabled) return; // Completely hide from zone broadcasts
 
-    // ⚡ ENCODE ONCE, SEND TO MANY
+    // âš¡ ENCODE ONCE, SEND TO MANY
     const payload = encode(data);
     const visibleChunks = getVisibleChunks(targetChunkId);
 
@@ -729,7 +760,7 @@ function broadcast(data, excludeWs = null) {
 }
 
 // =========================================================
-// 🥊 MATCHMAKER GLOBAL (Soporta 1v1, 2v2, 3v1, 4v4, etc.)
+// ðŸ¥Š MATCHMAKER GLOBAL (Soporta 1v1, 2v2, 3v1, 4v4, etc.)
 
 
 // --- API ENDPOINT FOR LANDING PAGE ---
@@ -759,7 +790,7 @@ server.listen(PORT, () => {
 async function loadActiveSeason() {
     try {
         const now = new Date();
-        // Buscar la primera temporada activa que est� dentro del rango de fechas
+        // Buscar la primera temporada activa que estï¿½ dentro del rango de fechas
         const active = await Season.findOne({
             isActive: true,
             startDate: { $lte: now },
@@ -773,12 +804,12 @@ async function loadActiveSeason() {
             console.log('BATTLE PASS: No hay temporada activa actualmente.');
             state.ACTIVE_SEASON = null;
 
-            // --- AUTO-CREACI�N DE TEMPORADA 1 (SOLO PARA PRUEBAS) ---
+            // --- AUTO-CREACIï¿½N DE TEMPORADA 1 (SOLO PARA PRUEBAS) ---
             const count = await Season.countDocuments();
             if (count === 0) {
                 console.log('BATTLE PASS: Creando Temporada 1 de prueba en MongoDB...');
 
-                // Funci�n auxiliar para calcular XP exponencial
+                // Funciï¿½n auxiliar para calcular XP exponencial
                 const calcXpForLevel = (level) => {
                     // Nivel 1 a 2 = 1000. Nivel 49 a 50 = ~15000.
                     return Math.floor(1000 * Math.pow(1.057, level - 1));
@@ -799,8 +830,8 @@ async function loadActiveSeason() {
                     seasonId: 'season_1',
                     name: 'Season 1: Neon Origins',
                     isActive: true,
-                    startDate: new Date(now.getTime() - 86400000), // Empez� ayer
-                    endDate: new Date(now.getTime() + (86400000 * 30)), // Termina en 30 d�as
+                    startDate: new Date(now.getTime() - 86400000), // Empezï¿½ ayer
+                    endDate: new Date(now.getTime() + (86400000 * 30)), // Termina en 30 dï¿½as
                     costArgems: 500,
                     rewards: defaultRewards
                 });
@@ -824,4 +855,5 @@ async function loadActiveSeason() {
 
 
 loadActiveSeason();
+
 

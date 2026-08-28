@@ -1,4 +1,5 @@
-const WebSocket = require('ws');
+﻿const WebSocket = require('ws');
+const mongoose = require('mongoose');
 
 module.exports = function createWsHandler(deps) {
     const { 
@@ -7,22 +8,30 @@ module.exports = function createWsHandler(deps) {
         add_bp_xp, stripe
     } = deps;
     
-    const { SQUAD_CHATS_RAM, arenasRAM, safeZonesRAM, RANKS_CACHE, ZONE_CONFIG, skeletonRAM, PATCH_NOTES_CACHE, GLOBAL_BGM_PLAYLIST, ARGEM_PACKAGES, GLOBAL_TASKS, MASTER_CATALOG, WEAPONS, TRASH_CATALOG, METALS_CATALOG, TILESETS, serverWorldMap, players, activeProjectiles, groundItems, } = state;
+    const { SQUAD_CHATS_RAM, arenasRAM, safeZonesRAM, RANKS_CACHE, ZONE_CONFIG, skeletonRAM, PATCH_NOTES_CACHE, GLOBAL_BGM_PLAYLIST, ARGEM_PACKAGES, GLOBAL_TASKS, MASTER_CATALOG, WEAPONS, TRASH_CATALOG, METALS_CATALOG, TILESETS, serverWorldMap, players, activeProjectiles, groundItems } = state;
 
     const TILE_SIZE = 16;
     const CHUNK_SIZE = 512;
 
-    return async (ws) => {
+    return async (ws, req) => {
+    const clientIp = req ? (req.headers['x-forwarded-for'] || req.socket.remoteAddress) : 'unknown';
     const id = Math.random().toString(36).substring(2, 9);
-    ws.playerId = id; // <--- ¡AÑADE ESTA LÍNEA! Es crucial para encontrar a quién enviarle el PM.
+    ws.playerId = id;
+    ws.clientIp = clientIp; // <--- Â¡AÃ‘ADE ESTA LÃNEA! Es crucial para encontrar a quiÃ©n enviarle el PM.
 
     let isAuthenticated = false;
-    // Generate a random guest name like "Guest_482"
-    let currentUser = `Guest_${Math.floor(Math.random() * 1000)}`;
+    // Generate a structured temporary guest tag and username (e.g. Guest_4821 and G4821)
+    const guestNum = Math.floor(1000 + Math.random() * 9000);
+    let currentUser = `Guest_${guestNum}`;
+    const guestGameId = `G${guestNum}`;
 
-    // 1. INSTANTLY SPAWN THEM AS A GUEST
+    // 1. INSTANTLY SPAWN THEM AS A GUEST WITH TEMPORARY GAME ID
     players[id] = {
         username: currentUser,
+        gameId: guestGameId,
+        role: 'guest',
+        isGuest: true,
+        accountId: `guest_${id}`,
         worldX: 0, worldY: 0,
         frameX: 0, frameY: 0,
         isMoving: false, message: "", messageTimer: 0, isTyping: false,
@@ -34,17 +43,20 @@ module.exports = function createWsHandler(deps) {
         weaponAmmo: {},
         lastShotTime: 0,
         isReloading: false,
-        equipped: { head: 'head_default', body: 'body_default', hands: 'none' },
+        equipped: { head: 'H_D', body: 'body_default', hands: 'none' },
         chunkId: getChunkId(0, 0),
 
-        // 🛑 EL FIX 1: ¡El servidor necesita saber que los invitados SÍ tienen la Ghost Gun!
+        // ðŸ›‘ EL FIX 1: Â¡El servidor necesita saber que los invitados SÃ tienen la Ghost Gun!
         inventory: ["ghost_gun"],
         equippedWeapon: "ghost_gun"
     };
 
+    
+
+
     ws.on('message', async (message) => {
 
-        // --- 🛡️ ESCUDO ANTI-DDOS (RATE LIMITING) 🛡️ ---
+        // --- ðŸ›¡ï¸ ESCUDO ANTI-DDOS (RATE LIMITING) ðŸ›¡ï¸ ---
         const now = Date.now();
         if (!ws.rateLimit) ws.rateLimit = { count: 0, lastReset: now };
 
@@ -56,19 +68,19 @@ module.exports = function createWsHandler(deps) {
 
         ws.rateLimit.count++;
 
-        // Un jugador legal envía ~20 paquetes por segundo.
-        // Si manda más de 40, está usando macros o lag switch. Lo ignoramos.
+        // Un jugador legal envÃ­a ~20 paquetes por segundo.
+        // Si manda mÃ¡s de 40, estÃ¡ usando macros o lag switch. Lo ignoramos.
         if (ws.rateLimit.count > 40) {
 
             // Si el ataque es masivo (ej. un script malicioso enviando 100+), le cortamos el cable.
             if (ws.rateLimit.count > 100) {
                 console.warn(`[ANTI-DDOS] Desconectando atacante por spam masivo.`);
-                ws.close(); // Lo pateamos del servidor instantáneamente
+                ws.close(); // Lo pateamos del servidor instantÃ¡neamente
             }
-            return; // Detenemos la ejecución aquí. Salvamos la CPU del servidor.
+            return; // Detenemos la ejecuciÃ³n aquÃ­. Salvamos la CPU del servidor.
         }
 
-        // ⚡ Decode the incoming binary buffer back into a Javascript Object
+        // âš¡ Decode the incoming binary buffer back into a Javascript Object
         const data = decode(message);
 
         // 1. HANDLE REGISTRATION
@@ -109,11 +121,19 @@ module.exports = function createWsHandler(deps) {
         // 2. HANDLE LOGIN
         if (data.type === 'login') {
             try {
-                // Search by EMAIL instead of username
-                const user = await User.findOne({ email: new RegExp('^' + data.email.trim() + '$', 'i') });
-                if (!user) return ws.send(encode({ type: 'auth_error', message: 'Email not found' }));
+                const identifier = (data.email || data.username || '').toString().trim();
+                if (!identifier) return ws.send(encode({ type: 'auth_error', message: 'Please enter your email or username' }));
 
-                const isMatch = await bcrypt.compare(data.password, user.password);
+                // Search by EMAIL or USERNAME
+                const user = await User.findOne({
+                    $or: [
+                        { email: new RegExp('^' + identifier + '$', 'i') },
+                        { username: new RegExp('^' + identifier + '$', 'i') }
+                    ]
+                });
+                if (!user) return ws.send(encode({ type: 'auth_error', message: 'Account not found (check email/username)' }));
+
+                const isMatch = await bcrypt.compare(data.password || '', user.password);
                 if (!isMatch) return ws.send(encode({ type: 'auth_error', message: 'Incorrect password' }));
 
                 // --- NEW: RETROACTIVELY GIVE EXISTING PLAYERS THE GUN ---
@@ -140,44 +160,54 @@ module.exports = function createWsHandler(deps) {
                 await user.save();
 
                 isAuthenticated = true;
-                currentUser = user.email;
-
-                // --- KICK GHOST CLONES ---
-                wss.clients.forEach(client => {
-                    if (client !== ws && client.playerId && players[client.playerId] && players[client.playerId].email === user.email) {
-                        console.log(`[AUTH] Kicking old clone for ${user.email}`);
-                        try {
-                            client.send(encode({ type: 'auth_error', message: 'Logged in from another location.' }));
-                            client.terminate();
-                        } catch(e) {}
-                    }
-                });
- // Track session by email internally
+                currentUser = user.email; // Track session by email internally
 
                 // Pass their data to the lobby memory
                 players[id].email = user.email; // Hidden from other players
                 players[id].username = user.username;
                 players[id].gameId = user.gameId; // <--- NUEVO
                 players[id].role = user.role; // <--- ADMIN ROLE
+                players[id].isGuest = false;
+                players[id].accountId = user._id ? user._id.toString() : id;
                 players[id].worldX = user.worldX;
                 players[id].worldY = user.worldY;
-                players[id].friends = user.friends;
+                
+                const BanModel = require('../models/Ban');
+                if (user._id) {
+                    let activeBan = null;
+                    if (user.role !== 'admin') {
+                        activeBan = await BanModel.findOne({ $or: [{ accountId: user._id.toString() }, { ipAddress: ws.clientIp }], expiresAt: { $gt: new Date() } });
+                    }
+                    if (activeBan) {
+                        players[id].isJailed = true;
+                        if (state.jailSpawnPos) {
+                            players[id].worldX = state.jailSpawnPos.x;
+                            players[id].worldY = state.jailSpawnPos.y;
+                        } else {
+                            players[id].worldX = 0;
+                            players[id].worldY = 0;
+                        }
+                    } else {
+                        players[id].isJailed = false;
+                        ws.send(encode({ type: 'unjail' }));
+                    }
+                } players[id].friends = user.friends;
                 // --- THE FIX: Give the server memory their inventory! ---
                 players[id].inventory = user.inventory;
 
                 players[id].equippedWeapon = user.equippedWeapon || "none";
                 players[id].weaponAmmo = {};
-                players[id].equipped = user.equipped || { head: 'head_default', body: 'body_default', hands: 'none' };
+                players[id].equipped = user.equipped || { head: 'H_D', body: 'body_default', hands: 'none' };
 
                 // --- THE HOTBAR PERSISTENCE FIX ---
                 players[id].hotbar = user.hotbar || ["none", "none", "none"];
-                players[id].quickSwaps = user.quickSwaps || []; // 🆕 Nueva línea
+                players[id].quickSwaps = user.quickSwaps || []; // ðŸ†• Nueva lÃ­nea
 
                 // --- NUEVO: CARGAR MONEDAS A LA RAM ---
                 players[id].coins = user.coins || 0;
                 players[id].gems = user.gems || 0; // Cargar Argems
 
-                // 👇 NUEVO: CARGAR KILLS Y LOSSES 👇
+                // ðŸ‘‡ NUEVO: CARGAR KILLS Y LOSSES ðŸ‘‡
                 players[id].kills = user.kills || 0;
                 players[id].losses = user.losses || 0;
                 players[id].elo = user.elo || 1000;
@@ -197,11 +227,11 @@ module.exports = function createWsHandler(deps) {
                 players[id].bpPremium = user.bpPremium || false;
                 players[id].bpClaimedFree = user.bpClaimedFree || [];
                 players[id].bpClaimedPremium = user.bpClaimedPremium || [];
-                // 👇 NUEVO: CARGAR SALUD A LA RAM 👇
+                // ðŸ‘‡ NUEVO: CARGAR SALUD A LA RAM ðŸ‘‡
                 players[id].hp = user.hp !== undefined ? user.hp : 100;
                 players[id].isDead = user.isDead || false;
 
-                // --- 🌟 NUEVO: CARGAR TAREAS Y LOGROS A LA RAM 🌟 ---
+                // --- ðŸŒŸ NUEVO: CARGAR TAREAS Y LOGROS A LA RAM ðŸŒŸ ---
                 players[id].taskProgress = {};
                 players[id].claimedTasks = {};
 
@@ -217,21 +247,21 @@ module.exports = function createWsHandler(deps) {
                 parseMongoMap(rawUser.taskProgress, players[id].taskProgress, false);
                 parseMongoMap(rawUser.claimedTasks, players[id].claimedTasks, true);
 
-                // 🛑 EL FIX: REINICIAR EL TEMPORIZADOR DE COMBATE AL ENTRAR 🛑
-                // Esto evita que los que recargan la página se curen mágicamente
+                // ðŸ›‘ EL FIX: REINICIAR EL TEMPORIZADOR DE COMBATE AL ENTRAR ðŸ›‘
+                // Esto evita que los que recargan la pÃ¡gina se curen mÃ¡gicamente
                 players[id].lastHitTime = Date.now();
 
-                // Agrega esta línea para guardar el ID único de MongoDB en RAM:
+                // Agrega esta lÃ­nea para guardar el ID Ãºnico de MongoDB en RAM:
                 players[id].accountId = user._id.toString();
 
                 // --- NUEVO: PASAR EL ROL A LA MEMORIA ---
                 players[id].role = user.role || 'player';
 
-                // 👇 EL FIX ANTI-COMA: Si te conectas y estabas muerto, revives automáticamente 👇
+                // ðŸ‘‡ EL FIX ANTI-COMA: Si te conectas y estabas muerto, revives automÃ¡ticamente ðŸ‘‡
                 if (players[id].isDead || players[id].hp <= 0) {
                     players[id].hp = 100;
                     players[id].isDead = false;
-                    // Forzamos a que MongoDB también se entere de que ya no estás muerto
+                    // Forzamos a que MongoDB tambiÃ©n se entere de que ya no estÃ¡s muerto
                     User.findByIdAndUpdate(user._id, { hp: 100, isDead: false }).catch(console.error);
                 }
 
@@ -243,10 +273,14 @@ module.exports = function createWsHandler(deps) {
                         players[id].squadName = mySquad.name;
                         players[id].squadLogo = mySquad.logo;
 
-                        // 🛑 EL FIX: Revisar si soy líder o si tengo el permiso de invitar
-                        const isLeader = mySquad.leader.toString() === user._id.toString();
-                        const myData = mySquad.members.find(m => m.accountId.toString() === user._id.toString());
+                        const isLeader = mySquad.leader && mySquad.leader.toString() === user._id.toString();
+                        const myData = mySquad.members ? mySquad.members.find(m => m.accountId && m.accountId.toString() === user._id.toString()) : null;
+                        players[id].isLeader = !!isLeader;
                         players[id].squadCanInvite = isLeader || (myData && myData.canInvite) || false;
+                        players[id].squadCanKick = isLeader || (myData && myData.canKick) || false;
+                        players[id].squadCanAssignRoles = isLeader || (myData && myData.canAssignRoles) || false;
+                        players[id].squadTitle = isLeader ? 'ðŸ‘‘ LÃ­der' : (myData && myData.customTitle ? myData.customTitle : 'Miembro');
+                        players[id].squadRole = isLeader ? 'leader' : 'member';
                     }
                 }
                 // Send success and include their friends list!
@@ -267,10 +301,14 @@ module.exports = function createWsHandler(deps) {
                 broadcast({ type: 'update', id: id, player: players[id] }, ws);
 
                 // --- NUEVO: TRIGGER TUTORIAL IF NEEDED ---
+                // --- NUEVO: TRIGGER TUTORIAL IF NEEDED ---
                 if (!user.hasSeenTutorial) {
                     ws.send(encode({ type: 'trigger_tutorial' }));
                 }
-            } catch (err) { console.error(err); }
+                
+                isAuthenticated = true;
+                currentUser = user.email;
+            } catch (err) { console.error("AUTO LOGIN CRASH", err); ws.send(encode({ type: 'auth_error', message: 'Server crashed during login.' })); }
         }
 
         // --- NUEVO: HANDLE FEEDBACK ---
@@ -293,40 +331,205 @@ module.exports = function createWsHandler(deps) {
         if (data.type === 'tutorial_completed' && isAuthenticated) {
             try {
                 await User.findOneAndUpdate({ email: currentUser }, { hasSeenTutorial: true });
-            } catch (err) { console.error(err); }
+            } catch (err) { console.error("AUTO LOGIN CRASH", err); ws.send(encode({ type: 'auth_error', message: 'Server crashed during login.' })); }
         }
 
+
+            
+        // --- NUEVO: WEBRTC SIGNALING PARA RADIO DEL CLAN ---
+        if (data.type === 'webrtc_signal') {
+            console.log("WEBRTC SIGNAL RECV from:", id, "target:", data.targetId, "type:", data.signalData.type);
+            if (!players[id] || !players[id].squad) {
+                console.log("WEBRTC SIGNAL DROPPED: No squad for", id);
+                return;
+            }
+            const mySquadId = players[id].squad.toString();
+            
+            for (let pid in players) {
+                if (pid !== id && players[pid].squad && players[pid].squad.toString() === mySquadId) {
+                    if (!data.targetId || data.targetId === pid) {
+                        console.log("WEBRTC SIGNAL FORWARDING to:", pid);
+                        if (players[pid].ws && players[pid].ws.readyState === WebSocket.OPEN) {
+                            players[pid].ws.send(encode({
+                                type: 'webrtc_signal',
+                                senderId: id,
+                                senderName: players[id].username,
+                                senderHead: players[id].equipped ? players[id].equipped.head : "H_D",
+                                signalData: data.signalData
+                            }));
+                        }
+                    }
+                }
+            }
+        }
+        
+        if ((data.type === 'join_voice_lobby' || data.type === 'leave_voice_lobby')) {
+            console.log("VOICE LOBBY EVENT:", data.type, "from:", id);
+            if (!players[id] || !players[id].squad) {
+                console.log("VOICE LOBBY DROPPED: No squad for", id);
+                return;
+            }
+            const mySquadId = players[id].squad.toString();
+            
+            for (let pid in players) {
+                if (players[pid].squad && players[pid].squad.toString() === mySquadId) {
+                    console.log("VOICE LOBBY BROADCASTING to:", pid);
+                    if (players[pid].ws && players[pid].ws.readyState === WebSocket.OPEN) {
+                        players[pid].ws.send(encode({
+                            type: data.type,
+                            userId: id,
+                            username: players[id].username,
+                            head: players[id].equipped ? players[id].equipped.head : "H_D"
+                        }));
+                    }
+                }
+            }
+        }
+
+        if (data.type === 'admin_invisible') {
+                if (players[id]) players[id].invisibleEnabled = !!data.enabled;
+                if (data.enabled) {
+                    broadcast({ type: 'left', id: id });
+                } else if (players[id]) {
+                    broadcast({ type: 'update', id: id, player: players[id] });
+                }
+                ws.send(encode({ type: 'system_message', text: `Invisible mode: ${data.enabled ? 'ON' : 'OFF'}`, color: '#38ef7d' }));
+                return;
+            }
+
+            if (data.type === 'admin_noclip') {
+                if (players[id]) players[id].noclipEnabled = !!data.enabled;
+                ws.send(encode({ type: 'system_message', text: `Noclip mode: ${data.enabled ? 'ON' : 'OFF'}`, color: '#38ef7d' }));
+                return;
+            }
+
         // --- NUEVO: ADMIN TOOLS ---
-        if (['admin_teleport', 'admin_summon', 'admin_kick', 'admin_respawn', 'admin_invisible', 'admin_noclip'].includes(data.type) && isAuthenticated) {
-            if ((players[id].role || '').toLowerCase() !== 'admin') {
+        if (['admin_teleport', 'admin_summon', 'admin_kick', 'admin_respawn', 'admin_invisible', 'admin_noclip', 'admin_get_online_players', 'admin_freeze', 'admin_jail'].includes(data.type) && isAuthenticated) {
+            const myPlayer = players[id];
+            if (!myPlayer || (myPlayer.role || '').toLowerCase() !== 'admin') {
                 ws.send(encode({ type: 'system_message', text: 'You do not have permission to use admin tools.', isAlert: true }));
                 return;
             }
 
-            // Find target player by gameId
+            // 1. NON-TARGET ADMIN COMMANDS
+
+            if (data.type === 'admin_get_online_players') {
+                const onlineList = [];
+                const seenIds = new Set();
+
+                // Check all active clients
+                for (const client of wss.clients) {
+                    if (client && client.readyState === WebSocket.OPEN && client.playerId && players[client.playerId]) {
+                        const pid = client.playerId;
+                        seenIds.add(pid);
+                        const p = players[pid];
+                        if (!p) continue;
+                        const isGuestPlayer = !!p.isGuest || (p.role === 'guest') || (p.username && p.username.startsWith('Guest_'));
+                        onlineList.push({
+                            id: pid,
+                            gameId: p.gameId || (isGuestPlayer ? ('G' + String(pid).slice(0, 4).toUpperCase()) : ('P' + String(pid).slice(0, 5))),
+                            accountId: p.accountId || (isGuestPlayer ? ('guest_' + pid) : (p._id || pid)),
+                            username: p.username || p.name || (isGuestPlayer ? 'Guest' : 'Anonymous'),
+                            role: p.role || (isGuestPlayer ? 'guest' : 'player'),
+                            isGuest: isGuestPlayer,
+                            equipped: p.equipped || { head: 'H_D', body: 'body_default', hands: 'none' },
+                            hp: (typeof p.hp === 'number') ? p.hp : 100,
+                            maxHp: p.maxHp || 100,
+                            worldX: Math.round(p.worldX || 0),
+                            worldY: Math.round(p.worldY || 0),
+                            isDead: !!p.isDead, isFrozen: !!p.isFrozen, isJailed: !!p.isJailed
+                        });
+                    }
+                }
+
+                // Also check players map in case any socket was missed
+                for (const pid in players) {
+                    if (!seenIds.has(pid) && players[pid]) {
+                        const p = players[pid];
+                        if (!p) continue;
+                        const isGuestPlayer = !!p.isGuest || (p.role === 'guest') || (p.username && p.username.startsWith('Guest_'));
+                        onlineList.push({
+                            id: pid,
+                            gameId: p.gameId || (isGuestPlayer ? ('G' + String(pid).slice(0, 4).toUpperCase()) : ('P' + String(pid).slice(0, 5))),
+                            accountId: p.accountId || (isGuestPlayer ? ('guest_' + pid) : (p._id || pid)),
+                            username: p.username || p.name || (isGuestPlayer ? 'Guest' : 'Anonymous'),
+                            role: p.role || (isGuestPlayer ? 'guest' : 'player'),
+                            isGuest: isGuestPlayer,
+                            equipped: p.equipped || { head: 'H_D', body: 'body_default', hands: 'none' },
+                            hp: (typeof p.hp === 'number') ? p.hp : 100,
+                            maxHp: p.maxHp || 100,
+                            worldX: Math.round(p.worldX || 0),
+                            worldY: Math.round(p.worldY || 0),
+                            isDead: !!p.isDead
+                        });
+                    }
+                }
+
+                ws.send(encode({ type: 'admin_online_players_list', players: onlineList }));
+                return;
+            }
+
+            // 2. TARGET-BASED ADMIN COMMANDS (Supports both Registered Users & Temporary Guests)
             let targetWs = null;
             let targetId = null;
-            for (const client of wss.clients) {
-                if (client.readyState === WebSocket.OPEN && client.playerId && players[client.playerId] && players[client.playerId].gameId === data.targetGameId) {
-                    targetWs = client;
-                    targetId = client.playerId;
-                    break;
+            const searchTarget = (data.targetGameId || '').trim().toUpperCase();
+
+            if (searchTarget) {
+                // Pass 1: Search connected client sockets
+                for (const client of wss.clients) {
+                    if (client && client.readyState === WebSocket.OPEN && client.playerId && players[client.playerId]) {
+                        const pid = client.playerId;
+                        const p = players[pid];
+                        if (p && (
+                            (p.gameId && String(p.gameId).toUpperCase() === searchTarget) ||
+                            (p.username && String(p.username).toUpperCase() === searchTarget) ||
+                            (p.accountId && String(p.accountId).toUpperCase() === searchTarget) ||
+                            (pid && String(pid).toUpperCase() === searchTarget)
+                        )) {
+                            targetWs = client;
+                            targetId = pid;
+                            break;
+                        }
+                    }
+                }
+                // Pass 2: Search players map directly if socket wasn't indexed yet
+                if (!targetId) {
+                    for (const pid in players) {
+                        const p = players[pid];
+                        if (p && (
+                            (p.gameId && String(p.gameId).toUpperCase() === searchTarget) ||
+                            (p.username && String(p.username).toUpperCase() === searchTarget) ||
+                            (p.accountId && String(p.accountId).toUpperCase() === searchTarget) ||
+                            (pid && String(pid).toUpperCase() === searchTarget)
+                        )) {
+                            targetId = pid;
+                            for (const client of wss.clients) {
+                                if (client && client.readyState === WebSocket.OPEN && client.playerId === pid) {
+                                    targetWs = client;
+                                    break;
+                                }
+                            }
+                            break;
+                        }
+                    }
                 }
             }
 
-            if (!targetWs && data.type !== 'admin_invisible' && data.type !== 'admin_noclip') {
-                if (data.type === 'admin_teleport') {
+            if (!targetWs || !targetId || !players[targetId]) {
+                if (data.type === 'admin_teleport' && data.targetGameId) {
                     try {
                         const offlineUser = await User.findOne({ gameId: data.targetGameId });
                         if (!offlineUser) {
                             ws.send(encode({ type: 'system_message', text: `Player ${data.targetGameId} does not exist in database.`, isAlert: true }));
                             return;
                         }
-                        players[id].worldX = offlineUser.worldX || 0;
-                        players[id].worldY = offlineUser.worldY || 0;
-                        ws.send(encode({ type: 'force_position', x: players[id].worldX, y: players[id].worldY, reason: 'teleport' }));
-                        broadcast({ type: 'update', id: id, player: players[id] }, ws);
-                        ws.send(encode({ type: 'system_message', text: `Teleported to offline player ${data.targetGameId}.` }));
+                        if (players[id]) {
+                            players[id].worldX = offlineUser.worldX || 0;
+                            players[id].worldY = offlineUser.worldY || 0;
+                            ws.send(encode({ type: 'force_position', x: players[id].worldX, y: players[id].worldY, reason: 'teleport' }));
+                            broadcast({ type: 'update', id: id, player: players[id] }, ws);
+                            ws.send(encode({ type: 'system_message', text: `Teleported to offline player ${data.targetGameId}.` }));
+                        }
                         return;
                     } catch (e) {
                         console.error("Offline teleport error", e);
@@ -335,52 +538,116 @@ module.exports = function createWsHandler(deps) {
                     }
                 } else {
                     const onlineIds = Array.from(wss.clients).map(c => {
-                        let p = players[c.playerId];
+                        let p = (c && c.playerId) ? players[c.playerId] : null;
                         if (!p) return 'Null';
-                        return `${p.email || 'Guest'}[${p.gameId || 'None'}]`;
+                        return `${p.username || p.email || 'Guest'}[${p.gameId || 'None'}]`;
                     }).join(', ');
-                    ws.send(encode({ type: 'system_message', text: `Player ${data.targetGameId} not found. Online: ${onlineIds}`, isAlert: true }));
+                    ws.send(encode({ type: 'system_message', text: `Player ${data.targetGameId || 'unknown'} not found. Online: ${onlineIds}`, isAlert: true }));
                     return;
                 }
             }
 
+            const targetPlayer = players[targetId];
+            const targetLabel = targetPlayer ? `${targetPlayer.username || data.targetGameId} [${targetPlayer.gameId || targetId}]` : (data.targetGameId || targetId);
+
             if (data.type === 'admin_teleport') {
-                players[id].worldX = players[targetId].worldX;
-                players[id].worldY = players[targetId].worldY;
-                ws.send(encode({ type: 'force_position', x: players[id].worldX, y: players[id].worldY, reason: 'teleport' }));
-                broadcast({ type: 'update', id: id, player: players[id] }, ws);
-                ws.send(encode({ type: 'system_message', text: `Teleported to ${data.targetGameId}.` }));
+                if (players[id] && targetPlayer) {
+                    players[id].worldX = targetPlayer.worldX;
+                    players[id].worldY = targetPlayer.worldY;
+                    ws.send(encode({ type: 'force_position', x: players[id].worldX, y: players[id].worldY, reason: 'teleport' }));
+                    broadcast({ type: 'update', id: id, player: players[id] }, ws);
+                    ws.send(encode({ type: 'system_message', text: `Teleported to ${targetLabel}.`, color: '#38ef7d' }));
+                }
             }
             else if (data.type === 'admin_summon') {
-                players[targetId].worldX = players[id].worldX;
-                players[targetId].worldY = players[id].worldY;
-                targetWs.send(encode({ type: 'force_position', x: players[id].worldX, y: players[id].worldY, reason: 'teleport' }));
-                broadcast({ type: 'update', id: targetId, player: players[targetId] }, targetWs);
-                ws.send(encode({ type: 'system_message', text: `Summoned ${data.targetGameId} to your location.` }));
+                if (players[id] && targetPlayer && targetWs && targetWs.readyState === WebSocket.OPEN) {
+                    targetPlayer.worldX = players[id].worldX;
+                    targetPlayer.worldY = players[id].worldY;
+                    targetWs.send(encode({ type: 'force_position', x: players[id].worldX, y: players[id].worldY, reason: 'teleport' }));
+                    broadcast({ type: 'update', id: targetId, player: targetPlayer }, targetWs);
+                    ws.send(encode({ type: 'system_message', text: `Summoned ${targetLabel} to your location.`, color: '#38ef7d' }));
+                }
             }
             else if (data.type === 'admin_kick') {
-                targetWs.send(encode({ type: 'auth_error', message: 'You have been kicked by an administrator.' }));
-                targetWs.close();
-                ws.send(encode({ type: 'system_message', text: `Kicked ${data.targetGameId}.` }));
+                if (targetWs && targetWs.readyState === WebSocket.OPEN) {
+                    targetWs.send(encode({ type: 'auth_error', message: 'You have been kicked by an administrator.' }));
+                    targetWs.close();
+                }
+                ws.send(encode({ type: 'system_message', text: `Kicked ${targetLabel}.`, color: '#e74c3c' }));
             }
             else if (data.type === 'admin_respawn') {
-                players[targetId].worldX = 0;
-                players[targetId].worldY = 0;
-                targetWs.send(encode({ type: 'force_position', x: 0, y: 0, reason: 'teleport' }));
-                broadcast({ type: 'update', id: targetId, player: players[targetId] }, targetWs);
-                ws.send(encode({ type: 'system_message', text: `Sent ${data.targetGameId} to spawn.` }));
-            }
-            else if (data.type === 'admin_invisible') {
-                players[id].invisibleEnabled = data.enabled;
-                if (data.enabled) {
-                    broadcast({ type: 'left', id: id });
-                } else {
-                    broadcast({ type: 'update', id: id, player: players[id] });
+                if (targetPlayer && targetWs && targetWs.readyState === WebSocket.OPEN) {
+                    targetPlayer.worldX = 0;
+                    targetPlayer.worldY = 0;
+                    targetWs.send(encode({ type: 'force_position', x: 0, y: 0, reason: 'teleport' }));
+                    broadcast({ type: 'update', id: targetId, player: targetPlayer }, targetWs);
+                    ws.send(encode({ type: 'system_message', text: `Sent ${targetLabel} to spawn.`, color: '#f39c12' }));
                 }
-                ws.send(encode({ type: 'system_message', text: `Invisible mode: ${data.enabled ? 'ON' : 'OFF'}`, color: '#38ef7d' }));
             }
-            else if (data.type === 'admin_noclip') {
-                ws.send(encode({ type: 'system_message', text: `Noclip mode: ${data.enabled ? 'ON' : 'OFF'}`, color: '#38ef7d' }));
+            else if (data.type === 'admin_freeze') {
+                if (targetPlayer) {
+                    targetPlayer.isFrozen = !targetPlayer.isFrozen;
+                    ws.send(encode({ type: 'system_message', text: targetPlayer.isFrozen ? 'Congelaste a ' + targetLabel : 'Descongelaste a ' + targetLabel, color: '#3498db' }));
+                }
+            }
+            else if (data.type === 'admin_jail') {
+                if (targetPlayer && targetWs && targetWs.readyState === WebSocket.OPEN) {
+                    const Ban = require('../models/Ban');
+                    const expiresAt = new Date(Date.now() + (data.duration * 60000));
+                    
+                    const banRecord = new Ban({
+                        accountId: targetPlayer.accountId,
+                        ipAddress: targetWs.clientIp,
+                        adminId: players[id].accountId,
+                        reasonType: data.reason,
+                        description: data.desc,
+                        durationMinutes: data.duration,
+                        expiresAt: expiresAt
+                    });
+                    
+                    banRecord.save().then(() => {
+                        targetPlayer.isJailed = true;
+                        
+                        let destX = 0, destY = 0;
+                        if (state.jailSpawnPos) {
+                            destX = state.jailSpawnPos.x;
+                            destY = state.jailSpawnPos.y;
+                        }
+                        
+                        targetPlayer.worldX = destX;
+                        targetPlayer.worldY = destY;
+                        targetWs.send(encode({ type: 'force_position', x: destX, y: destY, reason: 'teleport' }));
+                        broadcast({ type: 'update', id: targetId, player: targetPlayer }, targetWs);
+                        targetWs.send(encode({ type: 'system_message', text: 'Has sido enjaulado por ' + data.duration + ' minutos (' + data.reason + ').', color: '#e74c3c', isAlert: true, isJailAlert: true }));
+                        
+                        ws.send(encode({ type: 'system_message', text: 'Enjaulaste a ' + targetLabel + ' exitosamente.', color: '#9b59b6' }));
+                    }).catch(err => {
+                        console.error(err);
+                        ws.send(encode({ type: 'system_message', text: 'Error guardando condena.', color: '#e74c3c' }));
+                    });
+                } else if (data.targetGameId) {
+                    // Try offline jail
+                    const Ban = require('../models/Ban');
+                    const User = require('../models/User');
+                    User.findOne({ gameId: data.targetGameId }).then(offlineUser => {
+                        if (offlineUser) {
+                            const expiresAt = new Date(Date.now() + (data.duration * 60000));
+                            const banRecord = new Ban({
+                                accountId: offlineUser._id.toString(),
+                                adminId: players[id].accountId,
+                                reasonType: data.reason,
+                                description: data.desc,
+                                durationMinutes: data.duration,
+                                expiresAt: expiresAt
+                            });
+                            banRecord.save().then(() => {
+                                ws.send(encode({ type: 'system_message', text: 'Enjaulaste a ' + data.targetGameId + ' (Offline) exitosamente.', color: '#9b59b6' }));
+                            });
+                        } else {
+                            ws.send(encode({ type: 'system_message', text: 'Jugador no encontrado.', color: '#e74c3c' }));
+                        }
+                    });
+                }
             }
         }
 
@@ -401,7 +668,7 @@ module.exports = function createWsHandler(deps) {
                 }
                 await Arena.deleteMany({});
                 ws.send(encode({ type: 'system_message', text: `Cleared ${count} minigame arenas successfully!`, color: '#38ef7d' }));
-                console.log(`🧹 ADMIN NUKE: Cleared ${count} arenas.`);
+                console.log(`ðŸ§¹ ADMIN NUKE: Cleared ${count} arenas.`);
             } catch (e) {
                 console.error("Error clearing arenas:", e);
                 ws.send(encode({ type: 'system_message', text: 'Error clearing arenas from database.', isAlert: true }));
@@ -458,10 +725,10 @@ module.exports = function createWsHandler(deps) {
             } catch (err) { console.error("Error cambiando nombre:", err); }
         }
 
-        // 4. AÑADIR AMIGOS (POR ID)
+        // 4. AÃ‘ADIR AMIGOS (POR ID)
         if (data.type === 'add_friend' && isAuthenticated) {
             try {
-                // 1. Lo añadimos a tu base de datos usando su AccountID
+                // 1. Lo aÃ±adimos a tu base de datos usando su AccountID
                 await User.findOneAndUpdate(
                     { email: currentUser },
                     { $addToSet: { friends: data.friendAccountId } }
@@ -488,85 +755,119 @@ module.exports = function createWsHandler(deps) {
                         });
                     }
                 }
-            } catch (err) { console.error(err); }
+            } catch (err) { console.error("AUTO LOGIN CRASH", err); ws.send(encode({ type: 'auth_error', message: 'Server crashed during login.' })); }
         }
 
         // 5. HANDLE WORLD BUILDING
         if (data.type === 'place_tile') {
-            // --- EL CANDADO DE SEGURIDAD ABSOLUTA ---
             if (!players[id] || players[id].role !== 'admin') return;
 
-
             try {
-                // SMART QUERY: Catch tiles on the active layer, OR legacy ghost tiles with no layer (if L0)
-                const query = { x: data.x, y: data.y };
-                if (data.l === 0) {
-                    query.$or = [{ l: 0 }, { l: { $exists: false } }, { l: null }];
-                } else {
-                    query.l = data.l;
-                }
+                const targetL = data.l || 0;
+                const key = `${data.x},${data.y},${targetL}`;
 
                 if (data.tileId === -1) {
-                    // 🗑 ERASER: Wipe ALL ghost tiles and duplicates at this coordinate
-                    await Tile.deleteMany(query);
-
-                    // LIMPIEZA EN RAM!
-                    const key = `${data.x},${data.y},${data.l}`;
+                    await Tile.deleteOne({ x: data.x, y: data.y, l: targetL });
                     delete serverWorldMap[key];
 
-                    // BORRAR MINIJUEGOS SI EXISTEN EN ESTA COORDENADA
-                    const uniqueArenaId = `arena_${data.x}_${data.y}`;
-                    if (arenasRAM[uniqueArenaId]) {
-                        await Arena.deleteOne({ arenaId: uniqueArenaId });
-                        delete arenasRAM[uniqueArenaId];
-
-                        // Avisar a todos los clientes para que escondan el marcador y borren el balon
+                    const targetTurfId = `base_${data.x}_${data.y}`;
+                    if (state.turfBases && state.turfBases[targetTurfId] && targetL === 15) {
+                        await Turf.deleteOne({ turfId: targetTurfId });
+                        delete state.turfBases[targetTurfId];
+                        state.centralBase = Object.values(state.turfBases)[0] || null;
                         wss.clients.forEach(c => {
-                            if (c.readyState === WebSocket.OPEN) {
-                                c.send(encode({ type: 'delete_minigame', arenaId: uniqueArenaId }));
-                            }
+                            if (c.readyState === WebSocket.OPEN) c.send(encode({ type: 'base_delete', turfId: targetTurfId, turfBases: state.turfBases, base: state.centralBase }));
                         });
-                        console.log(`🗑️ Minigame eliminado con el Borrador: ${uniqueArenaId}`);
-                    }
-
-                    // 👇 EL FIX: Si pasamos el borrador por encima de la base, la destruimos
-                    // 👇 EL FIX: Solo destruimos la base si borramos en la Capa 15 (Lógica)
-                    if (state.centralBase && state.centralBase.gridX === data.x && state.centralBase.gridY === data.y && data.l === 15) {
-                        await Turf.deleteOne({ turfId: state.centralBase.turfId });
-                        state.centralBase = null;
-                        wss.clients.forEach(c => {
-                            if (c.readyState === WebSocket.OPEN) c.send(encode({ type: 'base_update', base: null }));
-                        });
-                        console.log("🗑️ Base destruida con el Borrador.");
                     }
                 } else {
-                    // 🎨 PAINT: Destroy old corrupted tiles first, then insert the clean new one
-                    await Tile.deleteMany(query);
-                    await Tile.create({ x: data.x, y: data.y, l: data.l, tileId: data.tileId });
+                    const tileDoc = {
+                        tileId: data.tileId,
+                        l: targetL,
+                        rotation: data.rotation || 0,
+                        hasCollision: !!data.hasCollision,
+                        isSit: !!data.isSit,
+                        shelfX: data.shelfX || 0,
+                        shelfY: data.shelfY || 0
+                    };
+                    if (data.triggerType !== undefined) tileDoc.triggerType = data.triggerType;
+                    if (data.destX !== undefined) tileDoc.destX = data.destX;
+                    if (data.destY !== undefined) tileDoc.destY = data.destY;
+                    if (data.itemId !== undefined) tileDoc.itemId = data.itemId;
+                    if (data.requiresClick !== undefined) tileDoc.requiresClick = data.requiresClick;
+                    if (data.npcMessage !== undefined) tileDoc.npcMessage = data.npcMessage;
+                    if (data.itemRow !== undefined) tileDoc.itemRow = data.itemRow;
 
-                    // RAM UPDATE
-                    const key = `${data.x},${data.y},${data.l}`;
-                    serverWorldMap[key] = { tileId: data.tileId, l: data.l };
+                    await Tile.updateOne(
+                        { x: data.x, y: data.y, l: targetL },
+                        { $set: tileDoc },
+                        { upsert: true }
+                    );
+
+                    if (!serverWorldMap[key]) serverWorldMap[key] = { l: targetL };
+                    Object.assign(serverWorldMap[key], tileDoc);
                 }
 
-                // EN LA SECCIÓN 5 (place_tile):
+                // RAM WORLD_TILES_CACHE UPDATE
+                if (state.WORLD_TILES_CACHE) {
+                    const idx = state.WORLD_TILES_CACHE.findIndex(t => t.x === data.x && t.y === data.y && (t.l || 0) === targetL);
+                    if (data.tileId === -1) {
+                        if (idx !== -1) state.WORLD_TILES_CACHE.splice(idx, 1);
+                    } else {
+                        const cachedObj = {
+                            x: data.x, y: data.y, l: targetL,
+                            tileId: data.tileId,
+                            rotation: data.rotation || 0,
+                            hasCollision: !!data.hasCollision,
+                            isSit: !!data.isSit,
+                            shelfX: data.shelfX || 0,
+                            shelfY: data.shelfY || 0
+                        };
+                        if (data.triggerType !== undefined) cachedObj.triggerType = data.triggerType;
+                        if (data.destX !== undefined) cachedObj.destX = data.destX;
+                        if (data.destY !== undefined) cachedObj.destY = data.destY;
+                        if (data.itemId !== undefined) cachedObj.itemId = data.itemId;
+                        if (data.requiresClick !== undefined) cachedObj.requiresClick = data.requiresClick;
+                        if (data.npcMessage !== undefined) cachedObj.npcMessage = data.npcMessage;
+                        if (data.itemRow !== undefined) cachedObj.itemRow = data.itemRow;
+
+                        if (idx !== -1) {
+                            Object.assign(state.WORLD_TILES_CACHE[idx], cachedObj);
+                        } else {
+                            state.WORLD_TILES_CACHE.push(cachedObj);
+                        }
+                    }
+                }
+
                 wss.clients.forEach(client => {
-                    // --- EL FIX: Agregamos client !== ws para no mandarnos ecos ---
                     if (client !== ws && client.readyState === WebSocket.OPEN) {
                         client.send(encode({
-                            type: 'tile_update', x: data.x, y: data.y, l: data.l, tileId: data.tileId
+                            type: 'tile_update',
+                            x: data.x, y: data.y, l: targetL,
+                            tileId: data.tileId,
+                            rotation: data.rotation || 0,
+                            hasCollision: !!data.hasCollision,
+                            isSit: !!data.isSit,
+                            shelfX: data.shelfX || 0,
+                            shelfY: data.shelfY || 0,
+                            triggerType: data.triggerType,
+                            destX: data.destX,
+                            destY: data.destY,
+                            itemId: data.itemId,
+                            requiresClick: data.requiresClick,
+                            npcMessage: data.npcMessage,
+                            itemRow: data.itemRow
                         }));
                     }
                 });
             } catch (err) { console.error('Tile Save Error:', err); }
         }
 
-        // 5.5 HANDLE BULK BUILDING (SÚPER GUARDADO MULTI-CAPA ANTI-LAG)
+        // 5.5 HANDLE BULK BUILDING (SÃšPER GUARDADO MULTI-CAPA ANTI-LAG)
         if (data.type === 'save_blueprint') {
             if (!players[id] || players[id].role !== 'admin') return;
             const bp = new Blueprint(data.blueprint);
             bp.save().then(() => {
-                ws.send(encode({ type: 'server_msg', msg: 'Prefab guardado con éxito: ' + data.blueprint.name, color: '#2ecc71' }));
+                ws.send(encode({ type: 'server_msg', msg: 'Prefab guardado con Ã©xito: ' + data.blueprint.name, color: '#2ecc71' }));
                 Blueprint.find().lean().then(bps => {
                     wss.clients.forEach(client => {
                         const pid = client.playerId;
@@ -586,33 +887,35 @@ module.exports = function createWsHandler(deps) {
         }
 
         if (data.type === 'place_tiles_bulk') {
-            // --- EL CANDADO DE SEGURIDAD ABSOLUTA ---
             if (!players[id] || players[id].role !== 'admin') return;
 
             try {
                 const bulkOps = [];
                 for (let t of data.tiles) {
-                    if (t.tileId === -1) {
-                        // BORRADOR: Solo borramos el bloque específico en su capa
-                        bulkOps.push({ deleteMany: { filter: { x: t.x, y: t.y, l: t.l } } });
+                    const targetL = t.l || 0;
+                    const key = `${t.x},${t.y},${targetL}`;
 
-                        // LIMPIEZA EN RAM!
-                        const key = `${t.x},${t.y},${t.l}`;
+                    if (t.tileId === -1) {
+                        bulkOps.push({ deleteMany: { filter: { x: t.x, y: t.y, l: targetL } } });
                         delete serverWorldMap[key];
 
-                        // 👇 EL FIX: Si borramos la base con el borrador de arrastre masivo
-                        // 👇 EL FIX: Solo si borramos con arrastre masivo en la Capa 15
-                        if (state.centralBase && state.centralBase.gridX === t.x && state.centralBase.gridY === t.y && t.l === 15) {
-                            await Turf.deleteOne({ turfId: state.centralBase.turfId });
-                            state.centralBase = null;
+                        const targetTurfId = `base_${t.x}_${t.y}`;
+                        if (state.turfBases && state.turfBases[targetTurfId] && targetL === 15) {
+                            await Turf.deleteOne({ turfId: targetTurfId });
+                            delete state.turfBases[targetTurfId];
+                            state.centralBase = Object.values(state.turfBases)[0] || null;
                             wss.clients.forEach(c => {
-                                if (c.readyState === WebSocket.OPEN) c.send(encode({ type: 'base_update', base: null }));
+                                if (c.readyState === WebSocket.OPEN) c.send(encode({ type: 'base_delete', turfId: targetTurfId, turfBases: state.turfBases, base: state.centralBase }));
                             });
                         }
                     } else {
-                        let updateObj = { tileId: t.tileId, rotation: t.rotation || 0 };
-                        if (t.hasCollision !== undefined) updateObj.hasCollision = t.hasCollision;
-                        if (t.isSit !== undefined) updateObj.isSit = t.isSit;
+                        let updateObj = {
+                            tileId: t.tileId,
+                            l: targetL,
+                            rotation: t.rotation || 0
+                        };
+                        if (t.hasCollision !== undefined) updateObj.hasCollision = !!t.hasCollision;
+                        if (t.isSit !== undefined) updateObj.isSit = !!t.isSit;
                         if (t.triggerType !== undefined) updateObj.triggerType = t.triggerType;
                         if (t.destX !== undefined) updateObj.destX = t.destX;
                         if (t.destY !== undefined) updateObj.destY = t.destY;
@@ -623,15 +926,12 @@ module.exports = function createWsHandler(deps) {
                         if (t.shelfX !== undefined) updateObj.shelfX = t.shelfX;
                         if (t.shelfY !== undefined) updateObj.shelfY = t.shelfY;
 
-                        // RAM UPDATE
-                        const key = `${t.x},${t.y},${t.l}`;
-                        if (!serverWorldMap[key]) serverWorldMap[key] = { l: t.l };
+                        if (!serverWorldMap[key]) serverWorldMap[key] = { l: targetL };
                         Object.assign(serverWorldMap[key], updateObj);
 
-                        // UPSERT: Si existe, lo sobrescribe. Si no existe, lo crea. ¡1 sola operación!
                         bulkOps.push({
                             updateOne: {
-                                filter: { x: t.x, y: t.y, l: t.l },
+                                filter: { x: t.x, y: t.y, l: targetL },
                                 update: { $set: updateObj },
                                 upsert: true
                             }
@@ -640,13 +940,44 @@ module.exports = function createWsHandler(deps) {
                 }
 
                 if (bulkOps.length > 0) {
-                    // LA MAGIA: ordered: false permite a MongoDB procesar todo en paralelo a máxima velocidad
                     await Tile.bulkWrite(bulkOps, { ordered: false });
                 }
 
-                // EN LA SECCIÓN 5.5 (place_tiles_bulk):
+                // RAM WORLD_TILES_CACHE BULK UPDATE (Full fields preservation)
+                if (state.WORLD_TILES_CACHE && data.tiles) {
+                    data.tiles.forEach(t => {
+                        const targetL = t.l || 0;
+                        const idx = state.WORLD_TILES_CACHE.findIndex(ct => ct.x === t.x && ct.y === t.y && (ct.l || 0) === targetL);
+                        if (t.tileId === -1) {
+                            if (idx !== -1) state.WORLD_TILES_CACHE.splice(idx, 1);
+                        } else {
+                            const cachedObj = {
+                                x: t.x, y: t.y, l: targetL,
+                                tileId: t.tileId,
+                                rotation: t.rotation || 0,
+                                hasCollision: !!t.hasCollision,
+                                isSit: !!t.isSit,
+                                shelfX: t.shelfX || 0,
+                                shelfY: t.shelfY || 0
+                            };
+                            if (t.triggerType !== undefined) cachedObj.triggerType = t.triggerType;
+                            if (t.destX !== undefined) cachedObj.destX = t.destX;
+                            if (t.destY !== undefined) cachedObj.destY = t.destY;
+                            if (t.itemId !== undefined) cachedObj.itemId = t.itemId;
+                            if (t.requiresClick !== undefined) cachedObj.requiresClick = t.requiresClick;
+                            if (t.npcMessage !== undefined) cachedObj.npcMessage = t.npcMessage;
+                            if (t.itemRow !== undefined) cachedObj.itemRow = t.itemRow;
+
+                            if (idx !== -1) {
+                                Object.assign(state.WORLD_TILES_CACHE[idx], cachedObj);
+                            } else {
+                                state.WORLD_TILES_CACHE.push(cachedObj);
+                            }
+                        }
+                    });
+                }
+
                 wss.clients.forEach(client => {
-                    // --- EL FIX: Agregamos client !== ws ---
                     if (client !== ws && client.readyState === WebSocket.OPEN) {
                         client.send(encode({
                             type: 'tile_update_bulk', tiles: data.tiles
@@ -685,69 +1016,97 @@ module.exports = function createWsHandler(deps) {
                     updateData.itemId = data.itemId;
                     updateData.requiresClick = data.requiresClick;
                     updateData.npcMessage = data.npcMessage;
-                    updateData.itemRow = data.itemRow || 0; // <--- AÑADE ESTO PARA MONGODB
+                    updateData.itemRow = data.itemRow || 0; // <--- AÃ‘ADE ESTO PARA MONGODB
                     updateData.shelfX = data.shelfX || 0; // <--- MONGODB
                     updateData.shelfY = data.shelfY || 0;
-                    // Guardar también en RAM
+                    // Guardar tambiÃ©n en RAM
                     serverWorldMap[key].triggerType = data.triggerType;
                     serverWorldMap[key].destX = data.destX;
                     serverWorldMap[key].destY = data.destY;
                     serverWorldMap[key].requiresClick = data.requiresClick;
                     serverWorldMap[key].npcMessage = data.npcMessage;
-                    serverWorldMap[key].itemRow = data.itemRow || 0; // <--- AÑADE ESTO
+                    serverWorldMap[key].itemRow = data.itemRow || 0; // <--- AÃ‘ADE ESTO
                     serverWorldMap[key].shelfX = data.shelfX || 0;
                     serverWorldMap[key].shelfY = data.shelfY || 0;
                 }
 
                 await Tile.updateMany(query, updateData);
 
-                // 🛑 EL FIX: CREAR O ACTUALIZAR LA BASE EN VIVO CON SUS DATOS REALES 🛑
+                // RAM WORLD_TILES_CACHE METADATA UPDATE
+                if (state.WORLD_TILES_CACHE) {
+                    const ct = state.WORLD_TILES_CACHE.find(t => t.x === data.x && t.y === data.y && (t.l || 0) === (data.layer || 0));
+                    if (ct) {
+                        Object.assign(ct, updateData);
+                    }
+                }
+
+                // ðŸ›‘ EL FIX: CREAR O ACTUALIZAR LA BASE EN VIVO CON SUS DATOS REALES ðŸ›‘
                 if (data.triggerType === 'base') {
                     const uniqueTurfId = `base_${data.x}_${data.y}`;
+                    const turfUpdateObj = {
+                        name: data.turfName || "Base Central",
+                        maxHp: data.turfHp || 5000,
+                        spriteOffsetX: data.turfOffsetX || 0,
+                        spriteOffsetY: data.turfOffsetY || 0,
+                        hitboxOffsetX: data.turfHitX || 0,
+                        hitboxOffsetY: data.turfHitY || 0,
+                        hitboxW: data.turfHitW || 32,
+                        hitboxH: data.turfHitH || 32
+                    };
 
-                    // upsert: true crea la base si no existe, o la actualiza si ya existe
+                    if (data.turfSrcIdle !== undefined && data.turfSrcIdle !== "") turfUpdateObj.srcIdle = data.turfSrcIdle;
+                    if (data.turfSrcHit !== undefined && data.turfSrcHit !== "") turfUpdateObj.srcHit = data.turfSrcHit;
+                    if (data.turfFrameW !== undefined) turfUpdateObj.frameWidth = data.turfFrameW;
+                    if (data.turfFrameH !== undefined) turfUpdateObj.frameHeight = data.turfFrameH;
+                    if (data.turfFrames !== undefined) turfUpdateObj.frameCount = data.turfFrames;
+                    if (data.turfAnimSpeed !== undefined) turfUpdateObj.animSpeed = data.turfAnimSpeed;
+                    if (data.turfScale !== undefined) turfUpdateObj.renderScale = data.turfScale;
+                    if (data.turfIsHover !== undefined) turfUpdateObj.isHover = Boolean(data.turfIsHover);
+
                     const dbTurf = await Turf.findOneAndUpdate(
                         { turfId: uniqueTurfId },
-                        {
-                            name: data.turfName || "Base Central",
-                            maxHp: data.turfHp || 5000,
-                            spriteOffsetX: data.turfOffsetX || 0, // <--- GUARDAR EN BD
-                            spriteOffsetY: data.turfOffsetY || 0,  // <--- GUARDAR EN BD
-                            hitboxOffsetX: data.turfHitX || 0, // <--- GUARDAR EN BD
-                            hitboxOffsetY: data.turfHitY || 0,  // <--- GUARDAR EN BD
-                            hitboxW: data.turfHitW || 32, // <--- GUARDAR W
-                            hitboxH: data.turfHitH || 32  // <--- GUARDAR H
-                            // 🛑 YA NO GUARDAMOS "src" AQUÍ. SE HACE DIRECTO EN MONGODB.
-                        },
-                        { upsert: true, returnDocument: 'after' } // <--- EL FIX
+                        { $set: turfUpdateObj },
+                        { upsert: true, returnDocument: 'after' }
                     );
 
-                    // La cargamos a la memoria RAM instantáneamente
-                    state.centralBase = {
+                    if (!state.turfBases) state.turfBases = {};
+                    const prevBase = state.turfBases[uniqueTurfId];
+
+                    state.turfBases[uniqueTurfId] = {
                         turfId: uniqueTurfId,
                         gridX: data.x, gridY: data.y,
                         worldX: (data.x * 16) + 8, worldY: (data.y * 16) + 8,
-                        hp: dbTurf.hp, maxHp: dbTurf.maxHp,
-                        currentOwnerSquadId: dbTurf.ownerSquadName,
+                        hp: dbTurf.hp || dbTurf.maxHp || 5000,
+                        maxHp: dbTurf.maxHp || 5000,
+                        currentOwnerSquadId: dbTurf.ownerSquadName || null,
                         name: dbTurf.name,
                         srcIdle: dbTurf.srcIdle || "",
                         srcHit: dbTurf.srcHit || "",
-                        spriteOffsetX: dbTurf.spriteOffsetX || 0, // <--- RAM
-                        spriteOffsetY: dbTurf.spriteOffsetY || 0, // <--- RAM
-                        hitboxOffsetX: dbTurf.hitboxOffsetX || 0, // <--- RAM
-                        hitboxOffsetY: dbTurf.hitboxOffsetY || 0, // <--- RAM
-                        hitboxW: dbTurf.hitboxW || 32, // <--- RAM W
-                        hitboxH: dbTurf.hitboxH || 32, // <--- RAM H
-                        lastHitTime: state.centralBase ? state.centralBase.lastHitTime : 0, // Conservar el tiempo si ya existía
-                        damageTracker: {}
+                        spriteOffsetX: dbTurf.spriteOffsetX || 0,
+                        spriteOffsetY: dbTurf.spriteOffsetY || 0,
+                        hitboxOffsetX: dbTurf.hitboxOffsetX || 0,
+                        hitboxOffsetY: dbTurf.hitboxOffsetY || 0,
+                        hitboxW: dbTurf.hitboxW || 32,
+                        hitboxH: dbTurf.hitboxH || 32,
+                        frameWidth: dbTurf.frameWidth || 0,
+                        frameHeight: dbTurf.frameHeight || 0,
+                        frameCount: dbTurf.frameCount || 0,
+                        animSpeed: dbTurf.animSpeed || 0,
+                        renderScale: dbTurf.renderScale || 1.0,
+                        isHover: dbTurf.isHover !== undefined ? dbTurf.isHover : true,
+                        lastHitTime: prevBase ? prevBase.lastHitTime : 0,
+                        damageTracker: prevBase ? prevBase.damageTracker : {}
                     };
+                    state.centralBase = state.turfBases[uniqueTurfId];
 
-                    console.log(`🏰 Base Guardada/Actualizada en vivo: ${state.centralBase.name} (${state.centralBase.maxHp} HP)`);
+                    console.log(`ðŸ° Base Guardada/Actualizada en vivo: ${dbTurf.name} (${uniqueTurfId})`);
 
                     wss.clients.forEach(c => {
-                        if (c.readyState === WebSocket.OPEN) c.send(encode({ type: 'base_update', base: state.centralBase }));
+                        if (c.readyState === WebSocket.OPEN) {
+                            c.send(encode({ type: 'base_update', base: state.turfBases[uniqueTurfId], turfBases: state.turfBases }));
+                        }
                     });
-                } // 🥊 NUEVO: CREAR O ACTUALIZAR ARENA DE SPARRING
+                } // ðŸ¥Š NUEVO: CREAR O ACTUALIZAR ARENA DE SPARRING
                 else if (data.triggerType === 'arena') {
                     const uniqueArenaId = `arena_${data.x}_${data.y}`;
 
@@ -773,7 +1132,7 @@ module.exports = function createWsHandler(deps) {
                         { upsert: true, returnDocument: 'after' } // <--- EL FIX
                     );
 
-                    // Mantener el estado en vivo (Si ya había gente en cola, no borrarlos)
+                    // Mantener el estado en vivo (Si ya habÃ­a gente en cola, no borrarlos)
                     if (!arenasRAM[uniqueArenaId]) {
                         arenasRAM[uniqueArenaId] = {
                             queue: [],
@@ -815,10 +1174,10 @@ module.exports = function createWsHandler(deps) {
                         arenasRAM[uniqueArenaId].ball.goal2Y = (dbArena.config?.goal2Y || 0) * 16;
                     }
 
-                    arenasRAM[uniqueArenaId].doorX = data.x; // Donde está el letrero para salir
+                    arenasRAM[uniqueArenaId].doorX = data.x; // Donde estÃ¡ el letrero para salir
                     arenasRAM[uniqueArenaId].doorY = data.y;
 
-                    console.log(`🎮 Minigame Guardado en vivo: ${dbArena.name} (${dbArena.gameType})`);
+                    console.log(`ðŸŽ® Minigame Guardado en vivo: ${dbArena.name} (${dbArena.gameType})`);
                 } else if (data.triggerType !== undefined) {
                     // Si cambias el bloque para quitar el minijuego, lo destruimos
                     if (data.triggerType !== 'arena') {
@@ -833,18 +1192,20 @@ module.exports = function createWsHandler(deps) {
                                     c.send(encode({ type: 'delete_minigame', arenaId: uniqueArenaId }));
                                 }
                             });
-                            console.log(`🗑️ Minigame eliminado mediante el Inspector: ${uniqueArenaId}`);
+                            console.log(`ðŸ—‘ï¸ Minigame eliminado mediante el Inspector: ${uniqueArenaId}`);
                         }
                     }
 
                     // Si cambias el bloque a "Normal" estando en la Capa 15, DESTRUIMOS LA BASE
-                    if (state.centralBase && state.centralBase.gridX === data.x && state.centralBase.gridY === data.y && data.layer === 15) {
-                        await Turf.deleteOne({ turfId: state.centralBase.turfId });
-                        state.centralBase = null;
+                    const targetTurfId = `base_${data.x}_${data.y}`;
+                    if (state.turfBases && state.turfBases[targetTurfId] && data.layer === 15) {
+                        await Turf.deleteOne({ turfId: targetTurfId });
+                        delete state.turfBases[targetTurfId];
+                        state.centralBase = Object.values(state.turfBases)[0] || null;
                         wss.clients.forEach(c => {
-                            if (c.readyState === WebSocket.OPEN) c.send(encode({ type: 'base_update', base: null }));
+                            if (c.readyState === WebSocket.OPEN) c.send(encode({ type: 'base_delete', turfId: targetTurfId, turfBases: state.turfBases, base: state.centralBase }));
                         });
-                        console.log(`🗑️ Base eliminada mediante el Inspector.`);
+                        console.log(`ðŸ—‘ï¸ Base ${targetTurfId} eliminada mediante el Inspector.`);
                     }
                 }
 
@@ -857,14 +1218,14 @@ module.exports = function createWsHandler(deps) {
                             itemId: data.itemId,
                             requiresClick: data.requiresClick,
                             npcMessage: data.npcMessage,
-                            itemRow: data.itemRow || 0, // <--- AÑADE ESTE ENVÍO AL CLIENTE
+                            itemRow: data.itemRow || 0, // <--- AÃ‘ADE ESTE ENVÃO AL CLIENTE
                             shelfX: data.shelfX || 0, // <--- AL CLIENTE
                             shelfY: data.shelfY || 0
                         }));
                     }
                 });
             } catch (err) { console.error('Meta Update Error:', err); }
-        }// --- 🥊 SISTEMA DE SPARRING (MULTIARENAS) ---
+        }// --- ðŸ¥Š SISTEMA DE SPARRING (MULTIARENAS) ---
         if (data.type === 'get_arena_info' && isAuthenticated) {
             const arena = arenasRAM[data.arenaId];
             if (arena) {
@@ -889,12 +1250,12 @@ module.exports = function createWsHandler(deps) {
             const arena = arenasRAM[data.arenaId];
             if (arena && !arena.queue.includes(id) && arena.fighter1 !== id && arena.fighter2 !== id) {
                 arena.queue.push(id);
-                // Guardar dónde estaba para devolverlo después de pelear
+                // Guardar dÃ³nde estaba para devolverlo despuÃ©s de pelear
                 players[id].preSparX = players[id].worldX;
                 players[id].preSparY = players[id].worldY;
-                players[id].currentArena = data.arenaId; // Marcamos en qué arena se metió
+                players[id].currentArena = data.arenaId; // Marcamos en quÃ© arena se metiÃ³
 
-                // Actualizar a todos los que estén viendo el letrero
+                // Actualizar a todos los que estÃ©n viendo el letrero
                 broadcast({ type: 'refresh_arena_ui', arenaId: data.arenaId });
                 ws.send(encode({ type: 'refresh_arena_ui', arenaId: data.arenaId }));
             }
@@ -908,18 +1269,18 @@ module.exports = function createWsHandler(deps) {
                 broadcast({ type: 'refresh_arena_ui', arenaId: data.arenaId });
                 ws.send(encode({ type: 'refresh_arena_ui', arenaId: data.arenaId }));
             }
-        }// 🛑 NUEVO: GUARDAR ATUENDO DEL GUARDARROPA (WARDROBE)
+        }// ðŸ›‘ NUEVO: GUARDAR ATUENDO DEL GUARDARROPA (WARDROBE)
         if (data.type === 'update_wardrobe' && isAuthenticated) {
             try {
                 const p = players[id];
                 if (!p) return;
 
-                const ownsHead = data.head === 'head_default' || (p.inventory && p.inventory.some(i => (typeof i === 'object' ? i.id : i) === data.head));
+                const ownsHead = data.head === 'H_D' || (p.inventory && p.inventory.some(i => (typeof i === 'object' ? i.id : i) === data.head));
                 const ownsBody = data.body === 'body_default' || (p.inventory && p.inventory.some(i => (typeof i === 'object' ? i.id : i) === data.body));
                 const ownsHat = data.hat === 'none' || (p.inventory && p.inventory.some(i => (typeof i === 'object' ? i.id : i) === data.hat));
 
                 if (ownsHead && ownsBody && ownsHat) {
-                    if (!p.equipped) p.equipped = { head: 'head_default', body: 'body_default', hands: 'none', hat: 'none' };
+                    if (!p.equipped) p.equipped = { head: 'H_D', body: 'body_default', hands: 'none', hat: 'none' };
                     p.equipped.head = data.head;
                     p.equipped.body = data.body;
                     p.equipped.hat = data.hat;
@@ -938,20 +1299,20 @@ module.exports = function createWsHandler(deps) {
                     zoneType: data.zoneType || 'safe',
                     xMin: data.xMin, xMax: data.xMax,
                     yMin: data.yMin, yMax: data.yMax,
-                    // 🏴 TURF: guardar el punto de spawn si lo manda el cliente
+                    // ðŸ´ TURF: guardar el punto de spawn si lo manda el cliente
                     spawnX: (data.spawnX != null) ? Number(data.spawnX) : null,
                     spawnY: (data.spawnY != null) ? Number(data.spawnY) : null
                 });
                 await newZone.save();
 
-                // 🛑 EL FIX: Convertir el Documento de Mongoose a Objeto Plano y limpiar el ID
+                // ðŸ›‘ EL FIX: Convertir el Documento de Mongoose a Objeto Plano y limpiar el ID
                 const plainZone = newZone.toObject();
                 plainZone._id = plainZone._id.toString();
 
                 // Guardarlo en la RAM
                 safeZonesRAM.push(plainZone);
 
-                // Enviarlo a los clientes (Ahora MessagePack lo empaquetará sin problemas)
+                // Enviarlo a los clientes (Ahora MessagePack lo empaquetarÃ¡ sin problemas)
                 wss.clients.forEach(client => {
                     if (client.readyState === WebSocket.OPEN) {
                         client.send(encode({ type: 'new_safezone', zone: plainZone }));
@@ -963,11 +1324,11 @@ module.exports = function createWsHandler(deps) {
             if (!players[id] || players[id].role !== 'admin') return;
 
             try {
-                // 1. Borrar de MongoDB usando su ID único
+                // 1. Borrar de MongoDB usando su ID Ãºnico
                 await SafeZone.findByIdAndDelete(data.id);
 
                 // 2. Borrar de la memoria RAM del servidor
-                const __f_sz = safeZonesRAM.filter(z => z._id.toString() !== data.id); safeZonesRAM.length = 0; safeZonesRAM.push(...__f_sz);
+                safeZonesRAM = safeZonesRAM.filter(z => z._id.toString() !== data.id);
 
                 // 3. Avisarle a todos los jugadores que esa zona ya no existe
                 wss.clients.forEach(client => {
@@ -975,7 +1336,7 @@ module.exports = function createWsHandler(deps) {
                         client.send(encode({ type: 'safezone_deleted', id: data.id }));
                     }
                 });
-                console.log(`🛡️ Zona Segura eliminada: ${data.id}`);
+                console.log(`ðŸ›¡ï¸ Zona Segura eliminada: ${data.id}`);
             } catch (err) {
                 console.error("Error eliminando SafeZone:", err);
             }
@@ -1013,39 +1374,50 @@ module.exports = function createWsHandler(deps) {
                 isAuthenticated = true;
                 currentUser = user.email; // We track the session by email now!
 
-                // --- KICK GHOST CLONES ---
-                wss.clients.forEach(client => {
-                    if (client !== ws && client.playerId && players[client.playerId] && players[client.playerId].email === user.email) {
-                        console.log(`[AUTH] Kicking old clone for ${user.email}`);
-                        try {
-                            client.send(encode({ type: 'auth_error', message: 'Logged in from another location.' }));
-                            client.terminate();
-                        } catch(e) {}
-                    }
-                });
-
-
                 // Pass their data to the lobby memory
                 players[id].email = user.email;
                 players[id].username = user.username;
                 players[id].gameId = user.gameId; // <--- NUEVO
                 players[id].role = user.role; // <--- ADMIN ROLE
+                players[id].isGuest = false;
+                players[id].accountId = user._id ? user._id.toString() : id;
                 players[id].worldX = user.worldX;
                 players[id].worldY = user.worldY;
+                
                 players[id].friends = user.friends; // Don't forget the friends list!
-                // --- FIX: Give the server memory their inventory! ---
+                const BanModel2 = require('../models/Ban');
+                if (user._id) {
+                    let activeBan = null;
+                    if (user.role !== 'admin') {
+                        activeBan = await BanModel2.findOne({ $or: [{ accountId: user._id.toString() }, { ipAddress: ws.clientIp }], expiresAt: { $gt: new Date() } });
+                    }
+                    if (activeBan) {
+                        players[id].isJailed = true;
+                        if (state.jailSpawnPos) {
+                            players[id].worldX = state.jailSpawnPos.x;
+                            players[id].worldY = state.jailSpawnPos.y;
+                        } else {
+                            players[id].worldX = 0;
+                            players[id].worldY = 0;
+                        }
+                    } else {
+                        // UNJAIL THEM IN CASE IP BAN CAUGHT THEM DURING INIT
+                        players[id].isJailed = false;
+                        ws.send(encode({ type: 'unjail' }));
+                    }
+                } // --- FIX: Give the server memory their inventory! ---
                 players[id].inventory = user.inventory;
 
                 // --- THE PERSISTENCE FIX: Load the saved weapon! ---
                 players[id].equippedWeapon = user.equippedWeapon || "none";
-                players[id].equipped = user.equipped || { head: 'head_default', body: 'body_default', hands: 'none' }; players[id].hotbar = user.hotbar || ["none", "none", "none"];
-                players[id].quickSwaps = user.quickSwaps || []; // 🆕 Nueva línea
+                players[id].equipped = user.equipped || { head: 'H_D', body: 'body_default', hands: 'none' }; players[id].hotbar = user.hotbar || ["none", "none", "none"];
+                players[id].quickSwaps = user.quickSwaps || []; // ðŸ†• Nueva lÃ­nea
 
                 // --- NUEVO: CARGAR MONEDAS A LA RAM ---
                 players[id].coins = user.coins || 0;
                 players[id].gems = user.gems || 0; // Cargar Argems
 
-                // 👇 NUEVO: CARGAR KILLS Y LOSSES 👇
+                // ðŸ‘‡ NUEVO: CARGAR KILLS Y LOSSES ðŸ‘‡
                 players[id].kills = user.kills || 0;
                 players[id].losses = user.losses || 0;
                 players[id].elo = user.elo || 1000;
@@ -1064,12 +1436,12 @@ module.exports = function createWsHandler(deps) {
                 players[id].bpXP = user.bpXP || 0;
                 players[id].bpPremium = user.bpPremium || false;
                 players[id].bpClaimedFree = user.bpClaimedFree || [];
-                players[id].bpClaimedPremium = user.bpClaimedPremium || []; // <--- AÑADIR ESTO
-                // 👇 NUEVO: CARGAR SALUD A LA RAM 👇
+                players[id].bpClaimedPremium = user.bpClaimedPremium || []; // <--- AÃ‘ADIR ESTO
+                // ðŸ‘‡ NUEVO: CARGAR SALUD A LA RAM ðŸ‘‡
                 players[id].hp = user.hp !== undefined ? user.hp : 100;
                 players[id].isDead = user.isDead || false;
 
-                // --- 🌟 NUEVO: CARGAR TAREAS Y LOGROS A LA RAM (AUTO LOGIN) 🌟 ---
+                // --- ðŸŒŸ NUEVO: CARGAR TAREAS Y LOGROS A LA RAM (AUTO LOGIN) ðŸŒŸ ---
                 players[id].taskProgress = {};
                 players[id].claimedTasks = {};
 
@@ -1086,20 +1458,20 @@ module.exports = function createWsHandler(deps) {
                 parseMongoMapAuto(rawUser.claimedTasks, players[id].claimedTasks, true);
                 console.log(`[INIT] Loaded claimedTasks from DB for ${user.email}:`, players[id].claimedTasks);
 
-                // 🛑 EL FIX: REINICIAR EL TEMPORIZADOR DE COMBATE AL ENTRAR 🛑
-                // Esto evita que los que recargan la página se curen mágicamente
+                // ðŸ›‘ EL FIX: REINICIAR EL TEMPORIZADOR DE COMBATE AL ENTRAR ðŸ›‘
+                // Esto evita que los que recargan la pÃ¡gina se curen mÃ¡gicamente
                 players[id].lastHitTime = Date.now();
 
-                // Agrega esta línea para guardar el ID único de MongoDB en RAM:
+                // Agrega esta lÃ­nea para guardar el ID Ãºnico de MongoDB en RAM:
                 players[id].accountId = user._id.toString();
 
                 // --- NUEVO: PASAR EL ROL A LA MEMORIA ---
                 players[id].role = user.role || 'player';
-                // 👇 EL FIX ANTI-COMA: Si te conectas y estabas muerto, revives automáticamente 👇
+                // ðŸ‘‡ EL FIX ANTI-COMA: Si te conectas y estabas muerto, revives automÃ¡ticamente ðŸ‘‡
                 if (players[id].isDead || players[id].hp <= 0) {
                     players[id].hp = 100;
                     players[id].isDead = false;
-                    // Forzamos a que MongoDB también se entere de que ya no estás muerto
+                    // Forzamos a que MongoDB tambiÃ©n se entere de que ya no estÃ¡s muerto
                     User.findByIdAndUpdate(user._id, { hp: 100, isDead: false }).catch(console.error);
                 }
                 // --- NUEVO: CARGAR EL TAG DEL SQUAD EN RAM ---
@@ -1110,14 +1482,40 @@ module.exports = function createWsHandler(deps) {
                         players[id].squadName = mySquad.name;
                         players[id].squadLogo = mySquad.logo;
 
-                        // 🛑 EL FIX: Revisar si soy líder o si tengo el permiso de invitar
-                        const isLeader = mySquad.leader.toString() === user._id.toString();
-                        const myData = mySquad.members.find(m => m.accountId.toString() === user._id.toString());
+                        const isLeader = mySquad.leader && mySquad.leader.toString() === user._id.toString();
+                        const myData = mySquad.members ? mySquad.members.find(m => m.accountId && m.accountId.toString() === user._id.toString()) : null;
+                        players[id].isLeader = !!isLeader;
                         players[id].squadCanInvite = isLeader || (myData && myData.canInvite) || false;
+                        players[id].squadCanKick = isLeader || (myData && myData.canKick) || false;
+                        players[id].squadCanAssignRoles = isLeader || (myData && myData.canAssignRoles) || false;
+                        players[id].squadTitle = isLeader ? 'ðŸ‘‘ LÃ­der' : (myData && myData.customTitle ? myData.customTitle : 'Miembro');
+                        players[id].squadRole = isLeader ? 'leader' : 'member';
                     }
                 }
 
-                // Send success back to the browser
+                
+                  // --- THE FIX: Load their squad into memory during auto_login! ---
+                  if (user.squad) {
+                      const Squad = require('../models/Squad');
+                      const mySquad = await Squad.findById(user.squad);
+                      if (mySquad) {
+                          players[id].squad = mySquad._id.toString();
+                          players[id].squadName = mySquad.name;
+                          players[id].squadLogo = mySquad.logo;
+
+                          const isLeader = mySquad.leader && mySquad.leader.toString() === user._id.toString();
+                          const myData = mySquad.members ? mySquad.members.find(m => m.accountId && m.accountId.toString() === user._id.toString()) : null;
+                          players[id].isLeader = !!isLeader;
+                          players[id].squadCanInvite = isLeader || (myData && myData.canInvite) || false;
+                          players[id].squadCanKick = isLeader || (myData && myData.canKick) || false;
+                          players[id].squadCanAssignRoles = isLeader || (myData && myData.canAssignRoles) || false;
+                          players[id].squadTitle = isLeader ? 'L�der' : (myData && myData.customTitle ? myData.customTitle : 'Miembro');
+                          players[id].squadRole = isLeader ? 'leader' : 'member';
+                      }
+                  }
+                  
+                  // Send success back to the browser
+
                 ws.send(encode({
                     type: 'login_success',
                     player: players[id],
@@ -1138,7 +1536,7 @@ module.exports = function createWsHandler(deps) {
                 if (!user.hasSeenTutorial) {
                     ws.send(encode({ type: 'trigger_tutorial' }));
                 }
-            } catch (err) { console.error(err); }
+            } catch (err) { console.error("AUTO LOGIN CRASH", err); ws.send(encode({ type: 'auth_error', message: 'Server crashed during login.' })); }
         }
 
         // 3. MOVIMIENTO AUTORITATIVO (ANTI-SPEEDHACK Y ANTI-NOCLIP)
@@ -1156,14 +1554,14 @@ module.exports = function createWsHandler(deps) {
             const dist = Math.hypot(requestedX - p.worldX, requestedY - p.worldY);
 
             // EL FIX (ANTI-JITTER): 
-            // 1. Subimos la velocidad teórica a 400px por segundo para dar más holgura al lag.
+            // 1. Subimos la velocidad teÃ³rica a 400px por segundo para dar mÃ¡s holgura al lag.
             let MAX_ALLOWED_DIST = (400 * timeSinceLastUpdate) / 1000;
 
-            // 2. Subimos el "Piso Mínimo" de 15 a 45 píxeles. 
+            // 2. Subimos el "Piso MÃ­nimo" de 15 a 45 pÃ­xeles. 
             // Esto evita que el servidor te castigue cuando recibe 2 paquetes amontonados al mismo tiempo.
             MAX_ALLOWED_DIST = Math.max(45, MAX_ALLOWED_DIST);
 
-            // --- NUEVO: ¿ESTÁ CERCA DE UN TELETRANSPORTADOR LEGAL? ---
+            // --- NUEVO: Â¿ESTÃ CERCA DE UN TELETRANSPORTADOR LEGAL? ---
             const oldGridX = Math.floor(p.worldX / TILE_SIZE);
             const oldGridY = Math.floor(p.worldY / TILE_SIZE);
 
@@ -1177,11 +1575,11 @@ module.exports = function createWsHandler(deps) {
                     const logicTile = serverWorldMap[`${checkX},${checkY},15`]; // Revisa capa 15
 
                     if (logicTile && logicTile.triggerType === 'teleport') {
-                        // Calculamos a dónde lleva esta puerta teóricamente
+                        // Calculamos a dÃ³nde lleva esta puerta teÃ³ricamente
                         const expectedX = (logicTile.destX * TILE_SIZE) + (TILE_SIZE / 2);
                         const expectedY = (logicTile.destY * TILE_SIZE) + (TILE_SIZE / 2);
 
-                        // EL FIX DEFINITIVO: 150 píxeles de tolerancia.
+                        // EL FIX DEFINITIVO: 150 pÃ­xeles de tolerancia.
                         // Al salir de edificios, el cliente suele "escupir" al jugador lejos de la puerta.
                         // Mientras caiga en un radio de 150px del destino, el salto es 100% legal.
                         if (Math.abs(requestedX - expectedX) < 150 && Math.abs(requestedY - expectedY) < 150) {
@@ -1194,15 +1592,15 @@ module.exports = function createWsHandler(deps) {
             }
 
             const isColliding = serverCheckCollision(requestedX, requestedY);
-            const isAdmin = (p.role === 'admin');
+            const isAdmin = p && (p.role === 'admin' || !!p.noclipEnabled);
 
-            // EL FIX: Agregamos !isLegalTeleport para que no lo castigue si usó una puerta
-            if (!isAdmin && !isLegalTeleport && (dist > MAX_ALLOWED_DIST || isColliding)) {
+            // EL FIX: Agregamos !isLegalTeleport para que no lo castigue si usÃ³ una puerta
+            if (p.isFrozen || (!isAdmin && !isLegalTeleport && (dist > MAX_ALLOWED_DIST || isColliding))) {
 
-                // Distinguir: ¿colisión limpia con pared o speedhack real?
-                // 'wall'     → el cliente se reposiciona silenciosamente, sin flash rojo
-                // 'antihack' → el cliente muestra flash rojo y resetea velocidad
-                const rejectReason = isColliding ? 'wall' : 'antihack';
+                // Distinguir: Â¿colisiÃ³n limpia con pared o speedhack real?
+                // 'wall'     â†’ el cliente se reposiciona silenciosamente, sin flash rojo
+                // 'antihack' â†’ el cliente muestra flash rojo y resetea velocidad
+                const rejectReason = p.isFrozen ? 'wall' : (isColliding ? 'wall' : 'antihack');
 
                 ws.send(encode({
                     type: 'force_position',
@@ -1239,7 +1637,7 @@ module.exports = function createWsHandler(deps) {
                     }
                 }
 
-                // --- ⚽ SOCCER KICK LOGIC ---
+                // --- âš½ SOCCER KICK LOGIC ---
                 if (p.currentArena && arenasRAM[p.currentArena] && arenasRAM[p.currentArena].gameType === 'soccer') {
                     const arena = arenasRAM[p.currentArena];
                     if (arena.ball) {
@@ -1261,7 +1659,7 @@ module.exports = function createWsHandler(deps) {
             p.isTyping = data.player.isTyping;
             p.isSitting = data.player.isSitting;
 
-            // 🛑 EL FIX 2: Sincronizar el arma para que los demás la vean en tu mano
+            // ðŸ›‘ EL FIX 2: Sincronizar el arma para que los demÃ¡s la vean en tu mano
             if (data.player.equippedWeapon !== undefined) {
                 p.equippedWeapon = data.player.equippedWeapon;
             }
@@ -1270,7 +1668,7 @@ module.exports = function createWsHandler(deps) {
             p.message = safeMsg.substring(0, 100);
             p.messageTimer = Math.min(data.player.messageTimer || 0, 600);
 
-            // 🎯 SEND MOVEMENT ONLY TO LOCAL CHUNK
+            // ðŸŽ¯ SEND MOVEMENT ONLY TO LOCAL CHUNK
             broadcastToZone({ type: 'update', id: id, player: p }, p.chunkId, ws);
         }
 
@@ -1279,7 +1677,7 @@ module.exports = function createWsHandler(deps) {
             const p = players[id];
             if (!p) return;
 
-            // 🛡️ ANTI-HACK: Escáner de inventario a prueba de formatos mixtos
+            // ðŸ›¡ï¸ ANTI-HACK: EscÃ¡ner de inventario a prueba de formatos mixtos
             let ownsWeapon = false;
             if (data.weaponId === "none") {
                 ownsWeapon = true;
@@ -1301,10 +1699,10 @@ module.exports = function createWsHandler(deps) {
                     }
                 }
 
-                // Avisamos a los demás jugadores qué arma traes en la mano
+                // Avisamos a los demÃ¡s jugadores quÃ© arma traes en la mano
                 broadcast({ type: 'update', id: id, player: p }, ws);
             } else {
-                console.warn(`[ANTI-HACK] ${p.username} intentó equipar un arma fantasma: ${data.weaponId}`);
+                console.warn(`[ANTI-HACK] ${p.username} intentÃ³ equipar un arma fantasma: ${data.weaponId}`);
             }
         }
 
@@ -1313,7 +1711,7 @@ module.exports = function createWsHandler(deps) {
             const p = players[id];
             if (!p) return;
 
-            // 🛡️ ANTI-HACK: Escáner de inventario a prueba de formatos mixtos
+            // ðŸ›¡ï¸ ANTI-HACK: EscÃ¡ner de inventario a prueba de formatos mixtos
             let ownsWeapon = false;
             if (data.weaponId === "none") {
                 ownsWeapon = true;
@@ -1328,10 +1726,10 @@ module.exports = function createWsHandler(deps) {
                 if (!p.hotbar) p.hotbar = ["none", "none", "none"];
                 p.hotbar[data.slotIndex] = data.weaponId;
             } else {
-                console.warn(`[ANTI-HACK] ${p.username} intentó equipar ${data.weaponId} sin comprarlo.`);
+                console.warn(`[ANTI-HACK] ${p.username} intentÃ³ equipar ${data.weaponId} sin comprarlo.`);
             }
         }
-        // 🔄 NUEVO: AVISO DE RECARGA AL SERVIDOR
+        // ðŸ”„ NUEVO: AVISO DE RECARGA AL SERVIDOR
         if (data.type === 'reload_weapon') {
             const p = players[id];
             const stats = WEAPONS[data.weaponId];
@@ -1344,7 +1742,7 @@ module.exports = function createWsHandler(deps) {
             if (players[id]) {
                 players[id].quickSwaps = data.quickSwaps;
             }
-        }// 🛠️ COMANDO DE RESCATE (/fix)
+        }// ðŸ› ï¸ COMANDO DE RESCATE (/fix)
         if (data.type === 'force_unstuck' && isAuthenticated) {
             const p = players[id];
             if (p) {
@@ -1356,7 +1754,7 @@ module.exports = function createWsHandler(deps) {
                     delete ws.reloadTimeout;
                 }
 
-                // 🛡️ EL FIX: Solo revivir si realmente su HP era 0
+                // ðŸ›¡ï¸ EL FIX: Solo revivir si realmente su HP era 0
                 if (p.hp <= 0 || p.isDead) {
                     p.hp = 100;
                     p.isDead = false;
@@ -1373,7 +1771,7 @@ module.exports = function createWsHandler(deps) {
 
                 ws.send(encode({
                     type: 'system_message',
-                    text: "🛠️ Tu personaje ha sido desbugueado.",
+                    text: "ðŸ› ï¸ Tu personaje ha sido desbugueado.",
                     color: "#2ecc71"
                 }));
             }
@@ -1382,7 +1780,7 @@ module.exports = function createWsHandler(deps) {
         if (data.type === 'shoot') {
             const shooter = players[id];
 
-            // 🛑 EL FIX 3: Usar el ID del arma que manda el gatillo, no el de la memoria lenta
+            // ðŸ›‘ EL FIX 3: Usar el ID del arma que manda el gatillo, no el de la memoria lenta
             const weaponId = data.weaponId || shooter.equippedWeapon || "none";
             const stats = WEAPONS[weaponId];
 
@@ -1390,22 +1788,22 @@ module.exports = function createWsHandler(deps) {
 
             const now = Date.now();
 
-            // 🛡️ ANTI-HACK: Control de Spam (Fire Rate)
+            // ðŸ›¡ï¸ ANTI-HACK: Control de Spam (Fire Rate)
             if (now - (shooter.lastShotTime || 0) < ((stats.fireRate || 300) - 50)) return;
             shooter.lastShotTime = now;
 
-            // 🛡️ ANTI-HACK: Control de Balas Mágicas
+            // ðŸ›¡ï¸ ANTI-HACK: Control de Balas MÃ¡gicas
             if (stats.type === 'ranged') {
                 if (shooter.weaponAmmo[weaponId] === undefined) shooter.weaponAmmo[weaponId] = stats.magSize;
-                if (shooter.weaponAmmo[weaponId] <= 0) return; // 🛑 HACKER INTENTANDO DISPARAR SIN BALAS
+                if (shooter.weaponAmmo[weaponId] <= 0) return; // ðŸ›‘ HACKER INTENTANDO DISPARAR SIN BALAS
                 shooter.weaponAmmo[weaponId]--; // Descontamos la bala oficial
             }
 
-            // 🛑 EL FIX 4: Reenviar usando weaponId para que tu oponente dibuje la bala y escuche tu disparo
+            // ðŸ›‘ EL FIX 4: Reenviar usando weaponId para que tu oponente dibuje la bala y escuche tu disparo
             broadcastToZone({ type: 'shoot', id: id, x: data.x, y: data.y, angle: data.angle, weaponId: weaponId, t: now }, shooter.chunkId, ws);
 
             if (stats && stats.type !== 'melee') {
-                // ⚡ LAG COMPENSATION: Advance bullet by 50ms of travel time (1.5 server frames)
+                // âš¡ LAG COMPENSATION: Advance bullet by 50ms of travel time (1.5 server frames)
                 // This puts the server bullet exactly where the shooter's visual bullet is right now.
                 const latencyAdvance = 50 / 33.0; // 50ms average ping / 33ms per tick
                 const bVx = Math.cos(data.angle) * stats.speed;
@@ -1452,7 +1850,7 @@ module.exports = function createWsHandler(deps) {
                 }
             }
         }
-        // --- 1. SINCRONIZAR ANIMACIÓN MELEE Y CALCULAR DAÑO ---
+        // --- 1. SINCRONIZAR ANIMACIÃ“N MELEE Y CALCULAR DAÃ‘O ---
         if (data.type === 'melee_swing') {
             const shooter = players[id];
             if (!shooter || shooter.isDead) return;
@@ -1466,14 +1864,14 @@ module.exports = function createWsHandler(deps) {
             if (now - lastDamage < ((currentWeaponStats.fireRate || 300) - 50)) return;
             shooter.lastDamageTime = now;
 
-            // 🎯 SEND SWING ANIMATION ONLY TO LOCAL CHUNK
+            // ðŸŽ¯ SEND SWING ANIMATION ONLY TO LOCAL CHUNK
             broadcastToZone({
                 type: 'player_swing',
                 id: id,
                 weaponId: weaponId
             }, shooter.chunkId, ws);
 
-            // 💥 SERVER-AUTHORITATIVE MELEE HIT DETECTION 💥
+            // ðŸ’¥ SERVER-AUTHORITATIVE MELEE HIT DETECTION ðŸ’¥
             const dir = shooter.frameY || 0;
             let aimAngle = 0; let dirMult = 1;
             if (dir === 0) aimAngle = Math.PI / 2;
@@ -1521,7 +1919,7 @@ module.exports = function createWsHandler(deps) {
             }
             players[id].lastPMTime = now;
 
-            // --- SANEAMIENTO: Máximo 250 caracteres ---
+            // --- SANEAMIENTO: MÃ¡ximo 250 caracteres ---
             let safeText = data.text || "";
             if (safeText.length > 250) safeText = safeText.substring(0, 250);
 
@@ -1544,7 +1942,7 @@ module.exports = function createWsHandler(deps) {
                     if (players[pid].accountId === targetAccountId) targetWsId = pid;
                 }
 
-                // 🛡️ Convert Mongoose docs to plain objects before encoding (avoids 'Too deep' error)
+                // ðŸ›¡ï¸ Convert Mongoose docs to plain objects before encoding (avoids 'Too deep' error)
                 const plainMessages = conv.messages.map(m => ({
                     senderId: m.senderId ? m.senderId.toString() : '',
                     text: m.text || '',
@@ -1575,12 +1973,12 @@ module.exports = function createWsHandler(deps) {
                 const myAccountId = players[id].accountId;
                 const targetAccountId = data.targetAccountId;
 
-                // 🛑 EL FIX: Añadir .lean() para limpiar el objeto de Mongoose
+                // ðŸ›‘ EL FIX: AÃ±adir .lean() para limpiar el objeto de Mongoose
                 const targetUser = await User.findById(targetAccountId).lean();
                 const currentTargetName = targetUser ? targetUser.username : "Usuario Desconocido";
-                const targetEquipped = targetUser && targetUser.equipped ? targetUser.equipped : { head: 'head_default' };
+                const targetEquipped = targetUser && targetUser.equipped ? targetUser.equipped : { head: 'H_D' };
 
-                // 🛑 EL FIX: Añadir .lean() al historial de mensajes
+                // ðŸ›‘ EL FIX: AÃ±adir .lean() al historial de mensajes
                 const conv = await PM.findOne({ participants: { $all: [myAccountId, targetAccountId] } }).lean();
 
                 ws.send(encode({
@@ -1598,17 +1996,17 @@ module.exports = function createWsHandler(deps) {
             try {
                 const myAccountId = players[id].accountId;
 
-                // 🛑 EL FIX: Añadir .lean()
+                // ðŸ›‘ EL FIX: AÃ±adir .lean()
                 const convos = await PM.find({ participants: myAccountId }).lean();
 
                 const inboxData = [];
                 for (let c of convos) {
                     const otherPersonId = c.participants.find(p => p !== myAccountId);
 
-                    // 🛑 EL FIX: Añadir .lean()
+                    // ðŸ›‘ EL FIX: AÃ±adir .lean()
                     const otherUser = await User.findById(otherPersonId).lean();
                     const currentName = otherUser ? otherUser.username : "Usuario Desconocido";
-                    const currentHead = (otherUser && otherUser.equipped) ? otherUser.equipped.head : 'head_default';
+                    const currentHead = (otherUser && otherUser.equipped) ? otherUser.equipped.head : 'H_D';
 
                     const lastMsg = c.messages.length > 0 ? c.messages[c.messages.length - 1] : null;
 
@@ -1626,8 +2024,124 @@ module.exports = function createWsHandler(deps) {
             } catch (err) { console.error("Error pidiendo inbox:", err); }
         }
         // ==========================================
-        // 💬 SQUAD CHAT (RAM-DRIVEN)
+        // ðŸ’¬ SQUAD CHAT (RAM-DRIVEN)
         // ==========================================
+
+        function broadcastSquadAnnouncement(sqIdStr, text) {
+            if (!sqIdStr) return;
+            if (!SQUAD_CHATS_RAM[sqIdStr]) SQUAD_CHATS_RAM[sqIdStr] = [];
+
+            const announcementMsg = {
+                senderId: 'system',
+                senderName: 'Clan',
+                senderHead: 'H_D',
+                text: text,
+                timestamp: new Date().toISOString(),
+                isSystem: true,
+                isAnnouncement: true
+            };
+
+            SQUAD_CHATS_RAM[sqIdStr].push(announcementMsg);
+            if (SQUAD_CHATS_RAM[sqIdStr].length > 30) SQUAD_CHATS_RAM[sqIdStr].shift();
+
+            wss.clients.forEach(client => {
+                if (client.readyState === WebSocket.OPEN && players[client.playerId] && players[client.playerId].squad === sqIdStr) {
+                    client.send(encode({
+                        type: 'new_squad_chat',
+                        message: announcementMsg
+                    }));
+                }
+            });
+        }
+
+        const SQUAD_ANNOUNCEMENT_BUFFER = {};
+
+        function queueSquadMemberAnnouncement(sqIdStr, actorUsername, targetAccountId, targetUsername, oldData, newData) {
+            const key = `${sqIdStr}:${targetAccountId}`;
+
+            if (!SQUAD_ANNOUNCEMENT_BUFFER[key]) {
+                SQUAD_ANNOUNCEMENT_BUFFER[key] = {
+                    sqIdStr,
+                    actorUsername,
+                    targetUsername,
+                    oldTitle: oldData.title,
+                    oldCanInvite: oldData.canInvite,
+                    oldCanKick: oldData.canKick,
+                    oldCanAssignRoles: oldData.canAssignRoles,
+                    newTitle: newData.title,
+                    newCanInvite: newData.canInvite,
+                    newCanKick: newData.canKick,
+                    newCanAssignRoles: newData.canAssignRoles,
+                    timer: null
+                };
+            } else {
+                const buf = SQUAD_ANNOUNCEMENT_BUFFER[key];
+                buf.actorUsername = actorUsername;
+                buf.targetUsername = targetUsername;
+                buf.newTitle = newData.title;
+                buf.newCanInvite = newData.canInvite;
+                buf.newCanKick = newData.canKick;
+                buf.newCanAssignRoles = newData.canAssignRoles;
+                if (buf.timer) clearTimeout(buf.timer);
+            }
+
+            SQUAD_ANNOUNCEMENT_BUFFER[key].timer = setTimeout(() => {
+                const buf = SQUAD_ANNOUNCEMENT_BUFFER[key];
+                delete SQUAD_ANNOUNCEMENT_BUFFER[key];
+                if (!buf) return;
+
+                const titleChanged = buf.newTitle !== buf.oldTitle;
+                const inviteChanged = buf.newCanInvite !== buf.oldCanInvite;
+                const kickChanged = buf.newCanKick !== buf.oldCanKick;
+                const assignChanged = buf.newCanAssignRoles !== buf.oldCanAssignRoles;
+
+                if (!titleChanged && !inviteChanged && !kickChanged && !assignChanged) {
+                    return;
+                }
+
+                const grantedPowers = [];
+                if (inviteChanged && buf.newCanInvite) grantedPowers.push("reclutar");
+                if (kickChanged && buf.newCanKick) grantedPowers.push("expulsar");
+                if (assignChanged && buf.newCanAssignRoles) grantedPowers.push("asignar roles");
+
+                const revokedPowers = [];
+                if (inviteChanged && !buf.newCanInvite) revokedPowers.push("reclutar");
+                if (kickChanged && !buf.newCanKick) revokedPowers.push("expulsar");
+                if (assignChanged && !buf.newCanAssignRoles) revokedPowers.push("asignar roles");
+
+                const formatList = (items) => {
+                    if (items.length === 0) return '';
+                    if (items.length === 1) return `[${items[0]}]`;
+                    if (items.length === 2) return `[${items[0]}] y [${items[1]}]`;
+                    return `${items.slice(0, -1).map(i => `[${i}]`).join(', ')} y [${items[items.length - 1]}]`;
+                };
+
+                const parts = [];
+                if (titleChanged) {
+                    parts.push(`asignÃ³ el rol [${buf.newTitle}]`);
+                }
+                if (grantedPowers.length > 0) {
+                    const word = grantedPowers.length === 1 ? "el poder de" : "los poderes de";
+                    parts.push(`dio ${word} ${formatList(grantedPowers)}`);
+                }
+                if (revokedPowers.length > 0) {
+                    const word = revokedPowers.length === 1 ? "el poder de" : "los poderes de";
+                    parts.push(`quitÃ³ ${word} ${formatList(revokedPowers)}`);
+                }
+
+                if (parts.length > 0) {
+                    let actionPhrase = "";
+                    if (parts.length === 1) {
+                        actionPhrase = `le ${parts[0]}`;
+                    } else if (parts.length === 2) {
+                        actionPhrase = `le ${parts[0]} y le ${parts[1]}`;
+                    } else {
+                        actionPhrase = `le ${parts.slice(0, -1).join(', le ')} y le ${parts[parts.length - 1]}`;
+                    }
+                    broadcastSquadAnnouncement(buf.sqIdStr, `@${buf.actorUsername} ${actionPhrase} a @${buf.targetUsername}`);
+                }
+            }, 600);
+        }
 
         // A. Fetch History when opening the clan menu
         if (data.type === 'get_squad_chat' && isAuthenticated) {
@@ -1655,8 +2169,8 @@ module.exports = function createWsHandler(deps) {
             const chatMsg = {
                 senderId: myUser._id.toString(),
                 senderName: myUser.username,
-                // 🛑 EL FIX: Guardar la cabeza actual en el historial
-                senderHead: players[id] && players[id].equipped ? players[id].equipped.head : 'head_default',
+                // ðŸ›‘ EL FIX: Guardar la cabeza actual en el historial
+                senderHead: players[id] && players[id].equipped ? players[id].equipped.head : 'H_D',
                 text: data.text.substring(0, 150),
                 timestamp: new Date().toISOString()
             };
@@ -1679,55 +2193,82 @@ module.exports = function createWsHandler(deps) {
                 }
             });
         }
-        // 12. PEDIR LISTA DE AMIGOS ACTUALIZADA (Versión Optimizada y con Ropa)
+        // 12. PEDIR LISTA DE AMIGOS ACTUALIZADA (VersiÃ³n Optimizada con Live Data y Ropa)
         if (data.type === 'get_friends_list' && isAuthenticated) {
             try {
                 const myUser = await User.findOne({ email: currentUser });
 
-                // Filtramos en milisegundos solo los IDs que sí son válidos
-                const validFriendIds = (myUser.friends || []).filter(id => mongoose.Types.ObjectId.isValid(id));
+                // Filtramos solo los IDs vÃ¡lidos
+                const validFriendIds = (myUser.friends || []).filter(fid => mongoose.Types.ObjectId.isValid(fid));
 
-                // LA MAGIA: Le pedimos a MongoDB que nos traiga TODOS esos usuarios
-                // Usamos .lean() para que la consulta sea hiper-rápida
+                // Consultamos MongoDB
                 const friendsUsers = await User.find({ _id: { $in: validFriendIds } }).lean();
 
-                // Armamos el paquete incluyendo TODA la ropa y stats
-                const friendsData = friendsUsers.map(fUser => ({
-                    accountId: fUser._id.toString(),
-                    username: fUser.username,
-                    role: fUser.role || 'player',
-                    equipped: fUser.equipped || { head: 'head_default', body: 'body_default', hat: 'none' },
-                    elo: fUser.elo || 1000,
-                    kills: fUser.kills || 0,
-                    losses: fUser.losses || 0,
-                    coins: fUser.coins || 0
-                }));
+                // Armamos el paquete enriquecido con datos en vivo si estÃ¡n conectados
+                const friendsData = friendsUsers.map(fUser => {
+                    const accIdStr = fUser._id.toString();
+                    let onlinePlayer = null;
+                    for (let pid in players) {
+                        if (players[pid].accountId === accIdStr) {
+                            onlinePlayer = players[pid];
+                            break;
+                        }
+                    }
+                    return {
+                        accountId: accIdStr,
+                        username: onlinePlayer ? onlinePlayer.username : fUser.username,
+                        role: onlinePlayer ? onlinePlayer.role : (fUser.role || 'player'),
+                        equipped: onlinePlayer ? (onlinePlayer.equipped || { head: 'H_D', body: 'body_default', hat: 'none' }) : (fUser.equipped || { head: 'H_D', body: 'body_default', hat: 'none' }),
+                        elo: onlinePlayer ? (onlinePlayer.elo || 1000) : (fUser.elo || 1000),
+                        kills: onlinePlayer ? (onlinePlayer.kills || 0) : (fUser.kills || 0),
+                        losses: onlinePlayer ? (onlinePlayer.losses || 0) : (fUser.losses || 0),
+                        coins: onlinePlayer ? (onlinePlayer.coins || 0) : (fUser.coins || 0),
+                        squadName: onlinePlayer ? onlinePlayer.squadName : null,
+                        squadLogo: onlinePlayer ? onlinePlayer.squadLogo : null,
+                        isOnline: !!onlinePlayer
+                    };
+                });
 
                 ws.send(encode({ type: 'friends_list_data', friends: friendsData }));
             } catch (err) { console.error("Error pidiendo amigos:", err); }
-        }// 27. BÚSQUEDA GLOBAL DE JUGADORES
+        }
+
+        // 27. BÃšSQUEDA GLOBAL DE JUGADORES (Con Live Data)
         if (data.type === 'search_players' && isAuthenticated) {
             try {
-                const query = data.query.trim();
-                // Bloqueo de seguridad: Mínimo 3 caracteres para no saturar la base de datos
-                if (query.length < 3) return;
+                const query = data.query ? data.query.trim() : "";
+                // Bloqueo de seguridad: MÃ­nimo 2 caracteres
+                if (query.length < 2) return;
 
-                // Buscar en MongoDB (Ignora mayúsculas y busca en cualquier parte del nombre)
+                // Buscar en MongoDB
                 const users = await User.find({
                     username: { $regex: query, $options: 'i' }
-                }).limit(20).lean(); // Límite de 20 resultados para no crear lag
+                }).limit(20).lean();
 
-                // Empaquetamos TODOS los datos para que el perfil offline se dibuje perfecto
-                const searchResults = users.map(u => ({
-                    accountId: u._id.toString(),
-                    username: u.username,
-                    role: u.role || 'player',
-                    equipped: u.equipped || { head: 'head_default', body: 'body_default', hat: 'none' },
-                    elo: u.elo || 1000,
-                    kills: u.kills || 0,
-                    losses: u.losses || 0,
-                    coins: u.coins || 0
-                }));
+                // Empaquetamos datos enriquecidos con live data
+                const searchResults = users.map(u => {
+                    const accIdStr = u._id.toString();
+                    let onlinePlayer = null;
+                    for (let pid in players) {
+                        if (players[pid].accountId === accIdStr) {
+                            onlinePlayer = players[pid];
+                            break;
+                        }
+                    }
+                    return {
+                        accountId: accIdStr,
+                        username: onlinePlayer ? onlinePlayer.username : u.username,
+                        role: onlinePlayer ? onlinePlayer.role : (u.role || 'player'),
+                        equipped: onlinePlayer ? (onlinePlayer.equipped || { head: 'H_D', body: 'body_default', hat: 'none' }) : (u.equipped || { head: 'H_D', body: 'body_default', hat: 'none' }),
+                        elo: onlinePlayer ? (onlinePlayer.elo || 1000) : (u.elo || 1000),
+                        kills: onlinePlayer ? (onlinePlayer.kills || 0) : (u.kills || 0),
+                        losses: onlinePlayer ? (onlinePlayer.losses || 0) : (u.losses || 0),
+                        coins: onlinePlayer ? (onlinePlayer.coins || 0) : (u.coins || 0),
+                        squadName: onlinePlayer ? onlinePlayer.squadName : null,
+                        squadLogo: onlinePlayer ? onlinePlayer.squadLogo : null,
+                        isOnline: !!onlinePlayer
+                    };
+                });
 
                 ws.send(encode({ type: 'search_players_results', results: searchResults }));
             } catch (err) {
@@ -1735,7 +2276,7 @@ module.exports = function createWsHandler(deps) {
             }
         }
 
-        // 🌟 13. SISTEMA DE LOGROS Y TAREAS DIARIAS 🌟
+        // ðŸŒŸ 13. SISTEMA DE LOGROS Y TAREAS DIARIAS ðŸŒŸ
         if (data.type === 'claim_task' && isAuthenticated) {
             const p = players[id];
             if (!p) return;
@@ -1745,7 +2286,7 @@ module.exports = function createWsHandler(deps) {
 
             if (!task) return ws.send(encode({ type: 'claim_error', message: 'Invalid task.' }));
 
-            // 1. Verificar si ya fue cobrada y si está en cooldown
+            // 1. Verificar si ya fue cobrada y si estÃ¡ en cooldown
             const lastClaimed = p.claimedTasks[taskId];
             const now = Date.now();
 
@@ -1759,10 +2300,10 @@ module.exports = function createWsHandler(deps) {
                 }
             }
 
-            // 2. Verificar progreso (Engine Genérico)
+            // 2. Verificar progreso (Engine GenÃ©rico)
             let hasCompleted = false;
             if (task.requirementType === 'login') {
-                hasCompleted = true; // Si está enviando el paquete, ya está logueado
+                hasCompleted = true; // Si estÃ¡ enviando el paquete, ya estÃ¡ logueado
             } else if (task.requirementType === 'kills') {
                 hasCompleted = (p.kills >= task.requirementValue);
             } else if (task.requirementType === 'elo') {
@@ -1840,7 +2381,7 @@ module.exports = function createWsHandler(deps) {
                 }
             }
 
-            // 4. Avisar al cliente que fue un éxito
+            // 4. Avisar al cliente que fue un Ã©xito
             p.claimedTasks[taskId] = now;
             ws.send(encode({ type: 'task_claimed', taskId: taskId, claimedTasks: p.claimedTasks }));
 
@@ -1924,7 +2465,7 @@ module.exports = function createWsHandler(deps) {
             ws.send(encode({ type: 'gems_update', gems: p.gems }));
             ws.send(encode({ type: 'bp_premium_unlocked' }));
 
-            // Guardar as�ncronamente
+            // Guardar asï¿½ncronamente
             User.updateOne({ email: p.email }, { $set: { gems: p.gems, bpPremium: true } }).catch(console.error);
         }
 
@@ -1983,7 +2524,7 @@ module.exports = function createWsHandler(deps) {
                 }
             }
 
-            // Informar �xito
+            // Informar ï¿½xito
             ws.send(encode({
                 type: 'bp_reward_claimed',
                 level: level,
@@ -1993,7 +2534,7 @@ module.exports = function createWsHandler(deps) {
                 bpClaimedPremium: p.bpClaimedPremium
             }));
 
-            // Guardar as�ncronamente
+            // Guardar asï¿½ncronamente
             User.updateOne({ email: p.email }, { $set: updatePayload }).catch(console.error);
         }
         if (data.type === 'buy_item' && isAuthenticated) {
@@ -2002,7 +2543,7 @@ module.exports = function createWsHandler(deps) {
 
             const itemId = data.itemId;
 
-            // 🛑 EL FIX: Buscar en TODO el catálogo maestro, no solo en la carpeta de armas
+            // ðŸ›‘ EL FIX: Buscar en TODO el catÃ¡logo maestro, no solo en la carpeta de armas
             const itemStats = WEAPONS[itemId] || MASTER_CATALOG[itemId];
 
             if (!itemStats) return ws.send(encode({ type: 'buy_error', message: 'Este objeto no existe en la base de datos.' }));
@@ -2014,15 +2555,15 @@ module.exports = function createWsHandler(deps) {
             if (p.coins < itemStats.price) return ws.send(encode({ type: 'buy_error', message: 'Monedas insuficientes.' }));
 
             try {
-                // Cobrar y entregar el ítem
+                // Cobrar y entregar el Ã­tem
                 p.coins -= itemStats.price;
                 if (!p.inventory) p.inventory = [];
                 p.inventory.push(itemId);
 
-                // Avisar al jugador que la compra fue un éxito
+                // Avisar al jugador que la compra fue un Ã©xito
                 ws.send(encode({
                     type: 'buy_success',
-                    message: `¡Compraste ${itemStats.name}!`,
+                    message: `Â¡Compraste ${itemStats.name}!`,
                     newCoins: p.coins,
                     newInventory: p.inventory
                 }));
@@ -2042,13 +2583,13 @@ module.exports = function createWsHandler(deps) {
                 const myUser = await User.findOne({ email: currentUser });
                 if (!myUser) return;
 
-                // 🛑 EL FIX: Borrar la validación que bloqueaba si ya tenías un Tag equipado.
-                // En su lugar, revisamos en la base de datos si ya eres DUEÑO de un clan.
+                // ðŸ›‘ EL FIX: Borrar la validaciÃ³n que bloqueaba si ya tenÃ­as un Tag equipado.
+                // En su lugar, revisamos en la base de datos si ya eres DUEÃ‘O de un clan.
                 const alreadyLeader = await Squad.findOne({ leader: myUser._id });
                 if (alreadyLeader) {
                     return ws.send(encode({
                         type: 'squad_error',
-                        message: 'Ya eres fundador de un Squad. Solo puedes ser dueño de uno.'
+                        message: 'Ya eres fundador de un Squad. Solo puedes ser dueÃ±o de uno.'
                     }));
                 }
 
@@ -2056,16 +2597,16 @@ module.exports = function createWsHandler(deps) {
                 if (myUser.coins < 2000) {
                     return ws.send(encode({
                         type: 'squad_error',
-                        message: 'No tienes suficientes Argons (Cuesta 2000 🪙).'
+                        message: 'No tienes suficientes Argons (Cuesta 2000 ðŸª™).'
                     }));
                 }
 
-                // Revisar si el nombre ya está en uso por otro clan
+                // Revisar si el nombre ya estÃ¡ en uso por otro clan
                 const existingName = await Squad.findOne({ name: data.squadName });
                 if (existingName) {
                     return ws.send(encode({
                         type: 'squad_error',
-                        message: 'Ese nombre ya está registrado.'
+                        message: 'Ese nombre ya estÃ¡ registrado.'
                     }));
                 }
 
@@ -2076,11 +2617,11 @@ module.exports = function createWsHandler(deps) {
                     name: data.squadName,
                     logo: data.logo || "",
                     leader: myUser._id,
-                    members: [] // Entra sin miembros, él es el líder
+                    members: [] // Entra sin miembros, Ã©l es el lÃ­der
                 });
                 await newSquad.save();
 
-                // 2. Equiparle automáticamente su nuevo Tag de Fundador
+                // 2. Equiparle automÃ¡ticamente su nuevo Tag de Fundador
                 myUser.squad = newSquad._id;
                 await myUser.save();
 
@@ -2091,13 +2632,13 @@ module.exports = function createWsHandler(deps) {
                     players[id].squad = newSquad._id.toString();
                     players[id].squadName = newSquad.name;
                     players[id].squadLogo = newSquad.logo;
-                    players[id].squadCanInvite = true; // El líder siempre puede invitar
+                    players[id].squadCanInvite = true; // El lÃ­der siempre puede invitar
                 }
 
-                // 4. Avisar al jugador que fue un éxito
+                // 4. Avisar al jugador que fue un Ã©xito
                 ws.send(encode({
                     type: 'squad_success',
-                    message: `¡Has fundado el Squad [${newSquad.name}]!`,
+                    message: `Â¡Has fundado el Squad [${newSquad.name}]!`,
                     newCoins: myUser.coins,
                     squadName: newSquad.name,
                     squadLogo: newSquad.logo,
@@ -2126,18 +2667,18 @@ module.exports = function createWsHandler(deps) {
                     await myUser.save();
                     await friendUser.save();
 
-                    // 3. Actualizar la memoria RAM si tú estás conectado
+                    // 3. Actualizar la memoria RAM si tÃº estÃ¡s conectado
                     if (players[id]) {
                         players[id].friends = myUser.friends.map(fid => fid.toString());
                     }
 
-                    // 4. (Opcional) Actualizar la memoria RAM del amigo si él también está conectado jugando
+                    // 4. (Opcional) Actualizar la memoria RAM del amigo si Ã©l tambiÃ©n estÃ¡ conectado jugando
                     const friendSocket = Object.keys(players).find(key => players[key].accountId === data.targetId);
                     if (friendSocket && players[friendSocket]) {
                         players[friendSocket].friends = friendUser.friends.map(fid => fid.toString());
                     }
 
-                    // 5. Avisarte que fue un éxito
+                    // 5. Avisarte que fue un Ã©xito
                     ws.send(encode({ type: 'friend_removed', targetId: data.targetId }));
                 }
             } catch (err) {
@@ -2162,7 +2703,7 @@ module.exports = function createWsHandler(deps) {
                 });
 
                 const listData = mySquads.map(sq => ({
-                    id: sq._id.toString(), // 🛑 EL FIX: Forzar a que sea texto
+                    id: sq._id.toString(), // ðŸ›‘ EL FIX: Forzar a que sea texto
                     name: sq.name,
                     logo: sq.logo,
                     isLeader: sq.leader.toString() === myUser._id.toString(),
@@ -2170,14 +2711,14 @@ module.exports = function createWsHandler(deps) {
                 }));
 
                 ws.send(encode({ type: 'my_squads_list_data', squads: listData }));
-            } catch (err) { console.error(err); }
+            } catch (err) { console.error("AUTO LOGIN CRASH", err); ws.send(encode({ type: 'auth_error', message: 'Server crashed during login.' })); }
         }
 
-        // 17. OBTENER DETALLES DE UN SQUAD ESPECÍFICO (Con Logo y Stats)
+        // 17. OBTENER DETALLES DE UN SQUAD ESPECÃFICO (Con Logo y Stats)
         if ((data.type === 'get_squad_details' || data.type === 'get_squad_details_silent') && isAuthenticated) {
             try {
                 const squad = await Squad.findById(data.squadId)
-                    // 🛑 EL FIX: Pedir explícitamente los stats de combate y economía
+                    // ðŸ›‘ EL FIX: Pedir explÃ­citamente los stats de combate y economÃ­a
                     .populate('leader', 'username equipped elo kills losses coins')
                     .populate('members.accountId', 'username equipped elo kills losses coins');
 
@@ -2192,7 +2733,7 @@ module.exports = function createWsHandler(deps) {
                     leader: {
                         accountId: squad.leader._id.toString(), // Estandarizado a accountId
                         name: squad.leader.username,
-                        equipped: squad.leader.equipped || { head: 'head_default', body: 'body_default', hat: 'none' },
+                        equipped: squad.leader.equipped || { head: 'H_D', body: 'body_default', hat: 'none' },
                         elo: squad.leader.elo || 1000,
                         kills: squad.leader.kills || 0,
                         losses: squad.leader.losses || 0,
@@ -2203,7 +2744,7 @@ module.exports = function createWsHandler(deps) {
                         return {
                             accountId: m.accountId._id.toString(),
                             name: m.accountId.username,
-                            equipped: m.accountId.equipped || { head: 'head_default', body: 'body_default', hat: 'none' },
+                            equipped: m.accountId.equipped || { head: 'H_D', body: 'body_default', hat: 'none' },
                             elo: m.accountId.elo || 1000,
                             kills: m.accountId.kills || 0,
                             losses: m.accountId.losses || 0,
@@ -2222,7 +2763,7 @@ module.exports = function createWsHandler(deps) {
                 } else {
                     ws.send(encode({ type: 'my_squad_data', squad: squadData }));
                 }
-            } catch (err) { console.error(err); }
+            } catch (err) { console.error("AUTO LOGIN CRASH", err); ws.send(encode({ type: 'auth_error', message: 'Server crashed during login.' })); }
         }
         // 26. SOLICITAR EL LEADERBOARD (PUNTAJES DE SQUADS Y BASES EN VIVO)
         if (data.type === 'get_squad_leaderboard' && isAuthenticated) {
@@ -2230,7 +2771,7 @@ module.exports = function createWsHandler(deps) {
                 // 1. Obtener a todos los clanes
                 const allSquads = await Squad.find({}, 'name logo dailyTimeMinutes weeklyTimeMinutes territoryTimeMinutes').lean();
 
-                // 🛑 EL FIX ARQUITECTÓNICO: Convertir los ObjectId a Strings ligeros antes de enviarlos
+                // ðŸ›‘ EL FIX ARQUITECTÃ“NICO: Convertir los ObjectId a Strings ligeros antes de enviarlos
                 const cleanSquads = allSquads.map(sq => ({
                     ...sq,
                     _id: sq._id.toString()
@@ -2238,25 +2779,27 @@ module.exports = function createWsHandler(deps) {
 
                 // 2. Preparar la vista "En Vivo"
                 const liveBases = [];
-                if (state.centralBase) {
+                const basesList = state.turfBases ? Object.values(state.turfBases) : (state.centralBase ? [state.centralBase] : []);
+                for (const b of basesList) {
                     let ownerLogo = "";
-                    if (state.centralBase.currentOwnerSquadId) {
-                        const sq = await Squad.findOne({ name: state.centralBase.currentOwnerSquadId });
+                    if (b.currentOwnerSquadId) {
+                        const sq = await Squad.findOne({ name: b.currentOwnerSquadId });
                         if (sq) ownerLogo = sq.logo;
                     }
 
                     liveBases.push({
-                        name: state.centralBase.name,
-                        owner: state.centralBase.currentOwnerSquadId || "Nadie",
+                        turfId: b.turfId,
+                        name: b.name,
+                        owner: b.currentOwnerSquadId || "Nadie",
                         ownerLogo: ownerLogo,
-                        hp: state.centralBase.hp,
-                        maxHp: state.centralBase.maxHp
+                        hp: b.hp,
+                        maxHp: b.maxHp
                     });
                 }
 
                 ws.send(encode({
                     type: 'squad_leaderboard_data',
-                    squads: cleanSquads, // 👈 Enviamos la lista sanitizada
+                    squads: cleanSquads, // ðŸ‘ˆ Enviamos la lista sanitizada
                     liveBases: liveBases
                 }));
             } catch (err) {
@@ -2270,9 +2813,9 @@ module.exports = function createWsHandler(deps) {
                 const squad = await Squad.findById(data.squadId);
                 const myUser = await User.findOne({ email: currentUser });
 
-                // Seguridad: Verificar si existe y si soy el líder
+                // Seguridad: Verificar si existe y si soy el lÃ­der
                 if (!squad || squad.leader.toString() !== myUser._id.toString()) {
-                    return ws.send(encode({ type: 'edit_squad_error', message: 'No tienes permisos de Líder.' }));
+                    return ws.send(encode({ type: 'edit_squad_error', message: 'No tienes permisos de LÃ­der.' }));
                 }
 
                 const newName = data.newName.trim();
@@ -2281,13 +2824,13 @@ module.exports = function createWsHandler(deps) {
                 if (newName.length < 3 || newName.length > 20) return ws.send(encode({ type: 'edit_squad_error', message: 'El nombre debe tener entre 3 y 20 letras.' }));
                 if (newLogo !== "" && !newLogo.startsWith("https://i.pinimg.com/")) return ws.send(encode({ type: 'edit_squad_error', message: 'El logo debe ser una imagen de Pinterest.' }));
 
-                // ¿Cambió el nombre? Si es así, validamos y cobramos 350
+                // Â¿CambiÃ³ el nombre? Si es asÃ­, validamos y cobramos 350
                 let nameChanged = (newName !== squad.name);
                 if (nameChanged) {
-                    if (p.coins < 350) return ws.send(encode({ type: 'edit_squad_error', message: 'Necesitas 350 🪙 para cambiar el nombre.' }));
+                    if (p.coins < 350) return ws.send(encode({ type: 'edit_squad_error', message: 'Necesitas 350 ðŸª™ para cambiar el nombre.' }));
 
                     const existingSquad = await Squad.findOne({ name: new RegExp('^' + newName + '$', 'i') });
-                    if (existingSquad) return ws.send(encode({ type: 'edit_squad_error', message: 'Ese nombre ya está en uso por otra banda.' }));
+                    if (existingSquad) return ws.send(encode({ type: 'edit_squad_error', message: 'Ese nombre ya estÃ¡ en uso por otra banda.' }));
 
                     // Cobrar
                     p.coins -= 350;
@@ -2300,15 +2843,15 @@ module.exports = function createWsHandler(deps) {
                 squad.logo = newLogo;
                 await squad.save();
 
-                ws.send(encode({ type: 'edit_squad_success', message: '¡Actualizado!', newCoins: p.coins, squadId: squad._id, squadName: p.squadName, squadLogo: p.squadLogo }));;
+                ws.send(encode({ type: 'edit_squad_success', message: 'Â¡Actualizado!', newCoins: p.coins, squadId: squad._id, squadName: p.squadName, squadLogo: p.squadLogo }));;
             } catch (err) { ws.send(encode({ type: 'edit_squad_error', message: 'Error del servidor.' })); }
-        }// 🔍 BUSCAR SQUADS EN LA BASE DE DATOS
+        }// ðŸ” BUSCAR SQUADS EN LA BASE DE DATOS
         if (data.type === 'search_squads' && isAuthenticated) {
             try {
                 const query = data.query ? data.query.trim() : "";
                 let filter = {};
 
-                // Si hay texto, buscamos por nombre (insensible a mayúsculas)
+                // Si hay texto, buscamos por nombre (insensible a mayÃºsculas)
                 if (query.length > 0) {
                     filter = { name: { $regex: query, $options: 'i' } };
                 }
@@ -2321,7 +2864,7 @@ module.exports = function createWsHandler(deps) {
 
                 // Empaquetamos TODOS los datos para que el perfil offline se dibuje perfecto
                 const results = squads.map(sq => ({
-                    id: sq._id.toString(), // 🛑 EL FIX: Forzar a que sea texto
+                    id: sq._id.toString(), // ðŸ›‘ EL FIX: Forzar a que sea texto
                     name: sq.name,
                     logo: sq.logo,
                     memberCount: (sq.members ? sq.members.length : 0) + 1,
@@ -2346,40 +2889,173 @@ module.exports = function createWsHandler(deps) {
                 if (!squad) return;
 
                 const isLeader = squad.leader.toString() === myUser._id.toString();
-                const isMember = squad.members.some(m => m.accountId.toString() === myUser._id.toString());
+                const isMember = squad.members.some(m => m.accountId && m.accountId.toString() === myUser._id.toString());
 
                 if (!isLeader && !isMember) {
                     return ws.send(encode({ type: 'squad_error', message: 'No perteneces a este squad.' }));
                 }
 
-                // 2. Lógica del "Interruptor" (Toggle)
+                // 2. LÃ³gica del "Interruptor" (Toggle)
                 let isActive = false;
 
-                // Si el squad que me envió es el mismo que ya tengo equipado, significa que lo quiero QUITAR
+                // Si el squad que me enviÃ³ es el mismo que ya tengo equipado, significa que lo quiero QUITAR
                 if (myUser.squad && myUser.squad.toString() === squadId) {
-                    myUser.squad = null; p.squad = null; p.squadName = null; p.squadLogo = null;
-                    p.squadCanInvite = false; // Pierdes el permiso
+                    myUser.squad = null;
+                    p.squad = null;
+                    p.squadName = null;
+                    p.squadLogo = null;
+                    p.squadCanInvite = false;
+                    p.squadCanKick = false;
+                    p.squadCanAssignRoles = false;
+                    p.isLeader = false;
+                    p.squadRole = null;
+                    p.squadTitle = null;
                     isActive = false;
 
                 } else {
-                    // Si es distinto o estaba en null, lo quiero EQUIPAR (reemplaza a cualquier otro)
-                    myUser.squad = squad._id; p.squad = squad._id.toString(); p.squadName = squad.name; p.squadLogo = squad.logo;
-                    p.squadCanInvite = isLeader || (isMember && squad.members.find(m => m.accountId.toString() === myUser._id.toString()).canInvite);
+                    // Si es distinto o estaba en null, lo quiero EQUIPAR (adopta todos los poderes del nuevo squad)
+                    const myMemberObj = squad.members ? squad.members.find(m => m.accountId && m.accountId.toString() === myUser._id.toString()) : null;
+                    const canInvite = isLeader || (myMemberObj && myMemberObj.canInvite) || false;
+                    const canKick = isLeader || (myMemberObj && myMemberObj.canKick) || false;
+                    const canAssignRoles = isLeader || (myMemberObj && myMemberObj.canAssignRoles) || false;
+                    const customTitle = isLeader ? 'ðŸ‘‘ LÃ­der' : (myMemberObj && myMemberObj.customTitle ? myMemberObj.customTitle : 'Miembro');
+
+                    myUser.squad = squad._id;
+                    p.squad = squad._id.toString();
+                    p.squadName = squad.name;
+                    p.squadLogo = squad.logo;
+                    p.squadCanInvite = canInvite;
+                    p.squadCanKick = canKick;
+                    p.squadCanAssignRoles = canAssignRoles;
+                    p.isLeader = isLeader;
+                    p.squadRole = isLeader ? 'leader' : 'member';
+                    p.squadTitle = customTitle;
                     isActive = true;
                 }
 
-                // 3. Guardar en Base de Datos y avisar a todos
+                // 3. Guardar en Base de Datos y avisar al cliente
                 await myUser.save();
 
-                ws.send(encode({ type: 'toggle_squad_success', isActive: isActive, squadId: squadId, squadName: p.squadName, squadLogo: p.squadLogo }));
+                ws.send(encode({
+                    type: 'toggle_squad_success',
+                    isActive: isActive,
+                    squadId: isActive ? squadId : null,
+                    squadName: p.squadName,
+                    squadLogo: p.squadLogo,
+                    squadCanInvite: p.squadCanInvite,
+                    squadCanKick: p.squadCanKick,
+                    squadCanAssignRoles: p.squadCanAssignRoles,
+                    isLeader: p.isLeader,
+                    squadRole: p.squadRole,
+                    squadTitle: p.squadTitle
+                }));
 
-                // Avisarle a los demás jugadores conectados que cambiaste tu Tag
+                // Avisarle a los demÃ¡s jugadores conectados que cambiaste tu Tag
                 broadcast({ type: 'update', id: id, player: p }, ws);
 
             } catch (err) {
                 console.error("Error al hacer toggle del tag:", err);
             }
-        }// 20. ENVIAR INVITACIÓN AL CLAN
+        }
+        // 20. ENVIAR INVITACIÃ“N AL CLAN
+        // =========================================================
+        // ðŸ” PERFIL DE JUGADOR (EN VIVO DESDE RAM O MONGODB)
+        // =========================================================
+        if (data.type === 'get_player_profile' && isAuthenticated) {
+            try {
+                let targetWsId = null;
+                let targetPlayer = null;
+
+                // 1. Buscar si estÃ¡ conectado en la RAM del servidor
+                for (let pid in players) {
+                    const pl = players[pid];
+                    if (
+                        (data.accountId && pl.accountId && pl.accountId.toString() === data.accountId.toString()) ||
+                        (data.targetId && (pid === data.targetId.toString() || (pl.accountId && pl.accountId.toString() === data.targetId.toString()))) ||
+                        (data.username && pl.username && pl.username.toLowerCase() === data.username.toLowerCase())
+                    ) {
+                        targetWsId = pid;
+                        targetPlayer = pl;
+                        break;
+                    }
+                }
+
+                if (targetPlayer) {
+                    // Enviar datos en vivo desde la memoria RAM
+                    return ws.send(encode({
+                        type: 'player_profile_data',
+                        targetId: data.targetId || targetWsId,
+                        profile: {
+                            accountId: targetPlayer.accountId,
+                            username: targetPlayer.username,
+                            gameId: targetPlayer.gameId || "",
+                            role: targetPlayer.role || (targetPlayer.isGuest ? 'guest' : 'player'),
+                            isGuest: !!targetPlayer.isGuest,
+                            isOnline: true,
+                            coins: targetPlayer.coins || 0,
+                            gems: targetPlayer.gems || 0,
+                            kills: targetPlayer.kills || 0,
+                            losses: targetPlayer.losses || 0,
+                            elo: targetPlayer.elo || 1000,
+                            squad: targetPlayer.squad || null,
+                            squadName: targetPlayer.squadName || null,
+                            squadLogo: targetPlayer.squadLogo || null,
+                            equipped: targetPlayer.equipped || { head: 'H_D', body: 'body_default', hat: 'none' }
+                        }
+                    }));
+                }
+
+                // 2. Si no estÃ¡ en RAM, buscar en MongoDB
+                let mongoQuery = null;
+                if (data.accountId && mongoose.Types.ObjectId.isValid(data.accountId)) {
+                    mongoQuery = { _id: data.accountId };
+                } else if (data.username) {
+                    mongoQuery = { username: new RegExp('^' + data.username.trim() + '$', 'i') };
+                }
+
+                if (mongoQuery) {
+                    const dbUser = await User.findOne(mongoQuery).lean();
+                    if (dbUser) {
+                        let squadInfo = null;
+                        if (dbUser.squad) {
+                            squadInfo = await Squad.findById(dbUser.squad).lean();
+                        }
+                        return ws.send(encode({
+                            type: 'player_profile_data',
+                            targetId: data.targetId,
+                            profile: {
+                                accountId: dbUser._id.toString(),
+                                username: dbUser.username,
+                                gameId: dbUser.gameId || "",
+                                role: dbUser.role || 'player',
+                                isGuest: false,
+                                isOnline: false,
+                                coins: dbUser.coins || 0,
+                                gems: dbUser.gems || 0,
+                                kills: dbUser.kills || 0,
+                                losses: dbUser.losses || 0,
+                                elo: dbUser.elo || 1000,
+                                squad: dbUser.squad ? dbUser.squad.toString() : null,
+                                squadName: squadInfo ? squadInfo.name : null,
+                                squadLogo: squadInfo ? squadInfo.logo : null,
+                                equipped: dbUser.equipped || { head: 'H_D', body: 'body_default', hat: 'none' }
+                            }
+                        }));
+                    }
+                }
+
+                // 3. Si no se encontrÃ³ en ningÃºn lado
+                ws.send(encode({
+                    type: 'player_profile_data',
+                    targetId: data.targetId,
+                    profile: null
+                }));
+            } catch (err) {
+                console.error("Error en get_player_profile:", err);
+            }
+        }
+
+        // 20. ENVIAR INVITACIÃ“N AL CLAN (RECLUTAMIENTO)
         if (data.type === 'send_squad_invite' && isAuthenticated) {
             try {
                 const p = players[id];
@@ -2390,49 +3066,64 @@ module.exports = function createWsHandler(deps) {
 
                 const myUser = await User.findOne({ email: currentUser });
                 const isLeader = squad.leader.toString() === myUser._id.toString();
-                const memberData = squad.members.find(m => m.accountId.toString() === myUser._id.toString());
+                const memberData = squad.members.find(m => m.accountId && m.accountId.toString() === myUser._id.toString());
                 const canInvite = isLeader || (memberData && memberData.canInvite);
 
                 if (!canInvite) return ws.send(encode({ type: 'squad_error', message: 'No tienes permisos para reclutar.' }));
 
-                // --- NUEVA VALIDACIÓN: ¿El objetivo ya está en ESTE clan? ---
-                const targetIsLeader = squad.leader.toString() === data.targetAccountId;
-                const targetIsMember = squad.members.some(m => m.accountId.toString() === data.targetAccountId);
+                // Buscar al objetivo conectado en la RAM del servidor
+                let targetWsId = null;
+                let targetPlayer = null;
+
+                for (let pid in players) {
+                    const pl = players[pid];
+                    if (
+                        (data.targetAccountId && (pl.accountId === data.targetAccountId.toString() || pid === data.targetAccountId.toString())) ||
+                        (data.targetUsername && pl.username && pl.username.toLowerCase() === data.targetUsername.toLowerCase()) ||
+                        (data.targetPlayerId && pid === data.targetPlayerId.toString())
+                    ) {
+                        targetWsId = pid;
+                        targetPlayer = pl;
+                        break;
+                    }
+                }
+
+                if (!targetWsId || !targetPlayer) {
+                    return ws.send(encode({ type: 'squad_error', message: 'El jugador no estÃ¡ en lÃ­nea.' }));
+                }
+
+                if (targetPlayer.isGuest) {
+                    return ws.send(encode({ type: 'squad_error', message: 'Los jugadores invitados no pueden unirse a clanes.' }));
+                }
+
+                // --- NUEVA VALIDACIÃ“N: Â¿El objetivo ya estÃ¡ en ESTE clan? ---
+                const targetIsLeader = squad.leader.toString() === targetPlayer.accountId;
+                const targetIsMember = squad.members.some(m => m.accountId && m.accountId.toString() === targetPlayer.accountId);
 
                 if (targetIsLeader || targetIsMember) {
                     return ws.send(encode({ type: 'squad_error', message: 'Este jugador ya pertenece a tu clan.' }));
                 }
 
-                // Buscar al objetivo y ver si está conectado
-                let targetWsId = null;
-                for (let pid in players) {
-                    if (players[pid].accountId === data.targetAccountId) targetWsId = pid;
-                }
-
-                if (targetWsId) {
-                    wss.clients.forEach(client => {
-                        if (client.playerId === targetWsId && client.readyState === WebSocket.OPEN) {
-                            client.send(encode({
-                                type: 'squad_invite',
-                                squadId: squad._id.toString(), // 🛑 EL FIX 2: Evita enviar como Buffer Binario
-                                squadName: squad.name,
-                                senderUsername: p.username,
-                                senderFrameX: p.frameX,
-                                senderFrameY: p.frameY
-                            }));
-                        }
-                    });
-                    ws.send(encode({ type: 'squad_success', message: 'Invitación enviada.' }));
-                } else {
-                    ws.send(encode({ type: 'squad_error', message: 'El jugador no está en línea.' }));
-                }
+                wss.clients.forEach(client => {
+                    if (client.playerId === targetWsId && client.readyState === WebSocket.OPEN) {
+                        client.send(encode({
+                            type: 'squad_invite',
+                            squadId: squad._id.toString(),
+                            squadName: squad.name,
+                            senderUsername: p.username,
+                            senderFrameX: p.frameX,
+                            senderFrameY: p.frameY
+                        }));
+                    }
+                });
+                ws.send(encode({ type: 'squad_success', message: 'InvitaciÃ³n enviada.' }));
             } catch (err) { console.error("Error invitando al clan:", err); }
         }
 
-        // 21. ACEPTAR INVITACIÓN AL CLAN
+        // 21. ACEPTAR INVITACIÃ“N AL CLAN
         if (data.type === 'accept_squad_invite' && isAuthenticated) {
             try {
-                // 🛑 ESCUDO ANTI-BUFFER
+                // ðŸ›‘ ESCUDO ANTI-BUFFER
                 const cleanSquadId = data.squadId.buffer ? Buffer.from(data.squadId).toString('hex') : data.squadId.toString();
 
                 const squad = await Squad.findById(cleanSquadId);
@@ -2440,10 +3131,10 @@ module.exports = function createWsHandler(deps) {
 
                 const myUser = await User.findOne({ email: currentUser });
 
-                // Regla 1: Límite de miembros
-                if (squad.members.length >= 24) return ws.send(encode({ type: 'squad_error', message: 'El clan está lleno.' }));
+                // Regla 1: LÃ­mite de miembros
+                if (squad.members.length >= 24) return ws.send(encode({ type: 'squad_error', message: 'El clan estÃ¡ lleno.' }));
 
-                // Regla 2: ¿Ya estoy en este clan?
+                // Regla 2: Â¿Ya estoy en este clan?
                 const isMember = squad.members.some(m => m.accountId.toString() === myUser._id.toString());
                 const isLeader = squad.leader.toString() === myUser._id.toString();
 
@@ -2453,7 +3144,7 @@ module.exports = function createWsHandler(deps) {
                     squad.members.push({ accountId: myUser._id });
                     await squad.save();
 
-                    // 2. 🛑 EL FIX 3: Sellar el Clan en la Base de Datos del Jugador
+                    // 2. ðŸ›‘ EL FIX 3: Sellar el Clan en la Base de Datos del Jugador
                     myUser.squad = squad._id;
                     await myUser.save();
 
@@ -2465,13 +3156,14 @@ module.exports = function createWsHandler(deps) {
                         players[id].squadCanInvite = false; // Entra sin poderes
                     }
 
-                    // 4. Avisar al jugador del éxito (Enviando sus nuevos datos)
+                    // 4. Avisar al jugador del Ã©xito (Enviando sus nuevos datos)
+                    broadcastSquadAnnouncement(squad._id.toString(), `ðŸŽ‰ @${myUser.username} se uniÃ³ al clan.`);
                     ws.send(encode({
                         type: 'squad_success',
-                        message: `¡Te has unido al clan [${squad.name}]!`,
+                        message: `Â¡Te has unido al clan [${squad.name}]!`,
                         squadName: squad.name,
                         squadLogo: squad.logo,
-                        squadId: squad._id.toString() // 🛑 EL FIX: Enviar el ID a la RAM
+                        squadId: squad._id.toString() // ðŸ›‘ EL FIX: Enviar el ID a la RAM
                     }));
 
                     // 5. Avisar a todo el mapa que el jugador tiene nuevo Tag
@@ -2505,7 +3197,7 @@ module.exports = function createWsHandler(deps) {
             } catch (err) { console.error("Error guardando pivote:", err); }
         }
 
-        // 23. GUARDAR ESTADÍSTICAS MELEE (SISTEMA DIRECCIONAL WASD)
+        // 23. GUARDAR ESTADÃSTICAS MELEE (SISTEMA DIRECCIONAL WASD)
         if (data.type === 'update_melee_stats' && isAuthenticated) {
             try {
                 if (players[id].role !== 'admin') return;
@@ -2529,7 +3221,7 @@ module.exports = function createWsHandler(deps) {
                         client.send(encode({ type: 'sync_melee_stats', weaponId: data.weaponId, direction: data.direction, stats: data.stats }));
                     }
                 });
-            } catch (err) { console.error("💥 ERROR al guardar en MongoDB:", err); }
+            } catch (err) { console.error("ðŸ’¥ ERROR al guardar en MongoDB:", err); }
         }// 24. RECOGER BASURA CON EL TRASH PICKER
         if (data.type === 'pickup_trash' && isAuthenticated) {
             const itemId = data.itemId;
@@ -2541,27 +3233,27 @@ module.exports = function createWsHandler(deps) {
 
                 if (!p.inventory) p.inventory = [];
 
-                // 🛑 EL FIX: SISTEMA APILABLE (STACKABLE)
-                // Buscamos si ya tiene un "montón" de este tipo de basura
+                // ðŸ›‘ EL FIX: SISTEMA APILABLE (STACKABLE)
+                // Buscamos si ya tiene un "montÃ³n" de este tipo de basura
                 let existingStack = p.inventory.find(i => typeof i === 'object' && i.id === item.templateId);
 
                 if (existingStack) {
-                    existingStack.quantity += 1; // Le sumamos 1 a su montón
+                    existingStack.quantity += 1; // Le sumamos 1 a su montÃ³n
                 } else {
-                    // Si no lo tiene, creamos el primer montón
+                    // Si no lo tiene, creamos el primer montÃ³n
                     p.inventory.push({ id: item.templateId, quantity: 1 });
                 }
 
                 broadcast({ type: 'remove_item', id: itemId });
 
-                // Avisamos visualmente que entró a la mochila
+                // Avisamos visualmente que entrÃ³ a la mochila
                 ws.send(encode({
                     type: 'system_message',
-                    text: `🎒 Recogiste: ${item.name}`,
+                    text: `ðŸŽ’ Recogiste: ${item.name}`,
                     color: '#3498db'
                 }));
 
-                // 🛑 EL FIX: El servidor le envía a tu pantalla tu nueva mochila
+                // ðŸ›‘ EL FIX: El servidor le envÃ­a a tu pantalla tu nueva mochila
                 ws.send(encode({
                     type: 'inventory_update',
                     inventory: p.inventory
@@ -2585,7 +3277,7 @@ module.exports = function createWsHandler(deps) {
                 if (typeof item === 'object' && item.id && item.id.startsWith('trash_')) {
                     let catalogItem = TRASH_CATALOG.find(t => t.id === item.id);
                     if (catalogItem) {
-                        // Si por algún error no tiene quantity, asumimos que es 1
+                        // Si por algÃºn error no tiene quantity, asumimos que es 1
                         const qty = item.quantity || 1;
                         totalEarned += (catalogItem.value * qty);
                         isTrash = true;
@@ -2606,7 +3298,7 @@ module.exports = function createWsHandler(deps) {
                 }
             }
 
-            // Si encontró dinero, hacemos la transacción
+            // Si encontrÃ³ dinero, hacemos la transacciÃ³n
             if (totalEarned > 0) {
                 p.coins += totalEarned;
                 p.inventory = newInventory;
@@ -2619,45 +3311,139 @@ module.exports = function createWsHandler(deps) {
                 }));
                 broadcast({ type: 'update', id: id, player: p }, ws);
             } else {
-                // 🛑 EL FIX: Si por algo falla, que el servidor te avise en pantalla en lugar de ignorarte
-                ws.send(encode({ type: 'system_message', text: "Error: No se encontró basura válida para vender.", color: '#e74c3c' }));
+                // ðŸ›‘ EL FIX: Si por algo falla, que el servidor te avise en pantalla en lugar de ignorarte
+                ws.send(encode({ type: 'system_message', text: "Error: No se encontrÃ³ basura vÃ¡lida para vender.", color: '#e74c3c' }));
             }
         }// 28. ACTUALIZAR ROL DE UN MIEMBRO DEL CLAN
         if (data.type === 'update_squad_member' && isAuthenticated) {
             try {
                 const myUser = await User.findOne({ email: currentUser });
-                if (!myUser.squad) return;
+                if (!myUser) return;
 
-                const squad = await Squad.findById(myUser.squad);
+                const squadId = data.squadId || myUser.squad;
+                if (!squadId) return;
+
+                const squad = await Squad.findById(squadId);
                 if (!squad) return;
 
                 // 1. Verificar si tengo permisos
                 const isLeader = squad.leader.toString() === myUser._id.toString();
-                const myData = squad.members.find(m => m.accountId.toString() === myUser._id.toString());
+                const myData = squad.members.find(m => m.accountId && m.accountId.toString() === myUser._id.toString());
                 const iCanAssignRoles = isLeader || (myData && myData.canAssignRoles);
 
-                if (!iCanAssignRoles) return ws.send(encode({ type: 'system_message', text: "No tienes permisos de Administrador en el Clan.", color: "#e74c3c" }));
+                if (!iCanAssignRoles) {
+                    return ws.send(encode({ type: 'system_message', text: "No tienes permisos de Administrador en el Clan.", color: "#e74c3c" }));
+                }
 
                 // 2. Buscar al miembro que queremos editar
-                const targetMember = squad.members.find(m => m.accountId.toString() === data.targetAccountId);
+                const targetMember = squad.members.find(m => m.accountId && m.accountId.toString() === data.targetAccountId.toString());
                 if (!targetMember) return;
 
-                // 3. Aplicar cambios
-                targetMember.customTitle = data.title;
-                targetMember.canInvite = data.canInvite;
-                targetMember.canKick = data.canKick;
-                targetMember.canAssignRoles = data.canAssignRoles;
+                // 3. Capturar valores previos antes de mutar
+                const oldTitle = (targetMember.customTitle || "Miembro").trim();
+                const oldCanInvite = !!targetMember.canInvite;
+                const oldCanKick = !!targetMember.canKick;
+                const oldCanAssignRoles = !!targetMember.canAssignRoles;
+
+                const newTitle = typeof data.title !== 'undefined' ? data.title.trim() : oldTitle;
+                const newCanInvite = typeof data.canInvite !== 'undefined' ? !!data.canInvite : oldCanInvite;
+                const newCanKick = typeof data.canKick !== 'undefined' ? !!data.canKick : oldCanKick;
+                const newCanAssignRoles = typeof data.canAssignRoles !== 'undefined' ? !!data.canAssignRoles : oldCanAssignRoles;
+
+                const titleChanged = newTitle !== oldTitle;
+                const inviteChanged = newCanInvite !== oldCanInvite;
+                const kickChanged = newCanKick !== oldCanKick;
+                const assignChanged = newCanAssignRoles !== oldCanAssignRoles;
+
+                // ðŸ›‘ SI NADA CAMBIÃ“ REALMENTE (ej. solo entrÃ³ a mirar), NO HACER NADA
+                if (!titleChanged && !inviteChanged && !kickChanged && !assignChanged) {
+                    return;
+                }
+
+                // 4. Aplicar cambios a BD
+                targetMember.customTitle = newTitle;
+                targetMember.canInvite = newCanInvite;
+                targetMember.canKick = newCanKick;
+                targetMember.canAssignRoles = newCanAssignRoles;
 
                 await squad.save();
-                ws.send(encode({ type: 'get_squad_details', squadId: squad._id.toString() }));
 
-                // 🛑 NUEVO: Avisarle al miembro afectado en TIEMPO REAL si le cambiaron sus poderes
-                let targetWsId = Object.keys(players).find(key => players[key].accountId === data.targetAccountId);
+                // ðŸ“¢ ANUNCIO APILADO CON BUFFER ANTI-SPAM
+                try {
+                    const targetUserDoc = await User.findById(data.targetAccountId);
+                    const targetUName = targetUserDoc ? targetUserDoc.username : "un miembro";
+
+                    queueSquadMemberAnnouncement(
+                        squad._id.toString(),
+                        myUser.username,
+                        data.targetAccountId.toString(),
+                        targetUName,
+                        { title: oldTitle, canInvite: oldCanInvite, canKick: oldCanKick, canAssignRoles: oldCanAssignRoles },
+                        { title: newTitle, canInvite: newCanInvite, canKick: newCanKick, canAssignRoles: newCanAssignRoles }
+                    );
+                } catch (annErr) {
+                    console.error("Error encolando anuncio de clan:", annErr);
+                }
+
+                // 4. Re-poblar y enviar los datos del squad actualizados al cliente
+                const populatedSquad = await Squad.findById(squad._id)
+                    .populate('leader', 'username equipped elo kills losses coins')
+                    .populate('members.accountId', 'username equipped elo kills losses coins');
+
+                if (populatedSquad) {
+                    const squadData = {
+                        id: populatedSquad._id.toString(),
+                        name: populatedSquad.name,
+                        logo: populatedSquad.logo,
+                        territoryTimeMinutes: populatedSquad.territoryTimeMinutes || 0,
+                        milestonesAchieved: populatedSquad.milestonesAchieved ? Object.fromEntries(populatedSquad.milestonesAchieved) : {},
+                        leader: {
+                            accountId: populatedSquad.leader ? populatedSquad.leader._id.toString() : '',
+                            name: populatedSquad.leader ? populatedSquad.leader.username : '',
+                            equipped: populatedSquad.leader ? (populatedSquad.leader.equipped || { head: 'H_D', body: 'body_default', hat: 'none' }) : { head: 'H_D', body: 'body_default', hat: 'none' },
+                            elo: populatedSquad.leader ? (populatedSquad.leader.elo || 1000) : 1000,
+                            kills: populatedSquad.leader ? (populatedSquad.leader.kills || 0) : 0,
+                            losses: populatedSquad.leader ? (populatedSquad.leader.losses || 0) : 0,
+                            coins: populatedSquad.leader ? (populatedSquad.leader.coins || 0) : 0
+                        },
+                        members: populatedSquad.members.map(m => {
+                            if (!m.accountId) return null;
+                            return {
+                                accountId: m.accountId._id.toString(),
+                                name: m.accountId.username,
+                                equipped: m.accountId.equipped || { head: 'H_D', body: 'body_default', hat: 'none' },
+                                elo: m.accountId.elo || 1000,
+                                kills: m.accountId.kills || 0,
+                                losses: m.accountId.losses || 0,
+                                coins: m.accountId.coins || 0,
+                                title: m.customTitle,
+                                canInvite: m.canInvite,
+                                canKick: m.canKick,
+                                canAssignRoles: m.canAssignRoles,
+                                joinedAt: m.joinedAt
+                            };
+                        }).filter(m => m !== null)
+                    };
+                    ws.send(encode({ type: 'my_squad_data_silent', squad: squadData }));
+                }
+
+                // 5. Avisarle al miembro afectado en TIEMPO REAL si le cambiaron sus poderes
+                let targetWsId = Object.keys(players).find(key => players[key].accountId && players[key].accountId.toString() === data.targetAccountId.toString());
                 if (targetWsId && players[targetWsId]) {
-                    players[targetWsId].squadCanInvite = data.canInvite;
+                    players[targetWsId].squadCanInvite = !!data.canInvite;
+                    players[targetWsId].squadCanKick = !!data.canKick;
+                    players[targetWsId].squadCanAssignRoles = !!data.canAssignRoles;
+                    if (typeof data.title !== 'undefined') players[targetWsId].squadTitle = data.title;
+
                     wss.clients.forEach(c => {
                         if (c.playerId === targetWsId && c.readyState === WebSocket.OPEN) {
-                            c.send(encode({ type: 'update_permissions', canInvite: data.canInvite }));
+                            c.send(encode({
+                                type: 'update_permissions',
+                                canInvite: !!data.canInvite,
+                                canKick: !!data.canKick,
+                                canAssignRoles: !!data.canAssignRoles,
+                                title: data.title
+                            }));
                         }
                     });
                 }
@@ -2665,22 +3451,167 @@ module.exports = function createWsHandler(deps) {
             } catch (err) {
                 console.error("Error editando roles del squad:", err);
             }
-        } // =========================================================
-        // 🛑 NUEVO: VENDER CANTIDAD ESPECÍFICA DE UN ÍTEM INDIVIDUAL (YONKE) 🛑
+        }
+
+        // 29. ABANDONAR UN CLAN
+        if (data.type === 'leave_squad' && isAuthenticated) {
+            try {
+                const myUser = await User.findOne({ email: currentUser });
+                if (!myUser) return;
+                const squadId = data.squadId;
+                const squad = await Squad.findById(squadId);
+                if (!squad) return ws.send(encode({ type: 'squad_error', message: 'Clan no encontrado.' }));
+
+                const isLeader = squad.leader.toString() === myUser._id.toString();
+                if (isLeader) {
+                    return ws.send(encode({ type: 'squad_error', message: 'El lÃ­der no puede abandonar su propio clan.' }));
+                }
+
+                const memberIdx = squad.members.findIndex(m => m.accountId && m.accountId.toString() === myUser._id.toString());
+                if (memberIdx === -1) {
+                    return ws.send(encode({ type: 'squad_error', message: 'No eres miembro de este clan.' }));
+                }
+
+                squad.members.splice(memberIdx, 1);
+                await squad.save();
+
+                // Si tenÃ­a equipado el tag de este clan, desequiparlo
+                if (myUser.squad && myUser.squad.toString() === squadId.toString()) {
+                    myUser.squad = null;
+                    await myUser.save();
+                }
+                const p = players[id];
+                if (p && p.squad === squadId.toString()) {
+                    p.squad = null;
+                    p.squadName = null;
+                    p.squadLogo = null;
+                    p.squadCanInvite = false;
+                    broadcast({ type: 'update', id: id, player: p }, ws);
+                    ws.send(encode({ type: 'toggle_squad_success', isActive: false, squadId: null, squadName: null, squadLogo: null }));
+                }
+
+                ws.send(encode({ type: 'squad_success', message: `Has abandonado el clan [${squad.name}].` }));
+                ws.send(encode({ type: 'squad_leave_success' }));
+            } catch (err) {
+                console.error("Error al abandonar squad:", err);
+                ws.send(encode({ type: 'squad_error', message: 'Error al abandonar el clan.' }));
+            }
+        }
+
+        // 30. EXPULSAR A UN MIEMBRO DEL CLAN
+        if (data.type === 'kick_squad_member' && isAuthenticated) {
+            try {
+                const myUser = await User.findOne({ email: currentUser });
+                if (!myUser) return;
+                const squadId = data.squadId;
+                const squad = await Squad.findById(squadId);
+                if (!squad) return;
+
+                const isLeader = squad.leader.toString() === myUser._id.toString();
+                const myData = squad.members.find(m => m.accountId && m.accountId.toString() === myUser._id.toString());
+                const canKick = isLeader || (myData && myData.canKick);
+
+                if (!canKick) {
+                    return ws.send(encode({ type: 'squad_error', message: 'No tienes permisos para expulsar miembros.' }));
+                }
+
+                const targetIdx = squad.members.findIndex(m => m.accountId && m.accountId.toString() === data.targetAccountId.toString());
+                if (targetIdx === -1) {
+                    return ws.send(encode({ type: 'squad_error', message: 'El miembro ya no pertenece al clan.' }));
+                }
+
+                squad.members.splice(targetIdx, 1);
+                await squad.save();
+
+                // Si el usuario expulsado tenÃ­a el tag guardado en BD, limpiarlo
+                const targetUser = await User.findById(data.targetAccountId);
+                if (targetUser && targetUser.squad && targetUser.squad.toString() === squadId.toString()) {
+                    targetUser.squad = null;
+                    await targetUser.save();
+                }
+
+                // Si estÃ¡ online, desequiparle el tag y avisarle en tiempo real
+                let targetWsId = Object.keys(players).find(key => players[key].accountId === data.targetAccountId.toString());
+                if (targetWsId && players[targetWsId]) {
+                    if (players[targetWsId].squad === squadId.toString()) {
+                        players[targetWsId].squad = null;
+                        players[targetWsId].squadName = null;
+                        players[targetWsId].squadLogo = null;
+                        players[targetWsId].squadCanInvite = false;
+                        broadcast({ type: 'update', id: targetWsId, player: players[targetWsId] });
+                        wss.clients.forEach(c => {
+                            if (c.playerId === targetWsId && c.readyState === WebSocket.OPEN) {
+                                c.send(encode({ type: 'toggle_squad_success', isActive: false, squadId: null, squadName: null, squadLogo: null }));
+                                c.send(encode({ type: 'system_message', text: `Fuiste expulsado del clan [${squad.name}].`, color: '#e74c3c' }));
+                            }
+                        });
+                    }
+                }
+
+                ws.send(encode({ type: 'squad_success', message: 'Miembro expulsado correctamente.' }));
+
+                // Re-poblar y enviar los datos del squad actualizados al cliente
+                const populatedSquad = await Squad.findById(squad._id)
+                    .populate('leader', 'username equipped elo kills losses coins')
+                    .populate('members.accountId', 'username equipped elo kills losses coins');
+
+                if (populatedSquad) {
+                    const squadData = {
+                        id: populatedSquad._id.toString(),
+                        name: populatedSquad.name,
+                        logo: populatedSquad.logo,
+                        territoryTimeMinutes: populatedSquad.territoryTimeMinutes || 0,
+                        milestonesAchieved: populatedSquad.milestonesAchieved ? Object.fromEntries(populatedSquad.milestonesAchieved) : {},
+                        leader: {
+                            accountId: populatedSquad.leader ? populatedSquad.leader._id.toString() : '',
+                            name: populatedSquad.leader ? populatedSquad.leader.username : '',
+                            equipped: populatedSquad.leader ? (populatedSquad.leader.equipped || { head: 'H_D', body: 'body_default', hat: 'none' }) : { head: 'H_D', body: 'body_default', hat: 'none' },
+                            elo: populatedSquad.leader ? (populatedSquad.leader.elo || 1000) : 1000,
+                            kills: populatedSquad.leader ? (populatedSquad.leader.kills || 0) : 0,
+                            losses: populatedSquad.leader ? (populatedSquad.leader.losses || 0) : 0,
+                            coins: populatedSquad.leader ? (populatedSquad.leader.coins || 0) : 0
+                        },
+                        members: populatedSquad.members.map(m => {
+                            if (!m.accountId) return null;
+                            return {
+                                accountId: m.accountId._id.toString(),
+                                name: m.accountId.username,
+                                equipped: m.accountId.equipped || { head: 'H_D', body: 'body_default', hat: 'none' },
+                                elo: m.accountId.elo || 1000,
+                                kills: m.accountId.kills || 0,
+                                losses: m.accountId.losses || 0,
+                                coins: m.accountId.coins || 0,
+                                title: m.customTitle,
+                                canInvite: m.canInvite,
+                                canKick: m.canKick,
+                                canAssignRoles: m.canAssignRoles,
+                                joinedAt: m.joinedAt
+                            };
+                        }).filter(m => m !== null)
+                    };
+                    ws.send(encode({ type: 'my_squad_data_silent', squad: squadData }));
+                }
+            } catch (err) {
+                console.error("Error expulsando miembro del squad:", err);
+            }
+        }
+
+        // =========================================================
+        // ðŸ›‘ NUEVO: VENDER CANTIDAD ESPECÃFICA DE UN ÃTEM INDIVIDUAL (YONKE) ðŸ›‘
         // =========================================================
         if (data.type === 'sell_individual_trash' && isAuthenticated) {
             const p = players[id];
             const requestedItemId = data.itemId;
             const requestedQty = parseInt(data.quantity);
 
-            // 1. Validaciones de seguridad básicas
+            // 1. Validaciones de seguridad bÃ¡sicas
             if (!p.inventory || !requestedItemId || !requestedQty || requestedQty <= 0) return;
 
-            // 2. Buscar el ítem en el Catálogo de MongoDB (TRASH_CATALOG) para saber su valor
+            // 2. Buscar el Ã­tem en el CatÃ¡logo de MongoDB (TRASH_CATALOG) para saber su valor
             const catalogItem = TRASH_CATALOG.find(t => t.id === requestedItemId);
-            if (!catalogItem) return; // Trampa o ítem no existe
+            if (!catalogItem) return; // Trampa o Ã­tem no existe
 
-            // 3. Buscar el montón (Stack) de ese ítem en tu inventario apilable
+            // 3. Buscar el montÃ³n (Stack) de ese Ã­tem en tu inventario apilable
             let stackIndex = -1;
             let existingStack = p.inventory.find((item, index) => {
                 if (typeof item === 'object' && item.id === requestedItemId) {
@@ -2692,69 +3623,69 @@ module.exports = function createWsHandler(deps) {
 
             // 4. Validar que tengas suficientes para vender
             if (!existingStack || existingStack.quantity < requestedQty) {
-                ws.send(encode({ type: 'system_message', text: "🛑 No tienes suficiente cantidad de este ítem.", color: '#e74c3c' }));
+                ws.send(encode({ type: 'system_message', text: "ðŸ›‘ No tienes suficiente cantidad de este Ã­tem.", color: '#e74c3c' }));
                 return;
             }
 
-            // 5. HACER LA TRANSACCIÓN
+            // 5. HACER LA TRANSACCIÃ“N
             const totalEarned = catalogItem.value * requestedQty;
             p.coins += totalEarned;
 
             // Descontar cantidad del inventario
             existingStack.quantity -= requestedQty;
 
-            // Si el montón llegó a 0, borrar el objeto del array por completo
+            // Si el montÃ³n llegÃ³ a 0, borrar el objeto del array por completo
             if (existingStack.quantity <= 0) {
                 p.inventory.splice(stackIndex, 1);
             }
 
-            console.log(`🏗️ Venta Individual: ${p.name} vendió x${requestedQty} ${catalogItem.name} por ${totalEarned} 🪙`);
+            console.log(`ðŸ—ï¸ Venta Individual: ${p.name} vendiÃ³ x${requestedQty} ${catalogItem.name} por ${totalEarned} ðŸª™`);
 
-            // 7. Avisar al cliente del éxito (Reusamos el paquete sell_success existente en demo.html)
+            // 7. Avisar al cliente del Ã©xito (Reusamos el paquete sell_success existente en demo.html)
             ws.send(encode({
                 type: 'sell_success',
-                earned: totalEarned, // Monto de esta venta específica
+                earned: totalEarned, // Monto de esta venta especÃ­fica
                 newCoins: p.coins,
                 newInventory: p.inventory
             }));
 
             broadcast({ type: 'update', id: id, player: p }, ws);
-        }// ⛏️ NUEVO: SISTEMA DE EXCAVACIÓN (CON FATIGA DINÁMICA BASADA EN EL ARMA)
+        }// â›ï¸ NUEVO: SISTEMA DE EXCAVACIÃ“N (CON FATIGA DINÃMICA BASADA EN EL ARMA)
         if (data.type === 'dig' && isAuthenticated) {
             const p = players[id];
             if (!p) return;
 
             const now = Date.now();
 
-            // 👇 NUEVO: LEER ESTADÍSTICAS DE LA PALA DESDE LA RAM DEL SERVIDOR 👇
+            // ðŸ‘‡ NUEVO: LEER ESTADÃSTICAS DE LA PALA DESDE LA RAM DEL SERVIDOR ðŸ‘‡
             const weaponId = p.equippedWeapon || 'none';
             const weaponStats = WEAPONS[weaponId] || {};
 
-            // Extraemos la resistencia de la pala (Por defecto 15 si es básica o no está configurada)
+            // Extraemos la resistencia de la pala (Por defecto 15 si es bÃ¡sica o no estÃ¡ configurada)
             const maxSwingsAllowed = weaponStats.maxFatigue || 15;
 
             // ==========================================
-            // 🛡️ CAPA 1: FATIGA DE MINERO (DINÁMICA)
+            // ðŸ›¡ï¸ CAPA 1: FATIGA DE MINERO (DINÃMICA)
             // ==========================================
-            // Si pasaron más de 8 segundos sin excavar, el jugador recupera su energía
+            // Si pasaron mÃ¡s de 8 segundos sin excavar, el jugador recupera su energÃ­a
             if (now - (p.lastDigTime || 0) > 8000) {
                 p.digFatigue = 0;
             }
 
-            // Cooldown básico de 1 segundo entre palazos
+            // Cooldown bÃ¡sico de 1 segundo entre palazos
             if (now - (p.lastDigTime || 0) < 1000) return;
 
             p.digFatigue = (p.digFatigue || 0) + 1;
             p.lastDigTime = now;
 
-            // 🛑 EL FIX: Comparamos contra la resistencia de LA PALA, no un número fijo
+            // ðŸ›‘ EL FIX: Comparamos contra la resistencia de LA PALA, no un nÃºmero fijo
             if (p.digFatigue > maxSwingsAllowed) {
                 ws.send(encode({
                     type: 'system_message',
-                    text: `Estás exhausto. ${maxSwingsAllowed} golpes seguidos. Descansa.`,
+                    text: `EstÃ¡s exhausto. ${maxSwingsAllowed} golpes seguidos. Descansa.`,
                     color: '#e74c3c'
                 }));
-                // Engañamos al timer poniéndolo en el futuro para forzar el descanso
+                // EngaÃ±amos al timer poniÃ©ndolo en el futuro para forzar el descanso
                 p.lastDigTime = now + 8000;
                 return;
             }
@@ -2762,14 +3693,14 @@ module.exports = function createWsHandler(deps) {
             const hitX = data.hitX;
             const hitY = data.hitY;
 
-            // 🛡️ ANTI-HACK: Validar que la pala alcance la tierra
+            // ðŸ›¡ï¸ ANTI-HACK: Validar que la pala alcance la tierra
             const distToDig = Math.hypot(p.worldX - hitX, p.worldY - hitY);
-            if (distToDig > 80) { // 80 píxeles es un buen margen
+            if (distToDig > 80) { // 80 pÃ­xeles es un buen margen
                 return; // Ignorar si intenta minar a distancia
             }
 
             // ==========================================
-            // 🛡️ CAPA 2: TIERRA AGOTADA (ANTI-AUTO-CLICK)
+            // ðŸ›¡ï¸ CAPA 2: TIERRA AGOTADA (ANTI-AUTO-CLICK)
             // ==========================================
             p.lastDigLocationX = p.lastDigLocationX || 0;
             p.lastDigLocationY = p.lastDigLocationY || 0;
@@ -2779,7 +3710,7 @@ module.exports = function createWsHandler(deps) {
             if (p.lastDigLocationX !== 0 && distFromLastDig < 40) {
                 ws.send(encode({
                     type: 'system_message',
-                    text: "Ya escarbaste todo aquí. ¡Camina hacia otro lado!",
+                    text: "Ya escarbaste todo aquÃ­. Â¡Camina hacia otro lado!",
                     color: '#e67e22'
                 }));
                 broadcast({ type: 'spawn_hole', x: hitX, y: hitY }, ws);
@@ -2788,7 +3719,7 @@ module.exports = function createWsHandler(deps) {
             }
 
             // ==========================================
-            // 🌍 LÓGICA NORMAL DE ZONAS Y PREMIOS
+            // ðŸŒ LÃ“GICA NORMAL DE ZONAS Y PREMIOS
             // ==========================================
             let inDigZone = false;
             for (let z of safeZonesRAM) {
@@ -2799,7 +3730,7 @@ module.exports = function createWsHandler(deps) {
             }
 
             if (!inDigZone) {
-                ws.send(encode({ type: 'system_message', text: "Aquí no hay tierra blanda para excavar.", color: '#e67e22' }));
+                ws.send(encode({ type: 'system_message', text: "AquÃ­ no hay tierra blanda para excavar.", color: '#e67e22' }));
                 return;
             }
 
@@ -2822,12 +3753,12 @@ module.exports = function createWsHandler(deps) {
 
                 User.findByIdAndUpdate(p.accountId, { inventory: p.inventory }).catch(console.error);
 
-                ws.send(encode({ type: 'system_message', text: `💎 Desenterraste: ${foundItem.name}!`, color: '#3498db' }));
+                ws.send(encode({ type: 'system_message', text: `ðŸ’Ž Desenterraste: ${foundItem.name}!`, color: '#3498db' }));
                 ws.send(encode({ type: 'inventory_update', inventory: p.inventory }));
                 broadcast({ type: 'update', id: id, player: p }, ws);
             }
         }// =========================================================
-        // 💎 VENDER TODOS LOS METALES (JOYERÍA)
+        // ðŸ’Ž VENDER TODOS LOS METALES (JOYERÃA)
         // =========================================================
         if (data.type === 'sell_all_metals' && isAuthenticated) {
             const p = players[id];
@@ -2862,7 +3793,7 @@ module.exports = function createWsHandler(deps) {
             }
         }
         // =========================================================
-        // 💎 VENDER METAL INDIVIDUAL
+        // ðŸ’Ž VENDER METAL INDIVIDUAL
         // =========================================================
         if (data.type === 'sell_individual_metal' && isAuthenticated) {
             const p = players[id];
@@ -2884,7 +3815,7 @@ module.exports = function createWsHandler(deps) {
             });
 
             if (!existingStack || existingStack.quantity < requestedQty) {
-                ws.send(encode({ type: 'system_message', text: "🛑 No tienes suficiente cantidad de este metal.", color: '#e74c3c' }));
+                ws.send(encode({ type: 'system_message', text: "ðŸ›‘ No tienes suficiente cantidad de este metal.", color: '#e74c3c' }));
                 return;
             }
 
@@ -2896,7 +3827,7 @@ module.exports = function createWsHandler(deps) {
                 p.inventory.splice(stackIndex, 1);
             }
 
-            // Reusamos sell_success para que el cliente procese la animación de monedas y cierre la tienda
+            // Reusamos sell_success para que el cliente procese la animaciÃ³n de monedas y cierre la tienda
             ws.send(encode({ type: 'sell_success', earned: totalEarned, newCoins: p.coins, newInventory: p.inventory }));
             broadcast({ type: 'update', id: id, player: p }, ws);
 
@@ -2907,7 +3838,7 @@ module.exports = function createWsHandler(deps) {
             }
         }
         else if (data.type === 'save_skeleton_data') {
-            for(let k in skeletonRAM) delete skeletonRAM[k]; Object.assign(skeletonRAM, data.anchors);
+            skeletonRAM = data.anchors;
             const globalHandTile = data.handTile; // Guardarlo en memoria
 
             // Guardar permanentemente en MongoDB
@@ -2916,7 +3847,7 @@ module.exports = function createWsHandler(deps) {
                 handTile: globalHandTile
             }, { upsert: true })
 
-            // 2. ¡MAGIA! Rebotamos la animación a TODOS los jugadores en vivo
+            // 2. Â¡MAGIA! Rebotamos la animaciÃ³n a TODOS los jugadores en vivo
             wss.clients.forEach(client => {
                 if (client.readyState === WebSocket.OPEN) {
                     client.send(encode({
@@ -2928,79 +3859,72 @@ module.exports = function createWsHandler(deps) {
 
             // 3. Guardar en MongoDB para que NUNCA se borre al reiniciar el server
             Skeleton.findOneAndUpdate({}, { anchors: skeletonRAM }, { upsert: true })
-                .then(() => console.log("🦴 Animación Gani guardada en la Base de Datos!"))
+                .then(() => console.log("ðŸ¦´ AnimaciÃ³n Gani guardada en la Base de Datos!"))
                 .catch(err => console.error("Error guardando Gani:", err));
-        }// --- NUEVO: SISTEMA DE DAÑO A LA BASE DE CLANES (TURF WARS) ---
+        }// --- NUEVO: SISTEMA DE DAÃ‘O A LA BASE DE CLANES (TURF WARS) ---
         if (data.type === 'damage_base' && isAuthenticated) {
             const shooter = players[id];
+            if (!shooter) return;
 
-            // 1. Reglas: Tienes que tener un arma, un clan, y la base debe existir
-            if (!shooter || !shooter.squad || !state.centralBase) return;
+            let targetBase = null;
+            if (data.turfId && state.turfBases && state.turfBases[data.turfId]) {
+                targetBase = state.turfBases[data.turfId];
+            } else if (state.turfBases && Object.keys(state.turfBases).length > 0) {
+                targetBase = Object.values(state.turfBases)[0];
+            } else if (state.centralBase) {
+                targetBase = state.centralBase;
+            }
+            if (!targetBase) return;
 
-            const stats = WEAPONS[data.weaponId];
-            if (!stats) return;
-
-            // 2. Anti-spam de daño/curación
+            const stats = WEAPONS[data.weaponId] || { damage: 10, fireRate: 300 };
             const now = Date.now();
             if (now - (shooter.lastBaseDamageTime || 0) < ((stats.fireRate || 300) - 50)) return;
             shooter.lastBaseDamageTime = now;
 
             const actualDamage = Number(stats.damage) || 10;
+            const squadTag = shooter.squadName || (shooter.squad ? shooter.squad : (shooter.username || 'Solo'));
 
-            // 🛑 EL FIX: BIFURCACIÓN DE LÓGICA (CURAR VS DESTRUIR)
-            // Comparamos si el dueño actual es exactamente el nombre de tu clan
-            if (state.centralBase.currentOwnerSquadId === shooter.squadName) {
-
-                // 3A. RUTINA DE REPARACIÓN (Fuego Amigo)
-                // Si la base ya está al 100%, no hacemos nada
-                if (state.centralBase.hp >= state.centralBase.maxHp) return;
-
-                state.centralBase.hp += actualDamage;
-
-                // Evitamos sobrecurar la base
-                if (state.centralBase.hp > state.centralBase.maxHp) {
-                    state.centralBase.hp = state.centralBase.maxHp;
+            if (targetBase.currentOwnerSquadId && targetBase.currentOwnerSquadId === shooter.squadName) {
+                // CuraciÃ³n de la base de tu squad
+                if (targetBase.hp >= targetBase.maxHp) return;
+                targetBase.hp += actualDamage;
+                if (targetBase.hp > targetBase.maxHp) {
+                    targetBase.hp = targetBase.maxHp;
                 }
-
             } else {
+                // Ataque a la base
+                targetBase.hp -= actualDamage;
+                targetBase.lastHitTime = Date.now();
+                if (!targetBase.damageTracker) targetBase.damageTracker = {};
+                if (!targetBase.damageTracker[squadTag]) targetBase.damageTracker[squadTag] = 0;
+                targetBase.damageTracker[squadTag] += actualDamage;
 
-                // 3B. RUTINA DE ATAQUE (Enemigos)
-                state.centralBase.hp -= actualDamage;
-                state.centralBase.lastHitTime = Date.now(); // ⏱️ ¡REGISTRAMOS EL GOLPE!
-
-                // Registrar en la "Libreta de Daño" quién le está pegando
-                if (!state.centralBase.damageTracker[shooter.squadName]) state.centralBase.damageTracker[shooter.squadName] = 0;
-                state.centralBase.damageTracker[shooter.squadName] += actualDamage;
-
-                // ¿SE DESTRUYÓ LA BASE? (Llegó a 0)
-                if (state.centralBase.hp <= 0) {
-                    let topSquad = null;
+                if (targetBase.hp <= 0) {
+                    let topSquad = squadTag;
                     let maxDamage = 0;
-                    for (let sqName in state.centralBase.damageTracker) {
-                        if (state.centralBase.damageTracker[sqName] > maxDamage) {
-                            maxDamage = state.centralBase.damageTracker[sqName];
+                    for (let sqName in targetBase.damageTracker) {
+                        if (targetBase.damageTracker[sqName] > maxDamage) {
+                            maxDamage = targetBase.damageTracker[sqName];
                             topSquad = sqName;
                         }
                     }
 
-                    state.centralBase.currentOwnerSquadId = topSquad;
-                    state.centralBase.hp = state.centralBase.maxHp;
-                    state.centralBase.damageTracker = {};
+                    targetBase.currentOwnerSquadId = topSquad;
+                    targetBase.hp = targetBase.maxHp;
+                    targetBase.damageTracker = {};
 
-                    console.log(`🏆 El Squad [${topSquad}] ha capturado ${state.centralBase.name}!`);
+                    console.log(`ðŸ† El Squad/Jugador [${topSquad}] ha capturado ${targetBase.name} (${targetBase.turfId})!`);
 
-                    // 🛑 EL FIX: GUARDAR EL NUEVO DUEÑO EN MONGODB
                     Turf.findOneAndUpdate(
-                        { turfId: state.centralBase.turfId },
-                        { ownerSquadName: topSquad, hp: state.centralBase.maxHp }
+                        { turfId: targetBase.turfId },
+                        { ownerSquadName: topSquad, hp: targetBase.maxHp }
                     ).catch(err => console.error("Error guardando Turf:", err));
                 }
             }
 
-            // 4. Avisar a todas las pantallas cómo va la vida de la base (sea daño o curación)
             wss.clients.forEach(client => {
                 if (client.readyState === WebSocket.OPEN) {
-                    client.send(encode({ type: 'base_update', base: state.centralBase }));
+                    client.send(encode({ type: 'base_update', base: targetBase, turfBases: state.turfBases }));
                 }
             });
         }
@@ -3029,7 +3953,7 @@ module.exports = function createWsHandler(deps) {
                     user.inventory = players[id].inventory;
                     user.equipped = players[id].equipped;
 
-                    // 🌟 Mongoose-safe way to save Mixed objects 🌟
+                    // ðŸŒŸ Mongoose-safe way to save Mixed objects ðŸŒŸ
                     user.taskProgress = players[id].taskProgress || {};
                     user.claimedTasks = players[id].claimedTasks || {};
                     user.markModified('taskProgress');
@@ -3037,7 +3961,7 @@ module.exports = function createWsHandler(deps) {
 
                     await user.save();
                 }
-            } catch (err) { console.error(err); }
+            } catch (err) { console.error("AUTO LOGIN CRASH", err); ws.send(encode({ type: 'auth_error', message: 'Server crashed during login.' })); }
         }
 
         delete players[id];
@@ -3047,32 +3971,61 @@ module.exports = function createWsHandler(deps) {
             }
         });
         broadcast({ type: 'player_count', count: Object.keys(players).length });
+
+    if (players[id] && players[id].isJailed) {
+        ws.send(encode({ type: 'system_message', text: 'Tu dirección IP se encuentra bloqueada. Estás en prisión temporalmente.', color: '#e74c3c', isAlert: true, isJailAlert: true }));
+    }
+
     });
 
-    // 2. FETCH WORLD DATA
-    // 2. FETCH WORLD DATA (Cleaned for MessagePack)
-    const allTiles = await Tile.find({}, { _id: 0, __v: 0 }).lean();
+    const BanModel3 = require('../models/Ban');
+    try {
+        const activeIpBan = await BanModel3.findOne({ ipAddress: clientIp, expiresAt: { $gt: new Date() } });
+        if (activeIpBan) {
+            players[id].isJailed = true;
+            if (state.jailSpawnPos) {
+                players[id].worldX = state.jailSpawnPos.x;
+                players[id].worldY = state.jailSpawnPos.y;
+            } else {
+                players[id].worldX = 0;
+                players[id].worldY = 0;
+            }
+        }
+    } catch(err) { console.error(err); }
+
+      // 2. FETCH WORLD DATA (From RAM Cache for ultra-fast instant connections)
+    let allTiles = state.WORLD_TILES_CACHE;
+    if (!allTiles || allTiles.length === 0) {
+        try {
+            allTiles = await Tile.find({}, { _id: 0, __v: 0 }).lean();
+            state.WORLD_TILES_CACHE = allTiles;
+        } catch (err) {
+            console.error("Error fetching tiles from DB:", err);
+            allTiles = [];
+        }
+    }
 
     // 3. TELL THE NEW GUEST WHO THEY ARE (INIT)
     ws.send(encode({
         type: 'init',
         id: id,
-        playlist: GLOBAL_BGM_PLAYLIST, // 🛑 LA SOLUCIÓN: Le decimos qué canción debe poner apenas entre
+        playlist: GLOBAL_BGM_PLAYLIST, // ðŸ›‘ LA SOLUCIÃ“N: Le decimos quÃ© canciÃ³n debe poner apenas entre
         players: Object.fromEntries(Object.entries(players).filter(([k, v]) => !v.invisibleEnabled || k === id)),
         worldMap: allTiles,
         weaponsDB: WEAPONS,
         tilesetsDB: TILESETS,
-        safeZones: safeZonesRAM, // <--- ¡NUEVO: Enviamos los rectángulos de paz al jugador!
-        skeleton: skeletonRAM, // <--- ¡ESTA ES LA LÍNEA QUE FALTABA!
-        centralBase: state.centralBase, // 🛑 EL FIX: Añadimos la base a la memoria del cliente
-        groundItems: groundItems, // 🛑 EL FIX: Mandar la basura a los jugadores nuevos
+        safeZones: safeZonesRAM, // <--- Â¡NUEVO: Enviamos los rectÃ¡ngulos de paz al jugador!
+        skeleton: skeletonRAM, // <--- Â¡ESTA ES LA LÃNEA QUE FALTABA!
+        centralBase: state.centralBase, // ðŸ›‘ EL FIX: AÃ±adimos la base a la memoria del cliente
+        turfBases: state.turfBases, // ðŸ° TODAS las bases activas enviadas al cliente
+        groundItems: groundItems, // ðŸ›‘ EL FIX: Mandar la basura a los jugadores nuevos
         trashCatalog: TRASH_CATALOG,
-        masterCatalog: MASTER_CATALOG, // 📦 EL FIX: Enviamos toda la ropa e ítems
-        zoneConfig: ZONE_CONFIG, // <--- 👇 AÑADE ESTA LÍNEA 👇
+        masterCatalog: MASTER_CATALOG, // ðŸ“¦ EL FIX: Enviamos toda la ropa e Ã­tems
+        zoneConfig: ZONE_CONFIG, // <--- ðŸ‘‡ AÃ‘ADE ESTA LÃNEA ðŸ‘‡
         ranksDB: RANKS_CACHE,
-        patchNotes: PATCH_NOTES_CACHE, // 📰 NUEVO: Enviamos las noticias
+        patchNotes: PATCH_NOTES_CACHE, // ðŸ“° NUEVO: Enviamos las noticias
 
-        // 🌟 TAREAS Y LOGROS GLOBALES 🌟
+        // ðŸŒŸ TAREAS Y LOGROS GLOBALES ðŸŒŸ
         globalTasks: GLOBAL_TASKS,
         taskProgress: {}, // Guests start with empty progress
         claimedTasks: {}
@@ -3088,3 +4041,4 @@ module.exports = function createWsHandler(deps) {
     broadcast({ type: 'player_count', count: Object.keys(players).length });
     };
 };
+

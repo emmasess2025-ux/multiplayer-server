@@ -1,4 +1,4 @@
-module.exports = {
+﻿module.exports = {
     SQUAD_CHATS_RAM: {},
     arenasRAM: {},
     safeZonesRAM: [],
@@ -18,5 +18,9 @@ module.exports = {
     players: {},
     activeProjectiles: [],
     groundItems: {},
-    centralBase: null
+    turfBases: {},
+    centralBase: null,
+    jailSpawnPos: null,
+    WORLD_TILES_CACHE: []
 };
+

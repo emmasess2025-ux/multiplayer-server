@@ -16,16 +16,16 @@ function serverCheckCollision(x, y) {
     const hitY = 5;
     const offsetY = 3;
     // 👇 NUEVO: HACER LA BASE SÓLIDA (CUADRADO EXACTO) 👇
-    if (state.centralBase) {
-        const bx = state.centralBase.worldX + (state.centralBase.hitboxOffsetX || 0);
-        const by = state.centralBase.worldY + (state.centralBase.hitboxOffsetY || 0);
-        const hw = (state.centralBase.hitboxW || 32) / 2;
-        const hh = (state.centralBase.hitboxH || 32) / 2;
+    const activeBases = state.turfBases ? Object.values(state.turfBases) : (state.centralBase ? [state.centralBase] : []);
+    for (const b of activeBases) {
+        if (!b) continue;
+        const bx = b.worldX + (b.hitboxOffsetX || 0);
+        const by = b.worldY + (b.hitboxOffsetY || 0);
+        const hw = (b.hitboxW || 32) / 2;
+        const hh = (b.hitboxH || 32) / 2;
 
-        // Función para ver si un punto entra en el rectángulo
         const isInsideRect = (px, py) => (px >= bx - hw && px <= bx + hw && py >= by - hh && py <= by + hh);
 
-        // Si alguna de las 4 esquinas del jugador toca el rectángulo, choca
         if (isInsideRect(x - hitX, y - hitY + offsetY) ||
             isInsideRect(x + hitX, y - hitY + offsetY) ||
             isInsideRect(x - hitX, y + hitY + offsetY) ||
@@ -97,9 +97,22 @@ function applyDamageToPlayer(targetId, shooterId, weaponId) {
 
     // 💥 KNOCKBACK
     let knockbackForce = 0;
-    if (stats.dirStats) {
-        const kbDir = stats.dirStats['0'] || stats.dirStats['1'] || stats.dirStats['2'] || stats.dirStats['3'] || {};
-        knockbackForce = Number(kbDir.kb) || 0;
+    if (stats.type === 'ranged') {
+        // Armas de fuego (pistolas, rifles, escopetas, bazookas):
+        // Solo empujan al enemigo si tienen configurado 'bulletKb' explícitamente (ej. Bazooka, Lanza-granadas, Escopeta pesada)
+        if (stats.dirStats) {
+            const kbDir = stats.dirStats['0'] || stats.dirStats['1'] || stats.dirStats['2'] || stats.dirStats['3'] || {};
+            knockbackForce = Number(kbDir.bulletKb !== undefined ? kbDir.bulletKb : (stats.bulletKb || 0)) || 0;
+        } else {
+            knockbackForce = Number(stats.bulletKb) || 0;
+        }
+    } else {
+        // Armas cuerpo a cuerpo (espadas, palos, etc.):
+        // Usan el retroceso de golpe (kb) configurado en el editor
+        if (stats.dirStats) {
+            const kbDir = stats.dirStats['0'] || stats.dirStats['1'] || stats.dirStats['2'] || stats.dirStats['3'] || {};
+            knockbackForce = Number(kbDir.kb) || 0;
+        }
     }
     if (knockbackForce > 0 && !target.isDead) {
         const angle = Math.atan2(target.worldY - shooter.worldY, target.worldX - shooter.worldX);
@@ -384,51 +397,151 @@ setInterval(() => {
 }, 3000);
 
 // =========================================================
+// 🔄 GESTOR INTELIGENTE DE RESETS DIARIOS Y SEMANALES (SQUADS)
+// =========================================================
+async function checkAndApplySquadResets() {
+    try {
+        const now = new Date();
+        let config = await ServerConfig.findOne();
+        if (!config) {
+            config = await ServerConfig.create({
+                bgmPlaylist: [],
+                lastDailyReset: now,
+                lastWeeklyReset: now
+            });
+            return;
+        }
+
+        let configChanged = false;
+        const lastDaily = config.lastDailyReset ? new Date(config.lastDailyReset) : new Date(0);
+        const lastWeekly = config.lastWeeklyReset ? new Date(config.lastWeeklyReset) : new Date(0);
+
+        const ONE_DAY_MS = 24 * 60 * 60 * 1000;
+        const SEVEN_DAYS_MS = 7 * ONE_DAY_MS;
+
+        // Reset Diario: Si han pasado 24 horas o cambió el día calendario UTC
+        const dailyTimeDiff = now.getTime() - lastDaily.getTime();
+        const isDifferentDay = (now.getUTCFullYear() !== lastDaily.getUTCFullYear() ||
+                                now.getUTCMonth() !== lastDaily.getUTCMonth() ||
+                                now.getUTCDate() !== lastDaily.getUTCDate());
+        const dailyResetDue = dailyTimeDiff >= ONE_DAY_MS || (isDifferentDay && dailyTimeDiff >= 3600000);
+
+        // Reset Semanal: Si han transcurrido 7 días completos (7 x 24h)
+        const weeklyTimeDiff = now.getTime() - lastWeekly.getTime();
+        const weeklyResetDue = weeklyTimeDiff >= SEVEN_DAYS_MS;
+
+        if (dailyResetDue) {
+            console.log("🌅 [DAILY RESET] 24 horas cumplidas. Reseteando 'dailyTimeMinutes' de todos los clanes a 0.");
+            await Squad.updateMany({}, { $set: { dailyTimeMinutes: 0 } });
+            config.lastDailyReset = now;
+            configChanged = true;
+        }
+
+        if (weeklyResetDue) {
+            console.log("🗓️ [WEEKLY RESET] 7 días cumplidos. Reseteando 'weeklyTimeMinutes' de todos los clanes a 0.");
+            await Squad.updateMany({}, { $set: { weeklyTimeMinutes: 0 } });
+            config.lastWeeklyReset = now;
+            configChanged = true;
+        }
+
+        if (configChanged) {
+            await config.save();
+            // Notificar a todos los jugadores online para sincronizar su UI y leaderboard
+            wss.clients.forEach(client => {
+                if (client.readyState === WebSocket.OPEN) {
+                    client.send(encode({
+                        type: 'squad_reset_event',
+                        dailyReset: dailyResetDue,
+                        weeklyReset: weeklyResetDue
+                    }));
+                }
+            });
+        }
+    } catch (err) {
+        console.error("💥 Error en el gestor de resets de Squads:", err);
+    }
+}
+
+// Ejecutar verificación inicial de resets al arrancar el motor
+checkAndApplySquadResets();
+
+// =========================================================
 // ⏱️ MOTOR DE RECOMPENSAS DE TURF WARS (ZONAS DE CAPTURA)
 // =========================================================
 setInterval(async () => {
-    // 1. ¿Existe la base y tiene dueño actualmente?
-    if (state.centralBase && state.centralBase.currentOwnerSquadId) {
-        try {
-            const ownerSquad = state.centralBase.currentOwnerSquadId;
-            console.log(`🏰 [TURF WARS] El clan [${ownerSquad}] ha mantenido la base por otro minuto.`);
+    try {
+        // 0. Verificar primero si corresponde resetear el día (24h) o semana (7d)
+        await checkAndApplySquadResets();
 
-            // 2. GUARDAR EL TIEMPO EN MONGODB (Total, Diario y Semanal)
+        // 1. Contar cuántas bases activas retiene cada Squad actualmente
+        const squadBaseCounts = {};
+        const allBases = (state.turfBases && typeof state.turfBases === 'object')
+            ? Object.values(state.turfBases)
+            : (state.centralBase ? [state.centralBase] : []);
+
+        for (const base of allBases) {
+            if (base && base.currentOwnerSquadId) {
+                const sqName = base.currentOwnerSquadId;
+                squadBaseCounts[sqName] = (squadBaseCounts[sqName] || 0) + 1;
+            }
+        }
+
+        // 2. Sumar minutos proporcionalmente a las bases que tiene cada clan
+        //    (1 base = +1 min/min, 2 bases = +2 min/min, 3 bases = +3 min/min, etc.)
+        for (const ownerSquad in squadBaseCounts) {
+            const count = squadBaseCounts[ownerSquad];
+            if (!count || count <= 0) continue;
+
+            console.log(`🏰 [TURF WARS] El clan [${ownerSquad}] ha mantenido ${count} base(s) (+${count} min ganados este minuto).`);
+
+            // Guardar el tiempo acumulado en MongoDB (Total, Diario y Semanal)
             const updatedSquad = await Squad.findOneAndUpdate(
                 { name: ownerSquad },
                 {
                     $inc: {
-                        territoryTimeMinutes: 1,
-                        dailyTimeMinutes: 1,
-                        weeklyTimeMinutes: 1
+                        territoryTimeMinutes: count,
+                        dailyTimeMinutes: count,
+                        weeklyTimeMinutes: count
                     }
                 },
                 { returnDocument: 'after' }
             );
 
-            // --- NUEVO: REVISAR METAS CUMPLIDAS EXACTAMENTE AHORA ---
+            // Revisar logros/milestones del clan cumplidos
             if (updatedSquad) {
                 let changed = false;
                 if (!updatedSquad.milestonesAchieved) updatedSquad.milestonesAchieved = new Map();
                 for (let taskId in GLOBAL_TASKS) {
                     const task = GLOBAL_TASKS[taskId];
                     if (task.requirementType === 'squad_base_minutes') {
-                        // Si alcanzaron la meta y an no tiene fecha guardada
                         if (updatedSquad.territoryTimeMinutes >= task.requirementValue && !updatedSquad.milestonesAchieved.has(taskId)) {
                             updatedSquad.milestonesAchieved.set(taskId, Date.now());
                             changed = true;
-                            console.log(`[LOGRO SQUAD] El clan [${ownerSquad}] alcanzo la meta: ${taskId}`);
+                            console.log(`🏆 [LOGRO SQUAD] El clan [${ownerSquad}] alcanzó la meta: ${taskId}`);
                         }
                     }
                 }
                 if (changed) {
                     await updatedSquad.save();
                 }
-            }
 
-        } catch (err) {
-            console.error("💥 Error en el cronómetro de la base:", err);
+                // Sincronizar en tiempo real a los jugadores conectados
+                wss.clients.forEach(client => {
+                    if (client.readyState === WebSocket.OPEN) {
+                        client.send(encode({
+                            type: 'squad_time_update',
+                            squadName: ownerSquad,
+                            basesHeld: count,
+                            territoryTimeMinutes: updatedSquad.territoryTimeMinutes,
+                            dailyTimeMinutes: updatedSquad.dailyTimeMinutes,
+                            weeklyTimeMinutes: updatedSquad.weeklyTimeMinutes
+                        }));
+                    }
+                });
+            }
         }
+    } catch (err) {
+        console.error("💥 Error en el cronómetro de bases Turf:", err);
     }
 }, 60000); // 60,000 milisegundos = 1 minuto exacto
 
