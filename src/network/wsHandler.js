@@ -336,6 +336,24 @@ module.exports = function createWsHandler(deps) {
 
 
             
+        
+        // --- NUEVO: WEBRTC MUTE STATUS ---
+        if (data.type === 'voice_mute_status') {
+            console.log("SERVER RECV MUTE from:", id, "muted:", data.isMuted);
+            if (!players[id] || !players[id].squad) return;
+            const mySquadId = players[id].squad.toString();
+            wss.clients.forEach(c => {
+                if (c.readyState === WebSocket.OPEN && c.playerId !== id && players[c.playerId] && players[c.playerId].squad && players[c.playerId].squad.toString() === mySquadId) {
+                    c.send(encode({
+                        type: 'voice_mute_status',
+                        userId: id,
+                        isMuted: !!data.isMuted
+                    }));
+                }
+            });
+        }
+
+
         // --- NUEVO: WEBRTC SIGNALING PARA RADIO DEL CLAN ---
         if (data.type === 'webrtc_signal') {
             console.log("WEBRTC SIGNAL RECV from:", id, "target:", data.targetId, "type:", data.signalData.type);
@@ -349,15 +367,17 @@ module.exports = function createWsHandler(deps) {
                 if (pid !== id && players[pid].squad && players[pid].squad.toString() === mySquadId) {
                     if (!data.targetId || data.targetId === pid) {
                         console.log("WEBRTC SIGNAL FORWARDING to:", pid);
-                        if (players[pid].ws && players[pid].ws.readyState === WebSocket.OPEN) {
-                            players[pid].ws.send(encode({
-                                type: 'webrtc_signal',
-                                senderId: id,
-                                senderName: players[id].username,
-                                senderHead: players[id].equipped ? players[id].equipped.head : "H_D",
-                                signalData: data.signalData
-                            }));
-                        }
+                        wss.clients.forEach(c => {
+                            if (c.playerId === pid && c.readyState === WebSocket.OPEN) {
+                                c.send(encode({
+                                    type: 'webrtc_signal',
+                                    senderId: id,
+                                    senderName: players[id].username,
+                                    senderHead: players[id].equipped ? players[id].equipped.head : "H_D",
+                                    signalData: data.signalData
+                                }));
+                            }
+                        });
                     }
                 }
             }
@@ -374,14 +394,16 @@ module.exports = function createWsHandler(deps) {
             for (let pid in players) {
                 if (players[pid].squad && players[pid].squad.toString() === mySquadId) {
                     console.log("VOICE LOBBY BROADCASTING to:", pid);
-                    if (players[pid].ws && players[pid].ws.readyState === WebSocket.OPEN) {
-                        players[pid].ws.send(encode({
-                            type: data.type,
-                            userId: id,
-                            username: players[id].username,
-                            head: players[id].equipped ? players[id].equipped.head : "H_D"
-                        }));
-                    }
+                    wss.clients.forEach(c => {
+                        if (c.playerId === pid && c.readyState === WebSocket.OPEN) {
+                            c.send(encode({
+                                type: data.type,
+                                userId: id,
+                                username: players[id].username,
+                                head: players[id].equipped ? players[id].equipped.head : "H_D"
+                            }));
+                        }
+                    });
                 }
             }
         }
