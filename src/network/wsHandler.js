@@ -341,6 +341,7 @@ module.exports = function createWsHandler(deps) {
         if (data.type === 'voice_mute_status') {
             console.log("SERVER RECV MUTE from:", id, "muted:", data.isMuted);
             if (!players[id] || !players[id].squad) return;
+            players[id].isVoiceMuted = !!data.isMuted; // SAVE STATE
             const mySquadId = players[id].squad.toString();
             wss.clients.forEach(c => {
                 if (c.readyState === WebSocket.OPEN && c.playerId !== id && players[c.playerId] && players[c.playerId].squad && players[c.playerId].squad.toString() === mySquadId) {
@@ -383,12 +384,34 @@ module.exports = function createWsHandler(deps) {
             }
         }
         
+        if (data.type === 'request_voice_lobby_state') {
+            console.log("SERVER RECV: request_voice_lobby_state from:", id);
+            if (!players[id] || !players[id].squad) return;
+            const mySquadId = players[id].squad.toString();
+            let activeMembers = [];
+            for (let pid in players) {
+                if (players[pid].squad && players[pid].squad.toString() === mySquadId && players[pid].inVoiceLobby) {
+                    activeMembers.push({
+                        userId: pid,
+                        username: players[pid].username,
+                        head: players[pid].equipped ? players[pid].equipped.head : "H_D",
+                        isMuted: players[pid].isVoiceMuted || false
+                    });
+                }
+            }
+            if (ws.readyState === 1) {
+                ws.send(encode({ type: 'voice_lobby_state_response', members: activeMembers }));
+            }
+        }
+
         if ((data.type === 'join_voice_lobby' || data.type === 'leave_voice_lobby')) {
             console.log("VOICE LOBBY EVENT:", data.type, "from:", id);
             if (!players[id] || !players[id].squad) {
                 console.log("VOICE LOBBY DROPPED: No squad for", id);
                 return;
             }
+            players[id].inVoiceLobby = (data.type === 'join_voice_lobby');
+            if (data.type === 'join_voice_lobby') players[id].isVoiceMuted = !!data.isMuted;
             const mySquadId = players[id].squad.toString();
             
             for (let pid in players) {
